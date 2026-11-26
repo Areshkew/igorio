@@ -5,6 +5,9 @@
 //! Swift becomes a stored deadline. `tick` runs whatever is due, `next_deadline` says when to
 //! tick next. Deadlines cascade from the deadline that triggered them, so a late tick ends in
 //! the same state as many small ones.
+//!
+//! Animations have no wake-up deadlines of their own: `is_animating` reads their progress from
+//! `now`, so a caller never wakes up just to end one.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,12 +44,6 @@ enum Task {
     DeliverStep { id: CardId, text: String },
     /// Remove cards whose leave animation is over.
     FinishLeaving { ids: Vec<CardId> },
-    /// A hint finished fading in or out (a wake-up, also drops the faded text).
-    HintSettled,
-    /// The overlay finished showing or hiding (a wake-up).
-    CaptureSettled,
-    /// The "no" wobble played out (a wake-up).
-    WobbleSettled,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +56,10 @@ struct Scheduled {
 
 /// Everything the overlay shows and does, as a pure value: the pile, the hint, the last "no",
 /// and the animations that are still running.
+///
+/// Caller contract: draw one frame after every mutating call and after every `tick`. While
+/// `is_animating(now)` is true, draw every frame. Otherwise sleep until `next_deadline()`, or
+/// until input arrives when it is `None`.
 #[derive(Debug, Clone)]
 pub struct FairyState {
     pile: HeldPile<HeldCard>,
@@ -167,9 +168,6 @@ impl FairyState {
         self.opacity_from = from;
         self.opacity_at = now;
         self.opacity_target = if hidden { 0.0 } else { 1.0 };
-        if from != self.opacity_target {
-            self.push_task(now + CAPTURE_FADE, Task::CaptureSettled);
-        }
     }
 
     // MARK: Actions
@@ -271,7 +269,6 @@ impl FairyState {
         self.reject_tick += 1;
         self.last_reject_at = Some(now);
         self.flash_hint(hint, 2.4, now);
-        self.push_task(now + WOBBLE, Task::WobbleSettled);
     }
 
     pub fn discard_all(&mut self, now: f64) {
@@ -286,9 +283,21 @@ impl FairyState {
         if restored.is_empty() {
             return;
         }
-        for card in &restored {
-            self.leave_started.remove(&card.id);
+        let restored_ids: Vec<CardId> = restored.iter().map(|card| card.id).collect();
+        for id in &restored_ids {
+            self.leave_started.remove(id);
         }
+        // A leave or delivery scheduled before the restore must not reach the card now that it
+        // is back on the pile. Drop its deliver steps and its share of pending finishes.
+        self.tasks
+            .retain_mut(|scheduled| match &mut scheduled.task {
+                Task::ClearHint { .. } => true,
+                Task::DeliverStep { id, .. } => !restored_ids.contains(id),
+                Task::FinishLeaving { ids } => {
+                    ids.retain(|id| !restored_ids.contains(id));
+                    !ids.is_empty()
+                }
+            });
         let text = if restored.len() == 1 {
             "restored".to_string()
         } else {
@@ -327,25 +336,43 @@ impl FairyState {
 
     // MARK: Time
 
-    /// Run every deferred step whose deadline has passed, in deadline order.
+    /// Run every deferred step whose deadline has passed, in deadline order, then forget
+    /// released screenshots that have expired.
     pub fn tick(&mut self, now: f64) {
+        if !now.is_finite() {
+            return;
+        }
         while let Some(index) = self.next_due(now) {
             let Scheduled { deadline, task, .. } = self.tasks.remove(index);
             self.run(task, deadline);
+        }
+        self.pile.prune(now);
+        // The faded hint text is kept only while it is still visible.
+        if self.hint.is_none() && self.hint_opacity_now(now) <= 0.0 {
+            self.hint_fade_text = None;
         }
     }
 
     /// The earliest deadline still pending, if any: when to call `tick` next.
     pub fn next_deadline(&self) -> Option<f64> {
-        self.tasks
+        let tasks = self
+            .tasks
             .iter()
             .map(|scheduled| scheduled.deadline)
-            .min_by(f64::total_cmp)
+            .min_by(f64::total_cmp);
+        match (tasks, self.prune_deadline()) {
+            (Some(task), Some(prune)) => Some(task.min(prune)),
+            (task, prune) => task.or(prune),
+        }
     }
 
-    /// Whether anything still moves or waits: the caller redraws only while this is true.
-    pub fn is_animating(&self, _now: f64) -> bool {
-        !self.tasks.is_empty()
+    /// Whether pixels still change: something is fading, wobbling or leaving. Pending
+    /// deadlines alone do not count, so a static hint does not drive a redraw loop.
+    pub fn is_animating(&self, now: f64) -> bool {
+        self.hint_fading(now)
+            || self.opacity_fading(now)
+            || self.wobble_active(now)
+            || self.leaving_active(now)
     }
 
     // MARK: Drawing
@@ -453,6 +480,10 @@ impl FairyState {
     }
 
     fn push_task(&mut self, deadline: f64, task: Task) {
+        // A deadline that is not a real number would never come due in a sane order.
+        if !deadline.is_finite() {
+            return;
+        }
         let seq = self.next_seq;
         self.next_seq += 1;
         self.tasks.push(Scheduled {
@@ -486,12 +517,6 @@ impl FairyState {
                 }
             }
             Task::FinishLeaving { ids } => self.finish_leaving(&ids, at),
-            Task::HintSettled => {
-                if self.hint.is_none() && self.hint_opacity_now(at) <= 0.0 {
-                    self.hint_fade_text = None;
-                }
-            }
-            Task::CaptureSettled | Task::WobbleSettled => {}
         }
     }
 
@@ -528,9 +553,6 @@ impl FairyState {
         self.hint_from = from;
         self.hint_at = at;
         self.hint_target = 1.0;
-        if from < 1.0 {
-            self.push_task(at + HINT_FADE, Task::HintSettled);
-        }
     }
 
     fn clear_hint(&mut self, at: f64) {
@@ -542,9 +564,6 @@ impl FairyState {
         self.hint_from = from;
         self.hint_at = at;
         self.hint_target = 0.0;
-        if from > 0.0 {
-            self.push_task(at + HINT_FADE, Task::HintSettled);
-        }
     }
 
     fn cancel_clear_hint(&mut self) {
@@ -554,12 +573,14 @@ impl FairyState {
 
     fn hint_opacity_now(&self, now: f64) -> f64 {
         let t = ((now - self.hint_at) / HINT_FADE).clamp(0.0, 1.0);
-        (self.hint_from + (self.hint_target - self.hint_from) * t).clamp(0.0, 1.0)
+        let eased = 1.0 - (1.0 - t) * (1.0 - t);
+        (self.hint_from + (self.hint_target - self.hint_from) * eased).clamp(0.0, 1.0)
     }
 
     fn opacity_now(&self, now: f64) -> f64 {
         let t = ((now - self.opacity_at) / CAPTURE_FADE).clamp(0.0, 1.0);
-        (self.opacity_from + (self.opacity_target - self.opacity_from) * t).clamp(0.0, 1.0)
+        let eased = t * t * (3.0 - 2.0 * t);
+        (self.opacity_from + (self.opacity_target - self.opacity_from) * eased).clamp(0.0, 1.0)
     }
 
     fn wobble_now(&self, now: f64) -> f64 {
@@ -570,5 +591,42 @@ impl FairyState {
             }
             None => 0.0,
         }
+    }
+
+    fn hint_fading(&self, now: f64) -> bool {
+        self.hint_from != self.hint_target && now - self.hint_at < HINT_FADE
+    }
+
+    fn opacity_fading(&self, now: f64) -> bool {
+        self.opacity_from != self.opacity_target && now - self.opacity_at < CAPTURE_FADE
+    }
+
+    fn wobble_active(&self, now: f64) -> bool {
+        !self.pile.is_empty() && self.last_reject_at.is_some_and(|at| now - at < WOBBLE)
+    }
+
+    fn leaving_active(&self, now: f64) -> bool {
+        self.pile.cards().iter().any(|card| {
+            let Some(at) = self.leave_started.get(&card.id).copied() else {
+                return false;
+            };
+            match self.pile.style(card.id) {
+                Some(LeaveStyle::Dissolve) => now - at < DISSOLVE_ANIMATION,
+                Some(LeaveStyle::Drop) => now - at < DROP_ANIMATION,
+                _ => false,
+            }
+        })
+    }
+
+    /// When the oldest remembered release expires (the Swift prune timer).
+    fn prune_deadline(&self) -> Option<f64> {
+        self.pile
+            .released()
+            .iter()
+            .map(|batch| batch.at)
+            .filter(|at| at.is_finite())
+            .min_by(f64::total_cmp)
+            .map(|at| at + self.pile.release_ttl + 1.0)
+            .filter(|at| at.is_finite())
     }
 }
