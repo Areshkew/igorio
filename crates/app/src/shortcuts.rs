@@ -945,6 +945,7 @@ impl Hotkeys {
         self.post(WM_REPORT, tag)
     }
 
+    /// Takes the reports made so far, oldest first. The wake handle is set when one arrives.
     pub fn reports(&self) -> Vec<RegistrationReport> {
         std::mem::take(&mut *lock(&self.shared.reports))
     }
