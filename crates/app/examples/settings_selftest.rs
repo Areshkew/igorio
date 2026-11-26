@@ -10,14 +10,20 @@ use std::time::{Duration, Instant};
 use igorio_app::layout::CardSize;
 use igorio_app::overlay::ensure_dpi_awareness;
 use igorio_app::settings::Settings;
-use igorio_app::settings_window::{Control::*, SettingsWindow, TestMode, test_client_size};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT, WAIT_OBJECT_0, WPARAM};
+use igorio_app::settings_window::{
+    Control::*, SettingsWindow, TestMode, TestScene, test_client_size,
+};
+use windows::Win32::Foundation::{
+    CloseHandle, FILETIME, HANDLE, HWND, LPARAM, RECT, WAIT_OBJECT_0, WPARAM,
+};
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PW_CLIENTONLY, PrintWindow};
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
 use windows::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, GetCurrentProcess,
-    SYNCHRONIZATION_SYNCHRONIZE, SetWaitableTimer, TIMER_MODIFY_STATE, WaitForSingleObject,
+    GetProcessTimes, SYNCHRONIZATION_SYNCHRONIZE, SetWaitableTimer, TIMER_MODIFY_STATE,
+    WaitForSingleObject,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -366,7 +372,39 @@ fn report_memory(label: &str) -> Result<()> {
     Ok(())
 }
 
+fn process_cpu() -> Result<u64> {
+    let (mut created, mut exited, mut kernel, mut user) =
+        (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    // SAFETY: four writable FILETIMEs and the pseudo-handle of this process.
+    unsafe {
+        GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user)?
+    };
+    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    Ok(ticks(kernel) + ticks(user))
+}
+
+fn check_idle(checks: &mut Checks, window: &SettingsWindow) -> Result<()> {
+    thread::sleep(Duration::from_millis(250));
+    let timer_stopped = window.test_idle();
+    let before = process_cpu()?;
+    let at = Instant::now();
+    thread::sleep(Duration::from_secs(2));
+    let cpu = process_cpu()? - before;
+    let seconds = at.elapsed().as_secs_f64();
+    checks.check(
+        "animation timer is stopped before and after two idle seconds",
+        timer_stopped && window.test_idle(),
+    );
+    checks.check(
+        &format!("idle process CPU {:.3} ms over {seconds:.3} s", cpu as f64 / 10_000.0),
+        cpu == 0,
+    );
+    Ok(())
+}
+
 fn capture(hwnd: HWND, path: &Path, dpi: u32) -> Result<bool> {
+    // SAFETY: wait for the compositor to consume the frozen client paint before PrintWindow.
+    let _ = unsafe { DwmFlush() };
     let mut client = RECT::default();
     // SAFETY: this is our visible test HWND and client is writable.
     unsafe { GetClientRect(hwnd, &mut client)? };
@@ -461,6 +499,8 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
     for cycle in 1..=3 {
         let hwnd = open(&mut controller)?;
         if cycle == 1 {
+            // Include the composed surface after the opening transition settles.
+            thread::sleep(Duration::from_millis(200));
             report_memory("while open")?;
             verify_controls(&mut checks, &mut controller, hwnd, &path, &defaults)?;
         } else {
@@ -525,8 +565,29 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
         let mode = TestMode { dark, dpi, ..defaults.clone() };
         let mut window = SettingsWindow::for_test(path.clone(), mode)?;
         let hwnd = open(&mut window)?;
-        let output = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").join(name);
+        if dark && dpi == 120 {
+            check_idle(&mut checks, &window)?;
+        }
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        window.test_scene(TestScene::Settled);
+        let output = folder.join(name);
         checks.check(name, capture(hwnd, &output, dpi)?);
+        if dark && dpi == 120 {
+            let mut frames = std::collections::BTreeSet::from([fs::read(&output)?]);
+            for (scene, name) in [
+                (TestScene::SwitchSlide, "settings-motion-switch.png"),
+                (TestScene::CardSlide, "settings-motion-card.png"),
+                (TestScene::ButtonHover, "settings-motion-button-hover.png"),
+                (TestScene::ButtonPress, "settings-motion-button-pressed.png"),
+                (TestScene::SwitchFocus, "settings-focus-switch.png"),
+                (TestScene::CardFocus, "settings-focus-card.png"),
+            ] {
+                window.test_scene(scene);
+                let output = folder.join(name);
+                checks
+                    .check(name, capture(hwnd, &output, dpi)? && frames.insert(fs::read(&output)?));
+            }
+        }
         checks.check("capture window closes within one second", close(&mut window, hwnd));
     }
     Ok(checks.ok)
