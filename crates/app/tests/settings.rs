@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use igorio_app::layout::CardSize;
 use igorio_app::settings::{DefaultFolders, Settings, default_settings_path};
+use igorio_app::shortcuts::{Action, Chord, Shortcuts};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -366,4 +367,75 @@ fn settings_path_lives_under_igorios_roaming_folder() {
     assert!(path.is_absolute());
     assert_eq!(path.file_name().unwrap(), "settings.json");
     assert_eq!(path.parent().unwrap().file_name().unwrap(), "Igorio");
+}
+
+#[test]
+fn shortcuts_round_trip_through_the_file() {
+    let scratch = Scratch::new("shortcuts-round-trip");
+    let path = scratch.path("settings.json");
+    let mut settings = Settings::default();
+    assert_eq!(settings.shortcuts, Shortcuts::defaults());
+    settings
+        .shortcuts
+        .set(Action::RestoreLast, Some(Chord::parse("Ctrl+Alt+Z").unwrap()))
+        .unwrap();
+    settings.shortcuts.set(Action::Pen, None).unwrap();
+    settings.save(&path).unwrap();
+
+    let text = fs::read_to_string(&path).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["shortcuts"]["restore_last"], "Ctrl+Alt+Z");
+    assert_eq!(json["shortcuts"]["pen"], serde_json::Value::Null);
+    assert_eq!(Settings::load(&path).unwrap(), settings);
+}
+
+#[test]
+fn missing_shortcuts_give_the_defaults() {
+    let scratch = Scratch::new("shortcuts-missing");
+    let path = scratch.path("settings.json");
+    fs::write(&path, r#"{"launch_at_login": true}"#).unwrap();
+    let settings = Settings::load(&path).unwrap();
+    assert_eq!(settings.shortcuts, Shortcuts::defaults());
+    assert!(settings.launch_at_login);
+}
+
+#[test]
+fn a_bad_shortcut_keeps_the_rest_of_the_file() {
+    let scratch = Scratch::new("shortcuts-lenient");
+    let path = scratch.path("settings.json");
+    fs::write(
+        &path,
+        r#"{
+            "launch_at_login": true,
+            "card_size": "large",
+            "shortcuts": {
+                "restore_last": "Ctrl+Alt+Z",
+                "discard_top": null,
+                "discard_all": "Ctrl+Alt+Z",
+                "pen": "Ctrl+Nope+7",
+                "highlighter": "Win+L",
+                "toggle_recording": 6,
+                "beam_me_up": "Ctrl+Alt+B"
+            }
+        }"#,
+    )
+    .unwrap();
+    let settings = Settings::load(&path).unwrap();
+    assert!(!scratch.path("settings.json.bad").exists(), "the file was parsed");
+    assert!(settings.launch_at_login);
+    assert_eq!(settings.card_size, CardSize::Large);
+    let s = &settings.shortcuts;
+    let chord = |text: &str| Some(Chord::parse(text).unwrap());
+    assert_eq!(s.get(Action::RestoreLast), chord("Ctrl+Alt+Z"));
+    assert_eq!(s.get(Action::DiscardTop), None);
+    assert_eq!(s.get(Action::DiscardAll), None, "the first action keeps a shared chord");
+    assert_eq!(s.get(Action::Pen), chord("Ctrl+Shift+7"));
+    assert_eq!(s.get(Action::Highlighter), chord("Ctrl+Shift+8"));
+    assert_eq!(s.get(Action::ToggleRecording), chord("Ctrl+Shift+6"));
+    assert_eq!(s.get(Action::OpenSettings), None);
+
+    fs::write(&path, r#"{"shortcuts": "Ctrl+Alt+Z", "launch_at_login": true}"#).unwrap();
+    let settings = Settings::load(&path).unwrap();
+    assert_eq!(settings.shortcuts, Shortcuts::defaults());
+    assert!(settings.launch_at_login);
 }
