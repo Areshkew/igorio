@@ -41,6 +41,21 @@ From the review of the M0 spikes. The spikes break some of these; do not copy th
    `GetDpiForMonitor`. Keep one cached bitmap for drawing, and tick only while
    something moves.
 
+
+## UI toolkit: native Win32
+
+Decided after a prototype (branch `t3/prototype-settings-ui`, not merged). The settings
+window, the first-run guide and the note windows use native Win32 windows and controls,
+owner-drawn where the look needs it. The note editor is a RichEdit control.
+
+- egui was tried for the settings window. It worked, but it added about 7 MB to the exe,
+  about 300 packages, and 60 to 80 MB of memory that is not released when the window
+  closes. Its text box has no spell checking, no Windows font fallback and incomplete
+  right-to-left editing.
+- RichEdit gives spell checking, IME, all scripts and UI Automation without extra code.
+- These windows run on their own thread with their own message loop. A modal dialog (the
+  folder picker) must never block the overlay loop.
+
 ## Workspace layout
 
 ```
@@ -56,7 +71,7 @@ crates/
 assets/                 icon, Barlow fonts (OFL)
 ```
 
-Crates: `windows`, `tiny-skia`, `tray-icon`, `egui`/`eframe`, `notify`, `image`,
+Crates: `windows`, `tiny-skia`, `fontdue`, `png`,
 `serde`/`serde_json`, `windows-capture`.
 
 ## File map
@@ -85,7 +100,7 @@ Replace them with a small role enum in `core`, filled from UI Automation control
 |---|---|
 | `Capability.swift` | `kit/src/capability.rs`: `Capability` and `Host` traits, `Manifest`, `DropZone` |
 | `HeldScreenshot.swift` | `kit/src/held.rs` |
-| `Theme.swift`, `SettingsRows.swift`, `KeyChip.swift` | `kit/src/theme.rs`, egui row helpers |
+| `Theme.swift`, `SettingsRows.swift`, `KeyChip.swift` | `kit/src/theme.rs`, row helpers for the settings window |
 | `SystemScreenshotLocation.swift` | `kit/src/folders.rs` (`Pictures\Screenshots`) |
 | `Finder.swift` | `platform/src/explorer.rs` |
 | `WebAccessibility.swift` | not needed: Chromium builds its tree when a UI Automation client asks. Check in M0 |
@@ -105,8 +120,8 @@ Replace them with a small role enum in `core`, filled from UI Automation control
 | `Keys.swift` | `platform/src/input.rs` | `SendInput` |
 | `FinderTarget.swift` | `app/src/explorer_target.rs` | `IShellWindows`, `CabinetWClass`, desktop |
 | `AppSettings.swift`, `CapabilityRegistry.swift` | `app/src/settings.rs`, `registry.rs` | JSON in `%APPDATA%` |
-| `SettingsWindow.swift` | `app/src/settings_window.rs` | egui |
-| `GuideWindow.swift`, `GuideScenes.swift` | `app/src/guide.rs` | egui; scenes simplified |
+| `SettingsWindow.swift` | `app/src/settings_window.rs` | native Win32 controls, owner-drawn where the look needs it |
+| `GuideWindow.swift`, `GuideScenes.swift` | `app/src/guide.rs` | native Win32 window; scenes simplified |
 | `Relocation.swift` | dropped (macOS translocation only) |
 
 ### capabilities
@@ -120,7 +135,7 @@ Replace them with a small role enum in `core`, filled from UI Automation control
 | `NoteStore.swift` | `notes/src/store.rs` (mostly portable) | markdown files |
 | `NoteContext.swift` | `notes/src/context.rs` | UI Automation |
 | `NoteSummoner.swift` | `notes/src/summoner.rs` | `WH_KEYBOARD_LL` + `WH_MOUSE_LL` |
-| `NoteView.swift`, `MarkdownEditor.swift` | `notes/src/view.rs`, `editor.rs` | egui |
+| `NoteView.swift`, `MarkdownEditor.swift` | `notes/src/view.rs`, `editor.rs` | Win32 note window hosting a RichEdit control; styling from `notes/markdown.rs` |
 | `RecordingCapability.swift`, `RecordingInput.swift` | `recording/src/lib.rs`, `input.rs` | `RegisterHotKey`, low-level hooks |
 | `ScreenRecorder.swift` | `recording/src/recorder.rs` | Windows.Graphics.Capture, Media Foundation H.264 (`.mp4`) |
 | `RecordingFrame.swift` | `recording/src/frame.rs` | overlay excluded from capture |
