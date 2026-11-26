@@ -85,7 +85,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use igorio_kit::Image;
 use windows::Win32::Foundation::{
@@ -453,13 +453,18 @@ pub fn format_name(id: u32) -> String {
 /// The clipboard thread. Dropping it stops the thread; delayed formats it still owns are
 /// rendered first (`WM_RENDERALLFORMATS`), so a staged screenshot stays pasteable.
 pub struct Clipboard {
-    commands: SyncSender<Command>,
+    client: CommandClient,
     replies: Receiver<Reply>,
+    thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct CommandClient {
+    commands: SyncSender<Command>,
     shared: Arc<Shared>,
     /// The owner window as a number, only to post to it. Never leaves the module.
     window: isize,
-    next_ticket: AtomicU64,
-    thread: Option<JoinHandle<()>>,
+    next_ticket: Arc<AtomicU64>,
 }
 
 impl Clipboard {
@@ -480,11 +485,13 @@ impl Clipboard {
             .map_err(|_| ClipError::Stopped)?;
         let window = ready_rx.recv().map_err(|_| ClipError::Stopped)??;
         Ok(Clipboard {
-            commands,
+            client: CommandClient {
+                commands,
+                shared,
+                window,
+                next_ticket: Arc::new(AtomicU64::new(1)),
+            },
             replies,
-            shared,
-            window,
-            next_ticket: AtomicU64::new(1),
             thread: Some(thread),
         })
     }
@@ -528,7 +535,7 @@ impl Clipboard {
 
     /// The facts as of now. Never waits on another process.
     pub fn watch(&self) -> Watch {
-        let facts = *self.shared.lock();
+        let facts = *self.client.shared.lock();
         Watch {
             sequence: sequence(),
             last_change: facts.last_change,
@@ -536,6 +543,16 @@ impl Clipboard {
         }
     }
 
+    pub(crate) fn screenshot_reader(&self) -> ScreenshotClipboard {
+        ScreenshotClipboard(self.client.clone())
+    }
+
+    fn send(&self, request: Request) -> Result<Ticket, ClipError> {
+        self.client.send(request)
+    }
+}
+
+impl CommandClient {
     fn send(&self, request: Request) -> Result<Ticket, ClipError> {
         let ticket = Ticket(self.next_ticket.fetch_add(1, Ordering::Relaxed));
         let command = Command {
@@ -563,12 +580,83 @@ impl Clipboard {
     }
 }
 
+/// Latest foreign clipboard write. Windows can coalesce updates if the clipboard changes
+/// again before its message is processed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ClipboardChange {
+    pub sequence: u32,
+    pub time: f64,
+    pub captured_at: SystemTime,
+}
+
+pub(crate) struct ImageMetadata {
+    pub formats: Vec<(u32, Option<String>)>,
+    pub owner_pid: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ImageFormat {
+    Png,
+    DibV5,
+    Dib,
+}
+
+impl ImageFormat {
+    pub(crate) fn preferred(formats: &[(u32, Option<String>)]) -> Option<Self> {
+        if formats.iter().any(|(_, name)| {
+            name.as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case("PNG"))
+        }) {
+            Some(Self::Png)
+        } else if formats.iter().any(|(id, _)| *id == DIBV5) {
+            Some(Self::DibV5)
+        } else if formats.iter().any(|(id, _)| *id == DIB || *id == BITMAP) {
+            Some(Self::Dib)
+        } else {
+            None
+        }
+    }
+}
+
+/// Read-only client. Its per-request receivers leave the paste transaction reply queue
+/// to the app. The app keeps ownership of the clipboard thread.
+#[derive(Clone)]
+pub(crate) struct ScreenshotClipboard(CommandClient);
+
+impl ScreenshotClipboard {
+    pub(crate) fn latest(&self) -> Option<ClipboardChange> {
+        self.0.shared.lock().screenshot_change
+    }
+
+    pub(crate) fn inspect(
+        &self,
+        change: ClipboardChange,
+        deadline: Instant,
+    ) -> Result<Receiver<Result<ImageMetadata, ClipError>>, ClipError> {
+        let (tx, rx) = mpsc::channel();
+        self.0.send(Request::InspectImage(change, deadline, tx))?;
+        Ok(rx)
+    }
+
+    pub(crate) fn read(
+        &self,
+        change: ClipboardChange,
+        format: ImageFormat,
+        deadline: Instant,
+    ) -> Result<Receiver<Result<Vec<u8>, ClipError>>, ClipError> {
+        let (tx, rx) = mpsc::channel();
+        self.0
+            .send(Request::ReadImage(change, format, deadline, tx))?;
+        Ok(rx)
+    }
+}
+
 impl Drop for Clipboard {
     fn drop(&mut self) {
         // SAFETY: as in `send`.
         let _ = unsafe {
             PostMessageW(
-                Some(hwnd(self.window)),
+                Some(hwnd(self.client.window)),
                 WM_QUIT_THREAD,
                 WPARAM(0),
                 LPARAM(0),
@@ -602,6 +690,7 @@ struct Shared {
 #[derive(Debug, Clone, Copy, Default)]
 struct Facts {
     last_change: Option<Instant>,
+    screenshot_change: Option<ClipboardChange>,
     staged: Option<Staged>,
 }
 
@@ -625,6 +714,17 @@ enum Request {
     Stage(Payload),
     Restage,
     Restore(Snapshot, Option<u32>),
+    InspectImage(
+        ClipboardChange,
+        Instant,
+        Sender<Result<ImageMetadata, ClipError>>,
+    ),
+    ReadImage(
+        ClipboardChange,
+        ImageFormat,
+        Instant,
+        Sender<Result<Vec<u8>, ClipError>>,
+    ),
 }
 
 struct Command {
@@ -658,6 +758,14 @@ struct Stage {
 }
 
 impl Owner {
+    fn observe(&mut self, sequence: u32) -> bool {
+        if sequence == self.last_seen {
+            return false;
+        }
+        self.last_seen = sequence;
+        !self.own.contains(&sequence)
+    }
+
     fn remember_own(&mut self, sequence: u32) {
         if self.own.len() == OWN_SEQUENCES {
             self.own.pop_front();
@@ -715,16 +823,10 @@ fn run(
         match msg.message {
             WM_COMMAND_QUEUED => {
                 while let Ok(command) = commands.try_recv() {
-                    let result = if command.queued.elapsed() > STALE_AFTER {
-                        Err(ClipError::Stale)
-                    } else {
-                        execute(window, command.ticket, command.request)
-                    };
-                    let _ = replies.send(Reply {
-                        ticket: command.ticket,
-                        result,
-                    });
-                    (shared.wake)();
+                    if let Some(result) = execute(window, command) {
+                        let _ = replies.send(result);
+                        (shared.wake)();
+                    }
                 }
             }
             WM_QUIT_THREAD => break,
@@ -736,10 +838,20 @@ fn run(
     }
     // Requests still queued are answered so no caller waits for them.
     while let Ok(command) = commands.try_recv() {
-        let _ = replies.send(Reply {
-            ticket: command.ticket,
-            result: Err(ClipError::Stopped),
-        });
+        match command.request {
+            Request::InspectImage(_, _, reply) => {
+                let _ = reply.send(Err(ClipError::Stopped));
+            }
+            Request::ReadImage(_, _, _, reply) => {
+                let _ = reply.send(Err(ClipError::Stopped));
+            }
+            _ => {
+                let _ = replies.send(Reply {
+                    ticket: command.ticket,
+                    result: Err(ClipError::Stopped),
+                });
+            }
+        }
     }
     // SAFETY: our own window, on its thread. `DestroyWindow` sends `WM_RENDERALLFORMATS`
     // while we still own delayed formats; `OWNER` is still set for it.
@@ -750,8 +862,24 @@ fn run(
     OWNER.with(|cell| cell.borrow_mut().take());
 }
 
-fn execute(window: HWND, ticket: Ticket, request: Request) -> Result<Done, ClipError> {
-    match request {
+fn execute(window: HWND, command: Command) -> Option<Reply> {
+    let Command {
+        ticket,
+        queued,
+        request,
+    } = command;
+    let result = match request {
+        Request::InspectImage(change, deadline, reply) => {
+            let result = inspect_image(window, change, deadline);
+            let _ = reply.send(result);
+            return None;
+        }
+        Request::ReadImage(change, format, deadline, reply) => {
+            let result = read_image(window, change, format, deadline);
+            let _ = reply.send(result);
+            return None;
+        }
+        _ if queued.elapsed() > STALE_AFTER => Err(ClipError::Stale),
         Request::Snapshot => take_snapshot(window).map(Done::Snapshot),
         Request::Stage(payload) => {
             write_stage(window, ticket, Some(payload)).map(|sequence| Done::Staged { sequence })
@@ -761,7 +889,8 @@ fn execute(window: HWND, ticket: Ticket, request: Request) -> Result<Done, ClipE
         }
         Request::Restore(snapshot, if_sequence) => write_restore(window, &snapshot, if_sequence)
             .map(|sequence| Done::Restored { sequence }),
-    }
+    };
+    Some(Reply { ticket, result })
 }
 
 fn create_window() -> Result<HWND, ClipError> {
@@ -949,24 +1078,93 @@ fn on_overwritten() {
 fn on_update() {
     let sequence = sequence();
     let now = Instant::now();
-    let foreign = with_owner(|owner| {
-        if sequence == owner.last_seen {
-            return None;
-        }
-        owner.last_seen = sequence;
-        if owner.own.contains(&sequence) {
-            return None;
-        }
-        Some(owner.shared.clone())
-    })
-    .flatten();
+    let foreign =
+        with_owner(|owner| owner.observe(sequence).then(|| owner.shared.clone())).flatten();
     if let Some(shared) = foreign {
+        let change = ClipboardChange {
+            sequence,
+            time: crate::hook::now(),
+            captured_at: SystemTime::now(),
+        };
         shared.update(|facts| {
             facts.last_change = Some(now);
+            facts.screenshot_change = Some(change);
             if let Some(staged) = facts.staged.as_mut() {
                 staged.overwritten_at.get_or_insert(now);
             }
         });
+    }
+}
+
+/// Like write_restore, verify the sequence under the clipboard lock before touching data.
+/// The deadline is also checked after Open's bounded retry.
+fn open_for_screenshot(
+    window: HWND,
+    change: ClipboardChange,
+    deadline: Instant,
+) -> Result<(Open, Option<HWND>), ClipError> {
+    if Instant::now() >= deadline {
+        return Err(ClipError::Stale);
+    }
+    if sequence() != change.sequence {
+        return Err(ClipError::Changed);
+    }
+    let open = Open::new(window)?;
+    if Instant::now() >= deadline {
+        return Err(ClipError::Stale);
+    }
+    if sequence() != change.sequence {
+        return Err(ClipError::Changed);
+    }
+    // SAFETY: no arguments. The lock keeps the current data and owner together.
+    let owner = unsafe { GetClipboardOwner() }.ok();
+    if owner == Some(window) {
+        return Err(ClipError::OwnData);
+    }
+    Ok((open, owner))
+}
+
+fn inspect_image(
+    window: HWND,
+    change: ClipboardChange,
+    deadline: Instant,
+) -> Result<ImageMetadata, ClipError> {
+    let (open, owner) = open_for_screenshot(window, change, deadline)?;
+    let formats = enumerate_formats()?;
+    let mut owner_pid = 0;
+    if let Some(owner) = owner {
+        // SAFETY: PID is written to a local. A vanished window gives no PID.
+        unsafe { GetWindowThreadProcessId(owner, Some(&mut owner_pid)) };
+    }
+    drop(open);
+    if sequence() != change.sequence {
+        return Err(ClipError::Changed);
+    }
+    Ok(ImageMetadata { formats, owner_pid })
+}
+
+fn read_image(
+    window: HWND,
+    change: ClipboardChange,
+    format: ImageFormat,
+    deadline: Instant,
+) -> Result<Vec<u8>, ClipError> {
+    let id = match format {
+        ImageFormat::Png => ids().png,
+        ImageFormat::DibV5 => DIBV5,
+        ImageFormat::Dib => DIB,
+    };
+    let (open, _) = open_for_screenshot(window, change, deadline)?;
+    let data = read_format(id, SNAPSHOT_CAP);
+    drop(open);
+    // Delayed rendering may advance the sequence, so the pre-read check is authoritative.
+    match data {
+        Read::Bytes(bytes) if Instant::now() < deadline => Ok(bytes),
+        Read::Bytes(_) => Err(ClipError::Stale),
+        Read::TooBig => Err(ClipError::Payload(
+            "clipboard image exceeds byte cap".into(),
+        )),
+        Read::Failed => Err(ClipError::Payload("could not read clipboard image".into())),
     }
 }
 
@@ -1707,6 +1905,47 @@ mod tests {
 
     fn plain(id: u32) -> (u32, Option<String>) {
         (id, None)
+    }
+
+    #[test]
+    fn screenshot_reader_only_observes_new_foreign_sequences() {
+        let mut owner = Owner {
+            shared: Arc::new(Shared {
+                facts: Mutex::new(Facts::default()),
+                wake: Box::new(|| {}),
+            }),
+            stage: None,
+            own: VecDeque::new(),
+            last_seen: 1,
+        };
+        assert!(!owner.observe(1));
+        assert!(owner.observe(2));
+        assert!(!owner.observe(2));
+        for own in [3, 4, 5] {
+            // stage, delayed render, restore
+            owner.remember_own(own);
+            assert!(!owner.observe(own));
+        }
+        assert!(owner.observe(6));
+    }
+
+    #[test]
+    fn only_selects_supported_hglobal_image_formats() {
+        assert!(
+            ImageFormat::preferred(&[plain(TEXT), plain(TIFF), named(0xc001, "GIF")]).is_none()
+        );
+        assert!(matches!(
+            ImageFormat::preferred(&[plain(BITMAP)]),
+            Some(ImageFormat::Dib)
+        ));
+        assert!(matches!(
+            ImageFormat::preferred(&[plain(DIB), plain(DIBV5)]),
+            Some(ImageFormat::DibV5)
+        ));
+        assert!(matches!(
+            ImageFormat::preferred(&[plain(DIBV5), named(0xc001, "png")]),
+            Some(ImageFormat::Png)
+        ));
     }
 
     fn test_image() -> Image {
