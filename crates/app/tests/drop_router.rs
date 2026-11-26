@@ -4,13 +4,14 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use igorio_app::clipboard::Expect;
 use igorio_app::clipboard::Payload;
 use igorio_app::drop_router::*;
+use igorio_app::explorer::{FolderOutcome, FolderRequest};
 use igorio_app::hook::{Button, MouseEvent};
 use igorio_app::input::{Batch, Key, Modifier, Sent};
 use igorio_app::state::FairyState;
@@ -71,6 +72,13 @@ struct Fake {
     pressed: Vec<Key>,
     sent: u32,
     log: Vec<String>,
+    /// Folder lookups: (id, request, deadline).
+    folders: Vec<(u64, FolderRequest, f64)>,
+    /// Folder saves: (job, card, folder, movie).
+    writes: Vec<(u64, CardId, PathBuf, Option<PathBuf>)>,
+    /// The saver refuses new jobs (queue full).
+    saver_busy: bool,
+    reveals: Vec<(isize, PathBuf)>,
 }
 
 impl Fake {
@@ -143,6 +151,23 @@ impl Env for Fake {
         let id = self.id();
         self.saves.push(id);
         id
+    }
+    fn folder_lookup(&mut self, request: FolderRequest, deadline: f64) -> u64 {
+        let id = self.id();
+        self.folders.push((id, request, deadline));
+        id
+    }
+    fn save_to_folder(&mut self, card: &HeldCard, folder: &Path) -> Result<u64, String> {
+        if self.saver_busy {
+            return Err("the saver is busy".into());
+        }
+        let id = self.id();
+        self.writes
+            .push((id, card.id, folder.to_path_buf(), card.movie.clone()));
+        Ok(id)
+    }
+    fn reveal(&mut self, window: isize, file: &Path) {
+        self.reveals.push((window, file.to_path_buf()));
     }
     fn foreground_is(&self, window: isize, pid: u32) -> bool {
         self.checks.borrow_mut().push((window, pid));
@@ -893,23 +918,19 @@ fn a_double_click_on_our_own_window_is_ignored() {
 }
 
 #[test]
-fn explorer_background_says_saving_comes_next_and_keeps_the_card() {
+fn explorer_background_starts_a_folder_save_and_an_item_is_ignored() {
     let mut rig = Rig::new(1);
     rig.double_click();
-    let mut t = target("explorer.exe", false);
-    t.shell = Some(Shell::Explorer);
-    let mut spot = Spot::new(t);
-    spot.drop_spot = true;
-    rig.answer(0.17, Seen::Spot(Box::new(spot.clone())));
+    rig.answer(0.17, shell_spot(Shell::Explorer, true));
     assert!(rig.e.logged("SaveToFinder"));
-    assert_eq!(rig.s.hint(), Some(HINT_FOLDERS_NEXT));
+    assert_eq!(rig.e.folders.len(), 1);
     assert!(rig.s.is_holding());
     // An item (not the background) is the user opening a file: ignored.
     let mut rig = Rig::new(1);
     rig.double_click();
-    spot.drop_spot = false;
-    rig.answer(0.17, Seen::Spot(Box::new(spot)));
+    rig.answer(0.17, shell_spot(Shell::Explorer, false));
     assert!(rig.e.logged("→ Ignore"));
+    assert!(rig.e.folders.is_empty());
 }
 
 #[test]
@@ -2450,9 +2471,15 @@ fn google_docs_is_a_page_drawn_document() {
 fn explorer_background_is_a_drop_spot_and_an_item_is_not() {
     let mut t = target("explorer.exe", false);
     t.shell = Some(Shell::Explorer);
-    let list = el(UIA_ListControlTypeId);
+    let list = ElementInfo {
+        class_name: "UIItemsView".into(),
+        ..el(UIA_ListControlTypeId)
+    };
     let s = snapshot(t.clone(), vec![list.clone(), window()], None);
     assert!(spot_from_snapshot(&s, AT).drop_spot);
+    // A list that is not the items view (the role rule alone said yes before).
+    let s = snapshot(t.clone(), vec![el(UIA_ListControlTypeId), window()], None);
+    assert!(!spot_from_snapshot(&s, AT).drop_spot);
     let item = el(UIA_ListItemControlTypeId);
     let s = snapshot(t, vec![item, list, window()], None);
     assert!(!spot_from_snapshot(&s, AT).drop_spot);
@@ -3217,4 +3244,708 @@ fn a_prosemirror_composer_is_multi_line_and_an_input_single_line() {
     let s = snapshot(target("chrome.exe", false), vec![input, page()], None);
     let spot = spot_from_snapshot(&s, AT);
     assert_eq!(lines(spot.field_role.as_deref()), "single-line");
+}
+
+// MARK: Saving into a folder (Explorer and the desktop)
+
+const PICTURES: &str = r"C:\Users\me\Pictures";
+
+/// A shell spot as the router gets it: the folder view's background when `drop_spot`.
+fn shell_spot(shell: Shell, drop_spot: bool) -> Seen {
+    let mut t = target("explorer.exe", false);
+    t.shell = Some(shell);
+    t.class_name = match shell {
+        Shell::Explorer => "CabinetWClass".into(),
+        Shell::Desktop => "Progman".into(),
+    };
+    let mut spot = Spot::new(t);
+    spot.role = "AXList".into();
+    spot.drop_spot = drop_spot;
+    Seen::Spot(Box::new(spot))
+}
+
+fn png(folder: &str, name: &str) -> PathBuf {
+    Path::new(folder).join(name)
+}
+
+impl Rig {
+    /// Double-click on the background of a folder view, then the release.
+    fn save_double_click(&mut self, shell: Shell) {
+        self.double_click();
+        self.answer(0.17, shell_spot(shell, true));
+        self.up(0.25);
+    }
+
+    /// Explorer answers the newest folder lookup.
+    fn folder_answer(&mut self, t: f64, outcome: FolderOutcome) {
+        self.to(t);
+        let id = self.e.folders.last().expect("a folder lookup").0;
+        self.r
+            .folder_answered(id, outcome, t, &mut self.s, &mut self.e);
+    }
+
+    /// The saver finishes the newest write.
+    fn written(&mut self, t: f64, result: Result<PathBuf, SaveFail>) {
+        self.to(t);
+        let job = self.e.writes.last().expect("a write").0;
+        self.r
+            .folder_saved(job, result, t, &mut self.s, &mut self.e);
+    }
+
+    fn in_pictures(&mut self, t: f64) {
+        self.folder_answer(t, FolderOutcome::Folder(PathBuf::from(PICTURES)));
+    }
+}
+
+fn fail(problem: SaveProblem) -> SaveFail {
+    SaveFail {
+        problem,
+        why: "os error".into(),
+    }
+}
+
+#[test]
+fn a_double_click_on_the_folder_background_saves_the_card_and_reveals_it() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.save_double_click(Shell::Explorer);
+    assert_eq!(
+        rig.e.folders,
+        vec![(2, FolderRequest::Window(0x10), FOLDER_DEADLINE)]
+    );
+    assert!(rig.r.busy());
+    rig.in_pictures(0.3);
+    assert_eq!(rig.e.writes.len(), 1);
+    assert_eq!(rig.e.writes[0].1, id);
+    assert_eq!(rig.e.writes[0].2, PathBuf::from(PICTURES));
+    assert_eq!(rig.e.writes[0].3, None);
+    // The card leaves only once the file exists.
+    assert!(rig.s.card(id).is_some());
+    let file = png(PICTURES, "Screenshot 1970-01-01 000000.png");
+    rig.written(0.4, Ok(file.clone()));
+    assert!(rig.s.card(id).is_none());
+    assert_eq!(rig.s.hint(), Some("saved to Pictures"));
+    assert_eq!(rig.e.reveals, vec![(0x10, file)]);
+    assert!(!rig.r.busy());
+    // Nothing touched the clipboard or the keyboard.
+    assert!(rig.e.stages.is_empty() && rig.e.pressed.is_empty() && rig.e.sent == 0);
+    for line in [
+        "drop-spot=yes",
+        "→ SaveToFinder",
+        "asking Explorer for the folder of Window(16) (request 2, 0.50s)",
+        r"folder (request 2, 130 ms): C:\Users\me\Pictures",
+        "(1/1): writing Screenshot ",
+        r"saved C:\Users\me\Pictures\Screenshot 1970-01-01 000000.png",
+        "delivered 1 card(s) → saved to Pictures",
+        "reveal C:",
+        "save over",
+    ] {
+        assert!(rig.e.logged(line), "{line}: {:#?}", rig.e.log);
+    }
+}
+
+#[test]
+fn a_double_click_on_the_empty_desktop_saves_into_the_desktop_folder() {
+    let mut rig = Rig::new(1);
+    rig.save_double_click(Shell::Desktop);
+    assert_eq!(rig.e.folders[0].1, FolderRequest::Desktop);
+    let desktop = r"C:\Users\me\OneDrive\Desktop";
+    rig.folder_answer(0.3, FolderOutcome::Folder(PathBuf::from(desktop)));
+    assert_eq!(rig.e.writes[0].2, PathBuf::from(desktop));
+    let file = png(desktop, "Screenshot.png");
+    rig.written(0.4, Ok(file.clone()));
+    assert_eq!(rig.s.hint(), Some("saved to Desktop"));
+    assert!(!rig.s.is_holding());
+    assert_eq!(rig.e.reveals, vec![(0x10, file)]);
+}
+
+/// Swift `saveToFinder`: `let pile = state.deliverable` (top first), each saved in turn,
+/// then one `deliver(ids: saved…, hint: "saved N to <folder>")`.
+#[test]
+fn a_pile_is_saved_top_first_one_file_at_a_time_and_leaves_together() {
+    let mut rig = Rig::new(3);
+    let ids = rig.ids();
+    rig.save_double_click(Shell::Explorer);
+    rig.in_pictures(0.3);
+    let mut files = Vec::new();
+    for (k, id) in ids.iter().enumerate() {
+        // One write at a time, in pile order.
+        assert_eq!(rig.e.writes.len(), k + 1);
+        assert_eq!(rig.e.writes[k].1, *id);
+        assert!(rig.s.card(*id).is_some());
+        let file = png(PICTURES, &format!("Screenshot ({}).png", k + 1));
+        files.push(file.clone());
+        rig.written(0.4 + k as f64 * 0.1, Ok(file));
+    }
+    assert!(ids.iter().all(|id| rig.s.card(*id).is_none()));
+    assert_eq!(rig.s.hint(), Some("saved 3 to Pictures"));
+    // The last file written is the one selected.
+    assert_eq!(rig.e.reveals, vec![(0x10, files[2].clone())]);
+}
+
+#[test]
+fn a_recording_is_copied_as_its_movie_file() {
+    let mut rig = Rig::with_movie();
+    rig.save_double_click(Shell::Explorer);
+    rig.in_pictures(0.3);
+    assert_eq!(
+        rig.e.writes[0].3,
+        Some(PathBuf::from(r"C:\Videos\clip one.mp4"))
+    );
+    rig.written(0.4, Ok(png(PICTURES, "clip one.mp4")));
+    assert_eq!(rig.s.hint(), Some("saved to Pictures"));
+
+    // Already in that folder (`FinderTarget.copy`): nothing is copied.
+    let mut rig = Rig::with_movie();
+    rig.save_double_click(Shell::Explorer);
+    rig.folder_answer(0.3, FolderOutcome::Folder(PathBuf::from(r"c:\videos\")));
+    rig.to(1.0);
+    assert!(rig.e.writes.is_empty());
+    assert_eq!(rig.s.hint(), Some(HINT_ALREADY_SAVED));
+    assert!(!rig.s.is_holding());
+    assert_eq!(
+        rig.e.reveals,
+        vec![(0x10, PathBuf::from(r"C:\Videos\clip one.mp4"))]
+    );
+}
+
+#[test]
+fn places_that_are_not_folders_and_silent_explorers_keep_the_card() {
+    let cases = [
+        (
+            FolderOutcome::NotAFolder {
+                display_name: "This PC".into(),
+            },
+            "can't save in This PC · still holding it",
+        ),
+        (
+            FolderOutcome::NotAFolder {
+                display_name: "Recycle Bin".into(),
+            },
+            "can't save in Recycle Bin · still holding it",
+        ),
+        (FolderOutcome::TimedOut, HINT_EXPLORER_SLOW),
+        (FolderOutcome::Failed("RPC".into()), HINT_SAVE_FAILED),
+    ];
+    for (outcome, hint) in cases {
+        let mut rig = Rig::new(1);
+        rig.save_double_click(Shell::Explorer);
+        rig.folder_answer(0.3, outcome);
+        rig.to(3.0);
+        assert!(rig.e.writes.is_empty(), "{hint}");
+        assert_eq!(rig.s.hint(), Some(hint));
+        assert_eq!(rig.s.reject_tick(), 1, "{hint}: the card wobbles");
+        assert!(rig.s.is_holding());
+        assert!(!rig.r.busy());
+    }
+    // No answer at all (the lookup service is gone): given up after the grace.
+    let mut rig = Rig::new(1);
+    rig.save_double_click(Shell::Explorer);
+    rig.to(0.15 + FOLDER_DEADLINE + LOOKUP_GRACE - 0.01);
+    assert!(rig.r.busy());
+    rig.to(3.0);
+    assert_eq!(rig.s.hint(), Some(HINT_EXPLORER_SLOW));
+    assert!(rig.s.is_holding() && !rig.r.busy());
+}
+
+#[test]
+fn a_write_error_keeps_the_card_with_a_hint_that_names_it() {
+    for (problem, hint) in [
+        (SaveProblem::ReadOnly, HINT_READ_ONLY),
+        (SaveProblem::DiskFull, HINT_DISK_FULL),
+        (SaveProblem::Other, HINT_SAVE_FAILED),
+    ] {
+        let mut rig = Rig::new(1);
+        rig.save_double_click(Shell::Explorer);
+        rig.in_pictures(0.3);
+        rig.written(0.4, Err(fail(problem)));
+        assert_eq!(rig.s.hint(), Some(hint));
+        assert!(rig.s.is_holding());
+        assert!(rig.e.reveals.is_empty());
+        assert!(!rig.r.busy());
+    }
+    // The saver does not take the job: the same, at once.
+    let mut rig = Rig::new(1);
+    rig.e.saver_busy = true;
+    rig.save_double_click(Shell::Explorer);
+    rig.in_pictures(0.3);
+    assert_eq!(rig.s.hint(), Some(HINT_SAVE_FAILED));
+    assert!(rig.s.is_holding() && !rig.r.busy());
+    // A write that never answers is given up.
+    let mut rig = Rig::new(1);
+    rig.save_double_click(Shell::Explorer);
+    rig.in_pictures(0.3);
+    rig.to(0.3 + SAVE_TIMEOUT + 0.1);
+    assert_eq!(rig.s.hint(), Some(HINT_SAVE_FAILED));
+    assert!(rig.s.is_holding() && !rig.r.busy());
+}
+
+#[test]
+fn a_write_error_in_a_pile_delivers_what_was_saved_then_names_the_problem() {
+    let mut rig = Rig::new(3);
+    let ids = rig.ids();
+    rig.save_double_click(Shell::Explorer);
+    rig.in_pictures(0.3);
+    let first = png(PICTURES, "a.png");
+    rig.written(0.4, Ok(first.clone()));
+    rig.written(0.5, Err(fail(SaveProblem::DiskFull)));
+    // The rest is not tried.
+    assert_eq!(rig.e.writes.len(), 2);
+    assert!(rig.s.card(ids[0]).is_none());
+    assert!(rig.s.card(ids[1]).is_some() && rig.s.card(ids[2]).is_some());
+    assert_eq!(rig.s.hint(), Some("saved to Pictures"));
+    assert_eq!(rig.e.reveals, vec![(0x10, first)]);
+    rig.to(0.5 + SAVE_FAIL_STEP + 0.01);
+    assert_eq!(rig.s.hint(), Some(HINT_DISK_FULL));
+    assert!(!rig.r.busy());
+}
+
+#[test]
+fn a_press_or_a_key_before_the_save_starts_cancels_it() {
+    // A press while Explorer is asked.
+    let mut rig = Rig::new(1);
+    rig.save_double_click(Shell::Explorer);
+    rig.down(0.28, 1);
+    rig.in_pictures(0.3);
+    rig.to(3.0);
+    assert!(rig.e.logged("another press → the save is dropped"));
+    assert!(rig.e.writes.is_empty() && rig.s.is_holding());
+    // A key while the button is still down after the answer.
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, shell_spot(Shell::Explorer, true));
+    rig.in_pictures(0.2);
+    rig.e.keys += 1;
+    rig.up(0.25);
+    rig.to(3.0);
+    assert!(rig.e.logged("the user typed → the save is dropped"));
+    assert!(rig.e.writes.is_empty() && rig.s.is_holding());
+    assert!(!rig.r.busy());
+}
+
+#[test]
+fn once_the_file_is_being_written_the_save_finishes() {
+    let mut rig = Rig::new(2);
+    rig.save_double_click(Shell::Explorer);
+    rig.in_pictures(0.3);
+    rig.down(0.32, 1);
+    rig.e.keys += 1;
+    assert!(rig.e.logged("another press → the save goes on"));
+    rig.written(0.4, Ok(png(PICTURES, "a.png")));
+    rig.written(0.5, Ok(png(PICTURES, "b.png")));
+    assert!(!rig.s.is_holding());
+    assert_eq!(rig.s.hint(), Some("saved 2 to Pictures"));
+}
+
+#[test]
+fn a_held_button_is_a_drag_and_saves_nothing() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, shell_spot(Shell::Explorer, true));
+    rig.in_pictures(0.2);
+    // The button stays down past MOUSE_UP_TIMEOUT.
+    rig.to(3.0);
+    assert!(rig.e.logged("the button is still down (a drag) → no save"));
+    assert!(rig.e.writes.is_empty() && rig.s.is_holding() && !rig.r.busy());
+    assert_eq!(rig.s.reject_tick(), 0, "quietly");
+}
+
+#[test]
+fn a_card_shaken_off_before_its_save_is_skipped() {
+    let mut rig = Rig::new(2);
+    let ids = rig.ids();
+    rig.save_double_click(Shell::Explorer);
+    // The top card is shaken off while Explorer is asked.
+    rig.s.dissolve(0.27);
+    rig.in_pictures(0.3);
+    assert_eq!(rig.e.writes.len(), 1);
+    assert_eq!(rig.e.writes[0].1, ids[1]);
+    rig.written(0.4, Ok(png(PICTURES, "b.png")));
+    assert_eq!(rig.s.hint(), Some("saved to Pictures"));
+    assert!(rig.e.logged(&format!(
+        "card {} left the pile meanwhile → skipped",
+        ids[0].0
+    )));
+    // Everything gone before the save: nothing to do, quietly.
+    let mut rig = Rig::new(1);
+    rig.save_double_click(Shell::Explorer);
+    rig.s.discard_all(0.27);
+    rig.in_pictures(0.3);
+    rig.to(2.0);
+    assert!(rig.e.writes.is_empty() && !rig.r.busy());
+    assert!(rig.e.reveals.is_empty());
+}
+
+#[test]
+fn a_capture_landing_during_the_save_stays_on_the_pile() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.save_double_click(Shell::Explorer);
+    rig.in_pictures(0.3);
+    rig.s.hold(
+        image(),
+        1.0,
+        SystemTime::UNIX_EPOCH,
+        false,
+        None,
+        None,
+        0.35,
+    );
+    rig.written(0.4, Ok(png(PICTURES, "a.png")));
+    rig.to(2.0);
+    assert_eq!(rig.e.writes.len(), 1);
+    assert!(rig.s.card(id).is_none());
+    assert_eq!(rig.s.deliverable().len(), 1);
+}
+
+#[test]
+fn a_second_double_click_during_a_save_is_ignored() {
+    let mut rig = Rig::new(2);
+    rig.save_double_click(Shell::Explorer);
+    rig.in_pictures(0.3);
+    rig.double_click_at(0.5);
+    assert!(rig.e.logged("busy=yes"));
+    assert_eq!(rig.e.folders.len(), 1);
+    assert_eq!(rig.e.lookups.len(), 1);
+    rig.written(0.6, Ok(png(PICTURES, "a.png")));
+    rig.written(0.7, Ok(png(PICTURES, "b.png")));
+    assert!(!rig.s.is_holding());
+}
+
+/// Quit while a file is written: the saver thread finishes that file (it writes a temp
+/// file and renames it, and `LiveEnv::finish` gives it a second); the router starts no more
+/// writes, delivers nothing and ignores the late answer.
+#[test]
+fn quit_during_a_save_starts_no_more_writes() {
+    let mut rig = Rig::new(2);
+    rig.save_double_click(Shell::Explorer);
+    rig.in_pictures(0.3);
+    assert_eq!(rig.r.quit(0.35, &mut rig.e), None);
+    assert!(
+        rig.e
+            .logged("quit: the file being written is finished by the saver")
+    );
+    assert!(!rig.r.busy());
+    rig.written(0.4, Ok(png(PICTURES, "a.png")));
+    rig.to(3.0);
+    assert_eq!(rig.e.writes.len(), 1);
+    assert_eq!(rig.s.deliverable().len(), 2);
+    assert!(rig.e.reveals.is_empty());
+    // While Explorer is asked: nothing at all is written.
+    let mut rig = Rig::new(1);
+    rig.save_double_click(Shell::Explorer);
+    assert_eq!(rig.r.quit(0.27, &mut rig.e), None);
+    rig.in_pictures(0.3);
+    assert!(rig.e.writes.is_empty());
+}
+
+#[test]
+fn presses_on_two_windows_or_an_answer_about_another_window_save_nothing() {
+    let mut rig = Rig::new(1);
+    rig.down(0.0, 1);
+    rig.up(0.08);
+    rig.mouse(
+        MouseEvent::Down {
+            button: Button::Left,
+            x: AT.0,
+            y: AT.1,
+            time: 0.15,
+            click_count: 2,
+            injected: false,
+            window: 0x20,
+            touch: false,
+        },
+        0.15,
+    );
+    assert!(rig.e.lookups.is_empty() && rig.e.folders.is_empty());
+    // The lookup found another window than the one pressed.
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    let Seen::Spot(mut spot) = shell_spot(Shell::Explorer, true) else {
+        unreachable!()
+    };
+    spot.target.window = 0x30;
+    rig.answer(0.17, Seen::Spot(spot));
+    assert!(rig.e.folders.is_empty());
+}
+
+#[test]
+fn not_a_drop_spot_in_explorer_is_ignored_without_a_folder_lookup() {
+    for shell in [Shell::Explorer, Shell::Desktop] {
+        let mut rig = Rig::new(1);
+        rig.double_click();
+        rig.answer(0.17, shell_spot(shell, false));
+        rig.up(0.25);
+        rig.to(3.0);
+        assert!(rig.e.logged("drop-spot=no"));
+        assert!(rig.e.folders.is_empty() && rig.e.lookups.len() == 1);
+        assert!(rig.s.is_holding() && rig.s.reject_tick() == 0);
+    }
+}
+
+#[test]
+fn hover_says_save_only_over_the_folder_background() {
+    let mut rig = Rig::new(1);
+    rig.moved(0.0, AT.0, AT.1);
+    rig.to(0.23);
+    rig.answer(0.24, shell_spot(Shell::Explorer, true));
+    assert_eq!(rig.s.hint(), Some(HINT_HOVER_SAVE));
+    // Onto the navigation pane: the hint goes.
+    rig.moved(0.5, AT.0, AT.1);
+    rig.to(0.75);
+    let s = explorer_snapshot(vec![nav_pane(), proper_tree_host()]);
+    rig.answer(0.76, Seen::Spot(Box::new(spot_from_snapshot(&s, AT))));
+    assert_eq!(rig.s.hint(), None);
+    assert_eq!(
+        hover_hint(&shell_spot(Shell::Desktop, true)),
+        Some(HINT_HOVER_SAVE)
+    );
+    assert_eq!(hover_hint(&shell_spot(Shell::Explorer, false)), None);
+}
+
+// Windows 11 Explorer, as UI Automation shows it (read from a live window, build 26300):
+// the top-level `CabinetWClass` window holds a `TITLE_BAR_SCAFFOLDING_WINDOW_CLASS` pane, a
+// XAML header (`Microsoft.UI.Content.DesktopChildSiteBridge` > `InputSiteWindowClass`, with
+// the tabs, the command bar, the breadcrumb bar, the address and search boxes), and the
+// active tab (`ShellTabWindowClass` > `DUIViewWndClassName`) with the status bar, the
+// navigation pane (`ProperTreeHost` > `SysTreeView32`, a Pane) and the folder view
+// (`DUIListView`, the `SHELLDLL_DefView` window, > the `UIItemsView` list, the
+// `DirectUIHWND` window, > `UIItem` list items > `UIProperty` edits for names and columns).
+
+fn named(control: UIA_CONTROLTYPE_ID, class: &str) -> ElementInfo {
+    ElementInfo {
+        class_name: class.into(),
+        ..el(control)
+    }
+}
+
+fn cabinet() -> ElementInfo {
+    ElementInfo {
+        class_name: "CabinetWClass".into(),
+        ..window()
+    }
+}
+
+fn tab_panes() -> Vec<ElementInfo> {
+    vec![
+        named(UIA_PaneControlTypeId, "DUIViewWndClassName"),
+        named(UIA_PaneControlTypeId, "ShellTabWindowClass"),
+        cabinet(),
+    ]
+}
+
+fn items_view() -> Vec<ElementInfo> {
+    let mut chain = vec![
+        named(UIA_ListControlTypeId, "UIItemsView"),
+        named(UIA_PaneControlTypeId, "DUIListView"),
+    ];
+    chain.extend(tab_panes());
+    chain
+}
+
+fn nav_pane() -> ElementInfo {
+    named(UIA_PaneControlTypeId, "SysTreeView32")
+}
+
+fn proper_tree_host() -> ElementInfo {
+    named(UIA_PaneControlTypeId, "ProperTreeHost")
+}
+
+fn header_site() -> Vec<ElementInfo> {
+    vec![
+        named(UIA_PaneControlTypeId, "InputSiteWindowClass"),
+        named(
+            UIA_PaneControlTypeId,
+            "Microsoft.UI.Content.DesktopChildSiteBridge",
+        ),
+        cabinet(),
+    ]
+}
+
+/// A snapshot of Explorer; a chain that does not reach the window is put in the tab.
+fn explorer_snapshot(hit_and_up: Vec<ElementInfo>) -> Snapshot {
+    let mut t = target("explorer.exe", false);
+    t.shell = Some(Shell::Explorer);
+    t.class_name = "CabinetWClass".into();
+    let mut chain = hit_and_up;
+    if !chain.last().is_some_and(|e| e.top_level) {
+        chain.extend(tab_panes());
+    }
+    snapshot(t, chain, None)
+}
+
+fn drop_spot_of(chain: Vec<ElementInfo>) -> bool {
+    spot_from_snapshot(&explorer_snapshot(chain), AT).drop_spot
+}
+
+fn with_view(hit: Vec<ElementInfo>) -> Vec<ElementInfo> {
+    let mut chain = hit;
+    chain.extend(items_view());
+    chain
+}
+
+#[test]
+fn only_the_items_views_background_is_a_drop_spot_in_explorer() {
+    // Icons or details view, the area beside and below the last item: the list itself.
+    assert!(drop_spot_of(items_view()));
+    // "This folder is empty.": a text right in the list.
+    assert!(drop_spot_of(with_view(vec![el(UIA_TextControlTypeId)])));
+    // An item, its name, a cell of the details view.
+    assert!(!drop_spot_of(with_view(vec![named(
+        UIA_ListItemControlTypeId,
+        "UIItem"
+    )])));
+    assert!(!drop_spot_of(with_view(vec![
+        named(UIA_EditControlTypeId, "UIProperty"),
+        named(UIA_ListItemControlTypeId, "UIItem"),
+    ])));
+    assert!(!drop_spot_of(with_view(vec![
+        named(UIA_TextControlTypeId, "UIProperty"),
+        named(UIA_ListItemControlTypeId, "UIItem"),
+    ])));
+    // The details view's column header: an item, and its free space past the last column.
+    assert!(!drop_spot_of(with_view(vec![
+        named(UIA_HeaderItemControlTypeId, "UIColumnHeader"),
+        named(UIA_HeaderControlTypeId, "UIColumnHeader"),
+    ])));
+    assert!(!drop_spot_of(with_view(vec![named(
+        UIA_HeaderControlTypeId,
+        "UIColumnHeader"
+    )])));
+    // The navigation pane's free space and its items.
+    assert!(!drop_spot_of(vec![nav_pane(), proper_tree_host()]));
+    assert!(!drop_spot_of(vec![
+        el(UIA_TreeItemControlTypeId),
+        nav_pane(),
+        proper_tree_host()
+    ]));
+    // The status bar, and the details or preview pane (a pane of the tab, not the view).
+    assert!(!drop_spot_of(vec![named(
+        UIA_StatusBarControlTypeId,
+        "StatusBarModuleInner"
+    )]));
+    assert!(!drop_spot_of(vec![named(
+        UIA_PaneControlTypeId,
+        "PreviewPane"
+    )]));
+    // The title bar area and the XAML header: the breadcrumb bar's free space, the address
+    // and search boxes, the header's free space, the command bar.
+    assert!(!drop_spot_of(vec![
+        named(UIA_PaneControlTypeId, "TITLE_BAR_SCAFFOLDING_WINDOW_CLASS"),
+        cabinet(),
+    ]));
+    let mut breadcrumb = vec![named(UIA_GroupControlTypeId, "LandmarkTarget")];
+    breadcrumb.extend(header_site());
+    assert!(!drop_spot_of(breadcrumb));
+    let address = ElementInfo {
+        value_pattern: true,
+        value_read_only: Some(false),
+        ..named(UIA_EditControlTypeId, "TextBox")
+    };
+    let mut address_bar = vec![address, named(UIA_GroupControlTypeId, "AutoSuggestBox")];
+    address_bar.extend(header_site());
+    assert!(!drop_spot_of(address_bar));
+    assert!(!drop_spot_of(header_site()));
+    let mut command_bar = vec![named(UIA_AppBarControlTypeId, "ApplicationBar")];
+    command_bar.extend(header_site());
+    assert!(!drop_spot_of(command_bar));
+}
+
+#[test]
+fn the_desktops_empty_area_is_a_drop_spot_and_an_icon_is_not() {
+    let mut t = target("explorer.exe", false);
+    t.shell = Some(Shell::Desktop);
+    t.class_name = "Progman".into();
+    let progman = ElementInfo {
+        class_name: "Progman".into(),
+        ..window()
+    };
+    let view = named(UIA_PaneControlTypeId, "SHELLDLL_DefView");
+    let list = named(UIA_ListControlTypeId, "SysListView32");
+    let icon = named(UIA_ListItemControlTypeId, "");
+    let spot = |chain: Vec<ElementInfo>| spot_from_snapshot(&snapshot(t.clone(), chain, None), AT);
+    assert!(spot(vec![list.clone(), view.clone(), progman.clone()]).drop_spot);
+    // Desktop icons hidden: the list is hidden and the view is the hit.
+    assert!(spot(vec![view.clone(), progman.clone()]).drop_spot);
+    assert!(
+        !spot(vec![
+            icon.clone(),
+            list.clone(),
+            view.clone(),
+            progman.clone()
+        ])
+        .drop_spot
+    );
+    assert!(
+        !spot(vec![
+            el(UIA_EditControlTypeId),
+            icon,
+            list,
+            view,
+            progman.clone()
+        ])
+        .drop_spot
+    );
+    // Not inside the desktop's view at all.
+    assert!(!spot(vec![progman]).drop_spot);
+}
+
+#[test]
+fn save_errors_are_told_apart_by_their_os_code() {
+    use igorio_app::saver::SaveError;
+    use std::io::Error;
+    let of = |code: i32| SaveFail::of(&SaveError::Io(Error::from_raw_os_error(code))).problem;
+    assert_eq!(of(5), SaveProblem::ReadOnly);
+    assert_eq!(of(112), SaveProblem::DiskFull);
+    assert_eq!(of(39), SaveProblem::DiskFull);
+    assert_eq!(of(3), SaveProblem::Other);
+    assert_eq!(
+        SaveFail::of(&SaveError::Encode("x".into())).problem,
+        SaveProblem::Other
+    );
+}
+
+#[test]
+fn saved_hints_name_the_folder() {
+    assert_eq!(saved_hint(1, Path::new(PICTURES)), "saved to Pictures");
+    assert_eq!(saved_hint(2, Path::new(PICTURES)), "saved 2 to Pictures");
+    assert_eq!(saved_hint(1, Path::new(r"D:\")), r"saved to D:\");
+    assert!(same_folder(
+        Some(Path::new(r"C:\Videos")),
+        Path::new(r"c:\videos\")
+    ));
+    assert!(!same_folder(
+        Some(Path::new(r"C:\Videos\a")),
+        Path::new(r"C:\Videos")
+    ));
+    assert!(!same_folder(None, Path::new(r"C:\Videos")));
+}
+
+#[test]
+fn anything_inside_an_item_is_not_background() {
+    // A group (a thumbnail's frame, a tile's text block) inside an item: the core's role
+    // rule alone takes a group for background.
+    assert!(!drop_spot_of(with_view(vec![
+        el(UIA_GroupControlTypeId),
+        named(UIA_ListItemControlTypeId, "UIItem"),
+    ])));
+}
+
+#[test]
+fn an_answer_for_another_write_is_ignored() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.save_double_click(Shell::Explorer);
+    rig.in_pictures(0.3);
+    let job = rig.e.writes[0].0;
+    rig.r.folder_saved(
+        job + 99,
+        Ok(png(PICTURES, "other.png")),
+        0.35,
+        &mut rig.s,
+        &mut rig.e,
+    );
+    assert!(rig.s.card(id).is_some() && rig.r.busy());
+    rig.written(0.4, Ok(png(PICTURES, "a.png")));
+    assert!(rig.s.card(id).is_none());
 }

@@ -25,7 +25,7 @@
 //!    gather the facts and call `drop_policy::decide`.
 //! 3. `Paste`: deliver now. `CheckFocusAfterMouseUp`: wait for the release and a settle
 //!    delay, look again with focus, and confirm a text input or a canvas as
-//!    `resolveAfterMouseUp` does. `SaveToFinder`: [`Router::save_to_folder`] (not done yet).
+//!    `resolveAfterMouseUp` does. `SaveToFinder`: save into the folder, see below.
 //! 4. Delivery (`deliverPaste` and `pasteRest`): the whole pile, top card first, one paste
 //!    per card, 0.45 s apart. Per card (`PasteJob`): payload ready (a terminal gets a PNG
 //!    saved to `Settings::pasted_dir` and its quoted path) and the user's clipboard saved,
@@ -33,6 +33,28 @@
 //!    check again and press Ctrl+V, then watch the reads until `OutcomeRules` decides.
 //! 5. Restore: when the delivery is over, `RestoreRules` decides when to put the user's
 //!    clipboard back; overwrites are handled with `overwrite_step` meanwhile.
+//!
+//! # Saving into a folder (`saveToFinder`)
+//!
+//! A double-click on the empty background of a File Explorer folder view or of the desktop
+//! ([`shell_drop_spot`]) saves the pile there. The steps of the saving phase:
+//!
+//! 1. Asking: [`Env::folder_lookup`] asks `explorer::Explorer` for the folder of the
+//!    double-clicked top-level window (or the desktop) with [`FOLDER_DEADLINE`]. A later
+//!    press or a typed key drops the save.
+//! 2. Ready: the folder is known; wait for the button to come up (still down after
+//!    `MOUSE_UP_TIMEOUT` is a drag: no save). A press or a key still drops the save.
+//! 3. Writing: one card at a time on the saver thread ([`Env::save_to_folder`]): a PNG, or
+//!    the movie file copied for a recording (not copied when it already lives in that
+//!    folder). From here a press or a key no longer stops it: the file being written is
+//!    finished (the saver never leaves half a file). A card shaken off before its own write
+//!    is skipped; a capture that lands meanwhile is not taken (the pile is fixed at the
+//!    double-click, top card first, as `deliverable` gives it).
+//! 4. Done: the saved cards are delivered at once with "saved to <folder>" (Swift: one
+//!    `deliver` with every saved id), and [`Env::reveal`] selects the last file written.
+//!    A write error stops the rest. With nothing saved the card wobbles with a hint naming
+//!    the problem; otherwise that hint follows the "saved" one after [`SAVE_FAIL_STEP`] per
+//!    saved card (Swift's "couldn't save N").
 //!
 //! # Windows differences
 //!
@@ -54,6 +76,7 @@
 //!   that also times out, the fairy says so and keeps the card. It never pastes into a
 //!   window it knows nothing about.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -72,16 +95,20 @@ use igorio_kit::HeldCard;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+use windows::Win32::UI::Accessibility::{UIA_HeaderControlTypeId, UIA_HeaderItemControlTypeId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetSystemMetrics, SM_SWAPBUTTON};
 
 use crate::clipboard::{self, ClipError, Clipboard, Done, Expect, Payload, Reply, Ticket};
+use crate::explorer::{Explorer, FolderOutcome, FolderRequest};
 use crate::hook::{self, Button, KeyWatch, MouseEvent};
 use crate::input::{self, Batch, Key, Modifier, Sent};
 use crate::saver;
 use crate::settings::{DefaultFolders, Settings};
 use crate::state::FairyState;
-use crate::uia::{self, ElementInfo, Lookup, Outcome, Probe, Snapshot, Target, Uia, UiaNode};
+use crate::uia::{
+    self, ElementInfo, Lookup, Outcome, Probe, Shell, Snapshot, Target, Uia, UiaNode,
+};
 
 // MARK: Constants
 
@@ -221,7 +248,14 @@ pub const HINT_HOVER_SAVE: &str = "double-click to save here";
 pub const HINT_ELEVATED: &str = "can't reach this window";
 pub const HINT_CLIPBOARD: &str = "can't save your clipboard · still holding it";
 pub const HINT_SLOW: &str = "this app didn't answer · still holding it";
-pub const HINT_FOLDERS_NEXT: &str = "saving to folders comes next";
+/// Saving into a folder (`saveToFinder`). The success hints are [`saved_hint`] and
+/// [`HINT_ALREADY_SAVED`]; [`not_a_folder_hint`] names a place that is not a folder.
+pub const HINT_SAVE_FAILED: &str = "can't save here · still holding it";
+pub const HINT_READ_ONLY: &str = "this folder is read-only · still holding it";
+pub const HINT_DISK_FULL: &str = "disk is full · still holding it";
+pub const HINT_EXPLORER_SLOW: &str = "Explorer didn't answer · still holding it";
+/// A recording whose movie file already lives in that folder: nothing is copied.
+pub const HINT_ALREADY_SAVED: &str = "already saved here";
 pub const HINT_RESTORE_FAILED: &str = "couldn't put your clipboard back";
 /// Something read the paste but nothing proves the target took it: the card stays (a lost
 /// card is worse than a second paste) and the user is asked to look.
@@ -231,6 +265,88 @@ pub const PROBE_TIMEOUT: f64 = 3.0;
 /// The keyboard focus is not in the target field (Swift's canvas text, used for "the paste
 /// would go nowhere").
 pub const HINT_NOT_FOCUSED: &str = HINT_CANVAS_FAILED;
+
+/// Deadline of the folder lookup (`explorer::DEFAULT_DEADLINE`).
+pub const FOLDER_DEADLINE: f64 = 0.5;
+/// One file must be written within this long, or the save gives up (a stuck network
+/// drive); the saver thread may still finish that file later.
+pub const SAVE_TIMEOUT: f64 = 15.0;
+/// After a partial save, the failure hint follows the "saved" one after this long per
+/// saved card (Swift: `0.4 * saved.count`).
+pub const SAVE_FAIL_STEP: f64 = 0.4;
+
+/// "saved to Pictures", "saved 3 to Pictures" (`saveToFinder`: "saved" or "saved N", then
+/// "to" and the folder's name). A drive root has no name, so it is shown whole.
+pub fn saved_hint(count: usize, folder: &Path) -> String {
+    let name = folder.file_name().map_or_else(
+        || folder.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    if count == 1 {
+        format!("saved to {name}")
+    } else {
+        format!("saved {count} to {name}")
+    }
+}
+
+/// The window shows something that is not a file-system folder (This PC, Recycle Bin).
+pub fn not_a_folder_hint(display_name: &str) -> String {
+    format!(
+        "can't save in {} · still holding it",
+        clip_chars(display_name, 40)
+    )
+}
+
+/// Why a file could not be written, in the words of the hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveProblem {
+    ReadOnly,
+    DiskFull,
+    Other,
+}
+
+impl SaveProblem {
+    pub fn hint(self) -> &'static str {
+        match self {
+            SaveProblem::ReadOnly => HINT_READ_ONLY,
+            SaveProblem::DiskFull => HINT_DISK_FULL,
+            SaveProblem::Other => HINT_SAVE_FAILED,
+        }
+    }
+}
+
+/// A failed folder save: the kind for the hint, the error for the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveFail {
+    pub problem: SaveProblem,
+    pub why: String,
+}
+
+impl SaveFail {
+    pub fn other(why: impl Into<String>) -> SaveFail {
+        SaveFail {
+            problem: SaveProblem::Other,
+            why: why.into(),
+        }
+    }
+
+    /// Access denied (a read-only or protected folder) and a full disk
+    /// (`ERROR_DISK_FULL`, `ERROR_HANDLE_DISK_FULL`) get their own hint.
+    pub fn of(error: &saver::SaveError) -> SaveFail {
+        let problem = match error {
+            saver::SaveError::Io(io) => match (io.kind(), io.raw_os_error()) {
+                (std::io::ErrorKind::PermissionDenied, _) | (_, Some(5)) => SaveProblem::ReadOnly,
+                (std::io::ErrorKind::StorageFull, _) | (_, Some(39 | 112)) => SaveProblem::DiskFull,
+                _ => SaveProblem::Other,
+            },
+            saver::SaveError::Encode(_) => SaveProblem::Other,
+        };
+        SaveFail {
+            problem,
+            why: error.to_string(),
+        }
+    }
+}
 
 /// The hint after the user held a modifier through every retry.
 pub fn modifier_hint(modifier: Modifier) -> String {
@@ -618,6 +734,15 @@ pub trait Env {
     /// Saves the card as a PNG into the pasted folder, off the UI thread; the result comes
     /// as [`Router::saved`] with the returned id.
     fn save_png(&mut self, card: &HeldCard) -> u64;
+    /// Asks File Explorer for the folder a window (or the desktop) shows; the answer comes
+    /// as [`Router::folder_answered`] with the returned id.
+    fn folder_lookup(&mut self, request: FolderRequest, deadline: f64) -> u64;
+    /// Writes the card into `folder` on the saver thread: a PNG, or a copy of a
+    /// recording's movie file. The result comes as [`Router::folder_saved`]. Err: not
+    /// queued (no saver, queue full).
+    fn save_to_folder(&mut self, card: &HeldCard, folder: &Path) -> Result<u64, String>;
+    /// Selects `file` in `window`'s view once it shows it. Best effort, no answer.
+    fn reveal(&mut self, window: isize, file: &Path);
     /// Is the target in front: its top-level window, and its process when both are known?
     fn foreground_is(&self, window: isize, pid: u32) -> bool;
     /// Is `point` inside the client area of `window` (Win32 only)?
@@ -670,6 +795,18 @@ pub fn quoted_path(path: &Path) -> String {
     }
 }
 
+/// `FinderTarget.copy`'s check: is `parent` the folder (Windows paths ignore case and a
+/// trailing separator)?
+pub fn same_folder(parent: Option<&Path>, folder: &Path) -> bool {
+    let key = |p: &Path| {
+        p.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .replace('/', "\\")
+            .to_lowercase()
+    };
+    parent.is_some_and(|p| key(p) == key(folder))
+}
+
 /// xterm.js marks its elements with `xterm…` classes; Chromium reports the class attribute
 /// as the UI Automation class name.
 fn is_web_terminal(chain: &[UiaNode]) -> bool {
@@ -720,6 +857,53 @@ fn canvas_facts(chain: &[UiaNode], exe: Option<&str>) -> CanvasFacts {
     }
 }
 
+/// UI Automation class of File Explorer's items view (the `DirectUIHWND` window inside
+/// `SHELLDLL_DefView`): the list of a folder's items and its empty background.
+pub const ITEMS_VIEW_CLASS: &str = "UIItemsView";
+/// UI Automation class of the desktop's folder view window. Its child is the icon list
+/// (`SysListView32`); with desktop icons hidden the list is hidden and the view is the hit.
+pub const DESKTOP_VIEW_CLASS: &str = "SHELLDLL_DefView";
+
+/// `FinderTarget.isDropSpot` for Windows: is the hit the empty background of a folder view?
+///
+/// The core's role rule alone is not enough here. Windows 11 Explorer shows the navigation
+/// pane as a `Pane` (`SysTreeView32`), and the title bar area, the tab strip's free space,
+/// the breadcrumb bar and the details pane as panes and groups: all of them map to
+/// `AXGroup`, a container role. So the hit must also be inside the folder view itself, told
+/// by its class: Explorer's items view ([`ITEMS_VIEW_CLASS`]) or the desktop's view
+/// ([`DESKTOP_VIEW_CLASS`]). Inside the view, an item (`AXRow`, with its name and cells)
+/// and a column header (`Header`, `HeaderItem`) are not background. The one text that is
+/// background is the view's own "This folder is empty." (a static text whose parent is the
+/// view; an item's name has the item as parent).
+pub fn shell_drop_spot(chain: &[UiaNode], shell: Shell) -> bool {
+    let Some(hit) = chain.first() else {
+        return false;
+    };
+    let view_class = match shell {
+        Shell::Explorer => ITEMS_VIEW_CLASS,
+        Shell::Desktop => DESKTOP_VIEW_CLASS,
+    };
+    let Some(view) = chain
+        .iter()
+        .position(|n| n.element().class_name == view_class)
+    else {
+        return false;
+    };
+    if chain.iter().any(|n| n.element().role == "AXRow") {
+        return false;
+    }
+    let header = |n: &UiaNode| {
+        let control = n.element().control_type;
+        control == UIA_HeaderControlTypeId.0 || control == UIA_HeaderItemControlTypeId.0
+    };
+    if chain[..view].iter().any(header) {
+        return false;
+    }
+    let e = hit.element();
+    let ancestors: Vec<String> = chain[1..].iter().filter_map(|n| n.role()).collect();
+    drop_policy::is_drop_spot(Some(e.role), &ancestors) || (view == 1 && e.role == "AXStaticText")
+}
+
 /// `DropSpotInfo.resolve`, on a snapshot.
 pub fn spot_from_snapshot(snapshot: &Snapshot, point: (i32, i32)) -> Spot {
     let hit = snapshot.hit.clone();
@@ -745,9 +929,8 @@ pub fn spot_from_snapshot(snapshot: &Snapshot, point: (i32, i32)) -> Spot {
             xterm: is_xterm_input(info),
         }
     });
-    if spot.is_shell() {
-        let ancestors: Vec<String> = chain[1..].iter().filter_map(|n| n.role()).collect();
-        spot.drop_spot = drop_policy::is_drop_spot(Some(e.role), &ancestors);
+    if let Some(shell) = snapshot.target.shell {
+        spot.drop_spot = shell_drop_spot(&chain, shell);
         return spot;
     }
     spot.chromium = chain.iter().any(|n| n.element().framework == "Chrome");
@@ -1091,6 +1274,45 @@ enum Phase {
         first: First,
     },
     Delivering(Box<Delivery>),
+    Saving(Box<FolderSave>),
+}
+
+/// A save into a folder (`saveToFinder`); see the module comment.
+struct FolderSave {
+    click: Click,
+    /// The window to reveal the file in: the Explorer window, or the desktop's.
+    window: isize,
+    /// The pile at the double-click, top first.
+    ids: Vec<CardId>,
+    /// The next card to write.
+    index: usize,
+    folder: Option<PathBuf>,
+    /// Written (or already there), in order.
+    saved: Vec<(CardId, PathBuf)>,
+    /// Recordings whose movie already lived in the folder.
+    already: usize,
+    /// The first file went to the saver: the save finishes whatever the user does.
+    started: bool,
+    step: SaveStep,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum SaveStep {
+    /// The folder lookup is out.
+    Asking { id: u64, since: f64 },
+    /// The folder is known: wait for the button to come up, then write.
+    Ready,
+    /// One card's file is being written by the saver.
+    Writing { job: u64, since: f64 },
+    /// A partial save: the failure hint after the "saved" one.
+    LateHint { at: f64, hint: &'static str },
+}
+
+impl FolderSave {
+    /// The first file is being written (or was): a press or a key no longer stops it.
+    fn writing(&self) -> bool {
+        self.started
+    }
 }
 
 struct Delivery {
@@ -1637,8 +1859,13 @@ impl<S: Clone> Router<S> {
     /// there. Returns a clipboard ticket to wait for (a stage still in flight, or the
     /// restore); feed its reply to [`Router::quit_reply`], which returns the next one.
     pub fn quit<E: Env<Snap = S>>(&mut self, now: f64, env: &mut E) -> Option<u64> {
-        if self.busy() {
-            env.log(now, "quit: the delivery stops here");
+        match &self.phase {
+            Phase::Saving(f) if matches!(f.step, SaveStep::Writing { .. }) => env.log(
+                now,
+                "quit: the file being written is finished by the saver; no more cards are saved",
+            ),
+            Phase::Idle => {}
+            _ => env.log(now, "quit: the delivery stops here"),
         }
         self.phase = Phase::Idle;
         if let Some(restore) = self.restore.as_mut() {
@@ -1813,6 +2040,17 @@ impl<S: Clone> Router<S> {
     fn cancel<E: Env<Snap = S>>(&mut self, why: &'static str, now: f64, env: &mut E) {
         match &mut self.phase {
             Phase::Idle => {}
+            Phase::Saving(f) if f.writing() => {
+                env.log(
+                    now,
+                    &format!("{why} → the save goes on (a file is being written)"),
+                );
+            }
+            Phase::Saving(_) => {
+                env.log(now, &format!("{why} → the save is dropped"));
+                self.phase = Phase::Idle;
+                self.phase_wake = None;
+            }
             Phase::Delivering(d) => {
                 if d.cancelled.is_none() {
                     env.log(now, &format!("{why} → the delivery stops"));
@@ -2113,7 +2351,7 @@ impl<S: Clone> Router<S> {
         match (action, first) {
             (Action::SaveToFinder, _) => {
                 if let Seen::Spot(spot) = &seen {
-                    self.save_to_folder(spot, now, state, env);
+                    self.save_to_folder(spot, click, now, state, env);
                 }
             }
             (Action::Paste, Some(first)) => {
@@ -2130,28 +2368,307 @@ impl<S: Clone> Router<S> {
         }
     }
 
-    /// SaveToFinder: save the pile into the Explorer folder (or the desktop) under the
-    /// cursor. NOT DONE YET: the folder lookup is being written in `explorer.rs`. Until it
-    /// lands this only says so and keeps the cards. When it does, follow
-    /// `DropRouter.saveToFinder`: find the folder, `saver::save_screenshot` / `copy_movie`
-    /// each card, `deliver` the saved ones with "saved to <folder>", reject with
-    /// "couldn't find that folder" / "couldn't save there" otherwise.
+    /// SaveToFinder (`DropRouter.saveToFinder`): ask Explorer for the folder of the
+    /// double-clicked window, or the desktop's. The rest runs in [`Router::save_step`].
     fn save_to_folder<E: Env<Snap = S>>(
         &mut self,
         spot: &Spot,
+        click: Click,
         now: f64,
         state: &mut FairyState,
         env: &mut E,
     ) {
+        let ids: Vec<CardId> = state.deliverable().iter().map(|c| c.id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let request = match spot.target.shell {
+            Some(Shell::Desktop) => FolderRequest::Desktop,
+            _ => FolderRequest::Window(spot.target.window),
+        };
+        let id = env.folder_lookup(request, FOLDER_DEADLINE);
         env.log(
             now,
             &format!(
-                "save to folder (window {:#x}): not done yet",
-                spot.target.child_window
+                "save {} card(s): asking Explorer for the folder of {request:?} (request {id}, {FOLDER_DEADLINE:.2}s)",
+                ids.len()
             ),
         );
-        state.flash_hint(HINT_FOLDERS_NEXT, 2.4, now);
+        self.phase = Phase::Saving(Box::new(FolderSave {
+            click,
+            window: spot.target.window,
+            ids,
+            index: 0,
+            folder: None,
+            saved: Vec::new(),
+            already: 0,
+            started: false,
+            step: SaveStep::Asking { id, since: now },
+        }));
+    }
+
+    /// Explorer answered a folder lookup.
+    pub fn folder_answered<E: Env<Snap = S>>(
+        &mut self,
+        id: u64,
+        outcome: FolderOutcome,
+        now: f64,
+        state: &mut FairyState,
+        env: &mut E,
+    ) {
+        let Phase::Saving(f) = &mut self.phase else {
+            return;
+        };
+        let SaveStep::Asking { id: want, since } = f.step else {
+            return;
+        };
+        if want != id {
+            return;
+        }
+        let took = (now - since) * 1000.0;
+        let refusal = match outcome {
+            FolderOutcome::Folder(folder) => {
+                env.log(
+                    now,
+                    &format!("folder (request {id}, {took:.0} ms): {}", folder.display()),
+                );
+                f.folder = Some(folder);
+                f.step = SaveStep::Ready;
+                None
+            }
+            FolderOutcome::NotAFolder { display_name } => {
+                env.log(
+                    now,
+                    &format!("folder (request {id}, {took:.0} ms): {display_name:?} is not a folder → refuse"),
+                );
+                Some(not_a_folder_hint(&display_name))
+            }
+            FolderOutcome::TimedOut => {
+                env.log(
+                    now,
+                    &format!("folder (request {id}, {took:.0} ms): Explorer did not answer in time → refuse"),
+                );
+                Some(HINT_EXPLORER_SLOW.to_string())
+            }
+            FolderOutcome::Failed(why) => {
+                env.log(
+                    now,
+                    &format!("folder (request {id}, {took:.0} ms): failed ({why}) → refuse"),
+                );
+                Some(HINT_SAVE_FAILED.to_string())
+            }
+        };
+        if let Some(hint) = refusal {
+            self.phase = Phase::Idle;
+            self.phase_wake = None;
+            state.reject(&hint, now);
+            self.state_changed = true;
+        }
+        self.run(now, state, env);
+    }
+
+    /// The saver wrote a card into the folder (or not).
+    pub fn folder_saved<E: Env<Snap = S>>(
+        &mut self,
+        job: u64,
+        result: Result<PathBuf, SaveFail>,
+        now: f64,
+        state: &mut FairyState,
+        env: &mut E,
+    ) {
+        let Phase::Saving(mut f) = std::mem::replace(&mut self.phase, Phase::Idle) else {
+            return;
+        };
+        if !matches!(f.step, SaveStep::Writing { job: j, .. } if j == job) {
+            self.phase = Phase::Saving(f);
+            return;
+        }
+        let id = f.ids[f.index];
+        match result {
+            Ok(path) => {
+                env.log(now, &format!("card {}: saved {}", id.0, path.display()));
+                f.saved.push((id, path));
+                f.index += 1;
+                f.step = SaveStep::Ready;
+                self.phase = Phase::Saving(f);
+            }
+            Err(fail) => {
+                env.log(
+                    now,
+                    &format!(
+                        "card {}: save failed ({:?}): {}",
+                        id.0, fail.problem, fail.why
+                    ),
+                );
+                if let Flow::Wait(at) = self.end_save(&mut f, Some(fail.problem), now, state, env) {
+                    self.phase = Phase::Saving(f);
+                    self.phase_wake = at;
+                }
+            }
+        }
+        self.run(now, state, env);
+    }
+
+    /// One step of a folder save; see the module comment.
+    fn save_step<E: Env<Snap = S>>(
+        &mut self,
+        f: &mut FolderSave,
+        now: f64,
+        state: &mut FairyState,
+        env: &mut E,
+    ) -> Flow {
+        if !f.writing() && env.key_presses() != f.click.keys {
+            env.log(now, "the user typed → the save is dropped");
+            return Flow::Done;
+        }
+        match f.step.clone() {
+            SaveStep::Asking { since, .. } => {
+                // The explorer controller answers at the deadline; this is the backstop.
+                let give_up = since + FOLDER_DEADLINE + LOOKUP_GRACE;
+                if now >= give_up {
+                    env.log(now, "folder: no answer at all → refuse");
+                    state.reject(HINT_EXPLORER_SLOW, now);
+                    self.state_changed = true;
+                    return Flow::Done;
+                }
+                Flow::Wait(Some(give_up))
+            }
+            SaveStep::Ready => {
+                if f.index == 0 && env.primary_down() {
+                    let up_deadline = f.click.at + paste_policy::MOUSE_UP_TIMEOUT;
+                    if now >= up_deadline {
+                        env.log(now, "the button is still down (a drag) → no save");
+                        return Flow::Done;
+                    }
+                    return Flow::Wait(Some(
+                        up_deadline.min(now + paste_policy::MOUSE_UP_POLL_INTERVAL),
+                    ));
+                }
+                let Some(folder) = f.folder.clone() else {
+                    return Flow::Done;
+                };
+                while let Some(&id) = f.ids.get(f.index) {
+                    let Some(card) = state.card(id).cloned() else {
+                        env.log(
+                            now,
+                            &format!("card {} left the pile meanwhile → skipped", id.0),
+                        );
+                        f.index += 1;
+                        continue;
+                    };
+                    let position = format!("card {} ({}/{})", id.0, f.index + 1, f.ids.len());
+                    if let Some(movie) = &card.movie
+                        && same_folder(movie.parent(), &folder)
+                    {
+                        env.log(
+                            now,
+                            &format!("{position}: the recording already lives there → not copied"),
+                        );
+                        f.saved.push((id, movie.clone()));
+                        f.already += 1;
+                        f.index += 1;
+                        continue;
+                    }
+                    let name = match &card.movie {
+                        Some(movie) => format!(
+                            "a copy of {}",
+                            movie.file_name().unwrap_or_default().to_string_lossy()
+                        ),
+                        None => saver::screenshot_file_name(card.captured_at),
+                    };
+                    return match env.save_to_folder(&card, &folder) {
+                        Ok(job) => {
+                            env.log(
+                                now,
+                                &format!(
+                                    "{position}: writing {name} into {} (job {job})",
+                                    folder.display()
+                                ),
+                            );
+                            f.started = true;
+                            f.step = SaveStep::Writing { job, since: now };
+                            Flow::Wait(Some(now + SAVE_TIMEOUT))
+                        }
+                        Err(why) => {
+                            env.log(
+                                now,
+                                &format!("{position}: the saver did not take it ({why})"),
+                            );
+                            self.end_save(f, Some(SaveProblem::Other), now, state, env)
+                        }
+                    };
+                }
+                self.end_save(f, None, now, state, env)
+            }
+            SaveStep::Writing { since, .. } => {
+                let give_up = since + SAVE_TIMEOUT;
+                if now >= give_up {
+                    env.log(now, "the file was not written in time → stop");
+                    return self.end_save(f, Some(SaveProblem::Other), now, state, env);
+                }
+                Flow::Wait(Some(give_up))
+            }
+            SaveStep::LateHint { at, hint } => {
+                if now < at {
+                    return Flow::Wait(Some(at));
+                }
+                state.reject(hint, now);
+                self.state_changed = true;
+                Flow::Done
+            }
+        }
+    }
+
+    /// The writes are over (all, or up to a failure): deliver what was saved, reveal the
+    /// last file, and say what failed.
+    fn end_save<E: Env<Snap = S>>(
+        &mut self,
+        f: &mut FolderSave,
+        failed: Option<SaveProblem>,
+        now: f64,
+        state: &mut FairyState,
+        env: &mut E,
+    ) -> Flow {
+        let hint = failed.map(SaveProblem::hint);
+        let Some(folder) = f.folder.clone() else {
+            return Flow::Done;
+        };
+        if f.saved.is_empty() {
+            match hint {
+                Some(hint) => {
+                    env.log(now, &format!("nothing saved → {hint}"));
+                    state.reject(hint, now);
+                    self.state_changed = true;
+                }
+                None => env.log(now, "nothing left to save"),
+            }
+            return Flow::Done;
+        }
+        let ids: Vec<CardId> = f.saved.iter().map(|(id, _)| *id).collect();
+        let text = if f.already == f.saved.len() {
+            HINT_ALREADY_SAVED.to_string()
+        } else {
+            saved_hint(f.saved.len(), &folder)
+        };
+        env.log(now, &format!("delivered {} card(s) → {text}", ids.len()));
+        state.deliver(&ids, &text, now);
         self.state_changed = true;
+        if let Some((_, last)) = f.saved.last() {
+            env.log(
+                now,
+                &format!("reveal {} in window {:#x}", last.display(), f.window),
+            );
+            env.reveal(f.window, last);
+        }
+        match hint {
+            Some(hint) => {
+                let at = now + SAVE_FAIL_STEP * f.saved.len() as f64;
+                env.log(now, &format!("the rest stays → {hint} at {at:.3}"));
+                f.step = SaveStep::LateHint { at, hint };
+                Flow::Wait(Some(at))
+            }
+            None => Flow::Done,
+        }
     }
 
     /// `resolveAfterMouseUp`.
@@ -3439,6 +3956,22 @@ impl<S: Clone> Router<S> {
                     self.phase = Phase::Recheck { id, click, first };
                     return;
                 }
+                Phase::Saving(mut f) => match self.save_step(&mut f, now, state, env) {
+                    Flow::Wait(at) => {
+                        if matches!(self.phase, Phase::Idle) {
+                            self.phase = Phase::Saving(f);
+                        }
+                        self.phase_wake = at;
+                        return;
+                    }
+                    Flow::Again => self.phase = Phase::Saving(f),
+                    Flow::Done => {
+                        self.phase = Phase::Idle;
+                        self.phase_wake = None;
+                        env.log(now, "save over");
+                        return;
+                    }
+                },
                 Phase::Delivering(mut d) => match self.step(&mut d, now, state, env) {
                     Flow::Wait(at) => {
                         if matches!(self.phase, Phase::Idle) {
@@ -3714,8 +4247,12 @@ pub struct LiveEnv {
     /// The one PNG saver thread (D2) and its job queue.
     saver: Option<(SyncSender<SaveJob>, std::thread::JoinHandle<()>)>,
     settings: Settings,
-    saved: Receiver<(u64, Result<PathBuf, String>)>,
+    saved: Receiver<(u64, Result<PathBuf, SaveFail>)>,
     next_save: u64,
+    /// Saver jobs that are folder saves (their answers go to `Router::folder_saved`).
+    folder_jobs: HashSet<u64>,
+    /// The File Explorer folder lookup; None when it could not start (saves then fail).
+    explorer: Option<Explorer>,
     log: DebugLog,
     primary: Button,
     /// Converts the clipboard's `Instant`s to the `hook::now` clock.
@@ -3724,8 +4261,9 @@ pub struct LiveEnv {
 }
 
 impl LiveEnv {
-    /// Starts the UI Automation worker and the clipboard thread.
-    pub fn start(settings: Settings, log: DebugLog) -> Result<LiveEnv, String> {
+    /// Starts the UI Automation worker, the clipboard thread, the saver and the Explorer
+    /// folder lookup.
+    pub fn start(settings: Settings, mut log: DebugLog) -> Result<LiveEnv, String> {
         let wake = Arc::new(WakeEvent::new().map_err(|e| format!("wake event: {e}"))?);
         let uia = Uia::start().map_err(|e| format!("UI Automation: {e}"))?;
         let clip_wake = wake.clone();
@@ -3736,7 +4274,17 @@ impl LiveEnv {
         let saver = spawn_saver(saves, wake.clone());
         // Without the key watch typing cannot stop a delivery; the rest still works.
         let keys = KeyWatch::start().ok();
+        // Without it the pastes still work; a folder save then says it can't save.
+        let explorer = match Explorer::start() {
+            Ok(explorer) => Some(explorer),
+            Err(e) => {
+                log.line(hook::now(), &format!("Explorer folder lookup is off: {e}"));
+                None
+            }
+        };
         Ok(LiveEnv {
+            folder_jobs: HashSet::new(),
+            explorer,
             uia: Some(uia),
             clip: Some(clip),
             keys,
@@ -3763,11 +4311,14 @@ impl LiveEnv {
     }
 
     /// Handles to add to the UI loop's wait: UI Automation answers, and clipboard replies,
-    /// clipboard changes and saved PNGs.
+    /// clipboard changes and saved PNGs, and Explorer's folder answers.
     pub fn wake_handles(&self) -> Vec<HANDLE> {
         let mut handles = vec![self.wake.0];
         if let Some(uia) = &self.uia {
             handles.push(uia.wake_handle());
+        }
+        if let Some(explorer) = &self.explorer {
+            handles.push(explorer.wake_handle());
         }
         handles
     }
@@ -3799,8 +4350,21 @@ impl LiveEnv {
         for reply in replies {
             router.clip_reply(convert_reply(reply), now, state, self);
         }
+        let mut folders = Vec::new();
+        if let Some(explorer) = &self.explorer {
+            while let Some((id, outcome)) = explorer.poll() {
+                folders.push((id.0, outcome));
+            }
+        }
+        for (id, outcome) in folders {
+            router.folder_answered(id, outcome, now, state, self);
+        }
         while let Ok((job, result)) = self.saved.try_recv() {
-            router.saved(job, result, now, state, self);
+            if self.folder_jobs.remove(&job) {
+                router.folder_saved(job, result, now, state, self);
+            } else {
+                router.saved(job, result.map_err(|f| f.why), now, state, self);
+            }
         }
         router.clipboard_changed(now, state, self);
     }
@@ -3830,7 +4394,13 @@ impl LiveEnv {
             let _ = uia.shutdown();
         }
         self.keys = None;
-        // The saver: no new jobs; the one running may finish within a second.
+        // Bounded: its controller abandons a worker stuck inside a Shell call.
+        if let Some(explorer) = self.explorer.take() {
+            let _ = explorer.shutdown();
+        }
+        // The saver: no new jobs; the one running (a terminal's PNG or a folder save) may
+        // finish within a second. It writes through a temp file, so a file it is cut off
+        // in never appears under its final name.
         if let Some((jobs, thread)) = self.saver.take() {
             drop(jobs);
             let until = Instant::now() + Duration::from_secs(1);
@@ -3844,18 +4414,28 @@ impl LiveEnv {
     }
 }
 
-/// One PNG to save for a terminal paste.
+/// One file for the saver: a PNG for a terminal paste, or a card saved into a folder.
 struct SaveJob {
     id: u64,
     image: Arc<igorio_kit::Image>,
     scale: f64,
     captured_at: std::time::SystemTime,
-    settings: Settings,
+    dest: Dest,
 }
 
-/// The saver worker: one thread for every terminal-paste PNG, fed through a short queue.
+enum Dest {
+    /// A terminal paste: a PNG in the pasted folder of these settings.
+    Pasted(Settings),
+    /// A folder save: a PNG, or a copy of the recording's movie file.
+    Folder {
+        folder: PathBuf,
+        movie: Option<PathBuf>,
+    },
+}
+
+/// The saver worker: one thread for every file, fed through a short queue.
 fn spawn_saver(
-    done: Sender<(u64, Result<PathBuf, String>)>,
+    done: Sender<(u64, Result<PathBuf, SaveFail>)>,
     wake: Arc<WakeEvent>,
 ) -> Option<(SyncSender<SaveJob>, std::thread::JoinHandle<()>)> {
     let (jobs, queue) = mpsc::sync_channel::<SaveJob>(2);
@@ -3863,10 +4443,21 @@ fn spawn_saver(
         .name("paste-saver".into())
         .spawn(move || {
             while let Ok(job) = queue.recv() {
-                let folder = job.settings.pasted_dir(&DefaultFolders::from_system());
-                let result =
-                    saver::save_screenshot(&job.image, job.scale, job.captured_at, &folder)
-                        .map_err(|e| e.to_string());
+                let result = match &job.dest {
+                    Dest::Pasted(settings) => {
+                        let folder = settings.pasted_dir(&DefaultFolders::from_system());
+                        saver::save_screenshot(&job.image, job.scale, job.captured_at, &folder)
+                    }
+                    Dest::Folder {
+                        folder,
+                        movie: Some(movie),
+                    } => saver::copy_movie(movie, folder),
+                    Dest::Folder {
+                        folder,
+                        movie: None,
+                    } => saver::save_screenshot(&job.image, job.scale, job.captured_at, folder),
+                };
+                let result = result.map_err(|e| SaveFail::of(&e));
                 let _ = done.send((job.id, result));
                 wake.set();
             }
@@ -3982,7 +4573,7 @@ impl Env for LiveEnv {
             image: card.image.clone(),
             scale: card.scale,
             captured_at: card.captured_at,
-            settings: self.settings.clone(),
+            dest: Dest::Pasted(self.settings.clone()),
         };
         // The folder lookup, the encode and the write run on the saver thread. With no
         // saver or a full queue the save fails at once and the paste says so.
@@ -3994,6 +4585,47 @@ impl Env for LiveEnv {
             self.log.line(hook::now(), "PNG saver busy or gone");
         }
         id
+    }
+
+    fn folder_lookup(&mut self, request: FolderRequest, deadline: f64) -> u64 {
+        match &self.explorer {
+            Some(explorer) => {
+                explorer
+                    .request(request, Duration::from_secs_f64(deadline))
+                    .0
+            }
+            None => {
+                // Never answered: the router gives up after the deadline and its grace.
+                self.log.line(hook::now(), "no Explorer folder lookup");
+                u64::MAX
+            }
+        }
+    }
+
+    fn save_to_folder(&mut self, card: &HeldCard, folder: &Path) -> Result<u64, String> {
+        let id = self.next_save;
+        self.next_save += 1;
+        let job = SaveJob {
+            id,
+            image: card.image.clone(),
+            scale: card.scale,
+            captured_at: card.captured_at,
+            dest: Dest::Folder {
+                folder: folder.to_path_buf(),
+                movie: card.movie.clone(),
+            },
+        };
+        let (jobs, _) = self.saver.as_ref().ok_or("no saver thread")?;
+        jobs.try_send(job)
+            .map_err(|_| "the saver is busy".to_string())?;
+        self.folder_jobs.insert(id);
+        Ok(id)
+    }
+
+    fn reveal(&mut self, window: isize, file: &Path) {
+        if let Some(explorer) = &self.explorer {
+            explorer.reveal(window, file.to_path_buf());
+        }
     }
 
     fn foreground_is(&self, window: isize, pid: u32) -> bool {
@@ -4141,10 +4773,10 @@ mod tests {
                 image: image.clone(),
                 scale: 1.0,
                 captured_at: std::time::SystemTime::now(),
-                settings: Settings {
+                dest: Dest::Pasted(Settings {
                     captures_folder: Some(folder.clone()),
                     ..Settings::default()
-                },
+                }),
             })
             .unwrap();
             let (actual_id, saved) = results.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -4155,6 +4787,49 @@ mod tests {
         }
         drop(jobs);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn folder_saves_write_a_png_or_copy_the_movie_and_leave_no_temp_file() {
+        let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("folder-saver-test-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let movie = folder.join("source clip.mp4");
+        std::fs::write(&movie, b"movie").unwrap();
+        let into = folder.join("into");
+        let (done, results) = mpsc::channel();
+        let (jobs, worker) = spawn_saver(done, Arc::new(WakeEvent::new().unwrap())).unwrap();
+        let image = Arc::new(igorio_kit::Image::new(1, 1, vec![0, 0, 0, 255]).unwrap());
+        for (id, movie) in [(1, None), (2, Some(movie.clone()))] {
+            jobs.send(SaveJob {
+                id,
+                image: image.clone(),
+                scale: 1.0,
+                captured_at: std::time::SystemTime::now(),
+                dest: Dest::Folder {
+                    folder: into.clone(),
+                    movie,
+                },
+            })
+            .unwrap();
+            let (actual, saved) = results.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(actual, id);
+            let saved = saved.unwrap();
+            assert_eq!(saved.parent(), Some(into.as_path()));
+            let expected = if id == 1 { "png" } else { "mp4" };
+            assert_eq!(saved.extension().unwrap(), expected);
+        }
+        drop(jobs);
+        worker.join().unwrap();
+        let names: Vec<String> = std::fs::read_dir(&into)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
+        assert!(names.contains(&"source clip.mp4".to_string()));
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 
     #[test]
