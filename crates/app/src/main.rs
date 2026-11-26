@@ -1,17 +1,21 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! Wires the modules together: one UI thread owns the overlay, the tray and the state.
-//! `igorio --demo N` starts with N generated screenshots on the pile.
+//! Wires the modules together: one UI thread owns the overlay, the tray, the state and the
+//! drop router. `igorio --demo N` starts with N generated screenshots on the pile.
+//! `FAIRY_DEBUG=1` logs every drop decision (see `drop_router::DebugLog`).
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use igorio_app::clipboard;
 use igorio_app::draw::Renderer;
+use igorio_app::drop_router::{DebugLog, LiveEnv, Router};
 use igorio_app::follower::Follower;
 use igorio_app::hook::{self, MouseEvent, MouseHook};
 use igorio_app::overlay::{self, Overlay};
+use igorio_app::settings::{self, Settings};
 use igorio_app::state::FairyState;
 use igorio_app::tray::{MenuItem, Tray};
 use igorio_core::shake::{ShakeGate, ShakeResult};
@@ -36,6 +40,8 @@ const FRAME: f64 = 0.008;
 /// The longest sleep. The loop wakes at least this often to check that the mouse hook is
 /// still installed (Windows removes a slow hook without notice).
 const HEALTH_CHECK: f64 = 1.0;
+/// At quit, how long to wait for the user's clipboard to be put back.
+const QUIT_RESTORE_WAIT: Duration = Duration::from_secs(1);
 
 struct App {
     state: FairyState,
@@ -225,16 +231,20 @@ impl Sleeper {
         Ok(Self(handle))
     }
 
-    /// Returns when `wait` has passed, a message is in the queue or `wake` is signalled,
-    /// whichever is first.
-    fn wait(&self, wait: Duration, wake: HANDLE) -> windows::core::Result<()> {
+    /// Returns when `wait` has passed, a message is in the queue or one of `wakes` is
+    /// signalled, whichever is first.
+    fn wait(&self, wait: Duration, wakes: &[HANDLE]) -> windows::core::Result<()> {
         // Negative means relative, in 100 ns units. At least one unit, so the timer fires.
         let due = -((wait.as_nanos() / 100).clamp(1, i64::MAX as u128) as i64);
-        // SAFETY: `self.0` and `wake` are live handles and `due` outlives the call.
+        let mut handles = Vec::with_capacity(1 + wakes.len());
+        handles.push(self.0);
+        handles.extend_from_slice(wakes);
+        // SAFETY: `self.0` and every handle in `wakes` are live handles, and `due` and
+        // `handles` outlive the call.
         unsafe {
             SetWaitableTimer(self.0, &due, 0, None, None, false)?;
             MsgWaitForMultipleObjectsEx(
-                Some(&[self.0, wake]),
+                Some(&handles),
                 INFINITE,
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE,
@@ -335,6 +345,24 @@ fn main() -> windows::core::Result<()> {
     let mut mouse_hook = MouseHook::start()?;
     let mut events = Vec::new();
     let sleeper = Sleeper::new()?;
+
+    // The drop router and its workers (UI Automation, clipboard). Without them the app
+    // still carries, shakes and restores.
+    let settings = Settings::load(&settings::default_settings_path()).unwrap_or_default();
+    let mut drops = match LiveEnv::start(settings, DebugLog::from_env()) {
+        Ok(env) => Some((
+            Router::<clipboard::Snapshot>::new(LiveEnv::primary_button()),
+            env,
+        )),
+        Err(why) => {
+            eprintln!("double-click drops are off: {why}");
+            None
+        }
+    };
+    let mut wakes = vec![mouse_hook.wake_handle()];
+    if let Some((_, env)) = &drops {
+        wakes.extend(env.wake_handles());
+    }
     // When the next frame runs; `None` waits for a mouse move or a menu action.
     let mut due = Some(hook::now());
     let mut next_health_check = hook::now() + HEALTH_CHECK;
@@ -342,9 +370,24 @@ fn main() -> windows::core::Result<()> {
     while pump_messages() {
         mouse_hook.drain(&mut events);
         let now = hook::now();
+        let mut router_due = None;
         {
             let mut app = app.borrow_mut();
+            let app = &mut *app;
             let moved = app.mouse(&events);
+            if let Some((router, env)) = drops.as_mut() {
+                for event in &events {
+                    router.mouse(*event, &mut app.state, env);
+                }
+                env.pump(router, &mut app.state, now);
+                if router.next_deadline().is_some_and(|at| at <= now) {
+                    router.tick(now, &mut app.state, env);
+                }
+                if router.take_state_changed() {
+                    app.dirty = true;
+                }
+                router_due = router.next_deadline();
+            }
             events.clear();
             if app.needs_frame() {
                 due = Some(now);
@@ -363,9 +406,15 @@ fn main() -> windows::core::Result<()> {
                 let _ = mouse_hook.restart();
             }
         }
-        let until = earlier(due, Some(next_health_check)).unwrap_or(next_health_check);
+        let until = earlier(earlier(due, router_due), Some(next_health_check))
+            .unwrap_or(next_health_check);
         let wait = Duration::from_secs_f64((until - hook::now()).max(0.0));
-        sleeper.wait(wait, mouse_hook.wake_handle())?;
+        sleeper.wait(wait, &wakes)?;
+    }
+    // Put the user's clipboard back if a paste left ours there, then stop the workers.
+    if let Some((mut router, mut env)) = drops {
+        let restore = router.quit(hook::now(), &mut env);
+        env.shutdown(restore, QUIT_RESTORE_WAIT);
     }
     Ok(())
 }
