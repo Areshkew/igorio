@@ -88,6 +88,19 @@ pub fn paste_shortcut() -> Sent {
     }
 }
 
+/// Presses `Ctrl+Shift+V`, the paste shortcut of terminals that send a literal `^V` for
+/// `Ctrl+V` (WezTerm, Alacritty). A held Ctrl or Shift is used as it is; Alt or Win block.
+pub fn paste_shortcut_with_shift() -> Sent {
+    let layout = foreground_layout();
+    let ctrl = scan(VK_CONTROL, layout);
+    let shift = scan(VK_SHIFT, layout);
+    let v = scan(VK_V, layout);
+    match shift_paste_inputs(held(), ctrl, shift, v) {
+        Ok(inputs) => send(&inputs),
+        Err(modifier) => Sent::Blocked(modifier),
+    }
+}
+
 /// Presses and releases one key, with no modifier: blocked while any modifier is down
 /// (Ctrl+Right jumps a word; Ctrl+Escape opens Start).
 pub fn press(key: Key) -> Sent {
@@ -208,6 +221,37 @@ fn paste_inputs(held: Held, ctrl: Scan, v: Scan) -> Result<Vec<INPUT>, Modifier>
     Ok(inputs)
 }
 
+/// Ctrl+Shift+V: Alt or Win block; Ctrl or Shift already down are not pressed again.
+fn shift_paste_inputs(
+    held: Held,
+    ctrl: Scan,
+    shift: Scan,
+    v: Scan,
+) -> Result<Vec<INPUT>, Modifier> {
+    if held.alt {
+        return Err(Modifier::Alt);
+    }
+    if held.win {
+        return Err(Modifier::Win);
+    }
+    let mut inputs = Vec::new();
+    if !held.ctrl {
+        inputs.push(keyboard(VK_CONTROL, ctrl, false));
+    }
+    if !held.shift {
+        inputs.push(keyboard(VK_SHIFT, shift, false));
+    }
+    inputs.push(keyboard(VK_V, v, false));
+    inputs.push(keyboard(VK_V, v, true));
+    if !held.shift {
+        inputs.push(keyboard(VK_SHIFT, shift, true));
+    }
+    if !held.ctrl {
+        inputs.push(keyboard(VK_CONTROL, ctrl, true));
+    }
+    Ok(inputs)
+}
+
 fn key_inputs(held: Held, vk: VIRTUAL_KEY, scan: Scan) -> Result<Vec<INPUT>, Modifier> {
     blocker(held, true)?;
     Ok(vec![keyboard(vk, scan, false), keyboard(vk, scan, true)])
@@ -320,6 +364,48 @@ mod tests {
                 (VK_V, 0x2F, true, false),
                 (VK_CONTROL, 0x1D, true, false),
             ]
+        );
+    }
+
+    #[test]
+    fn shift_paste_presses_ctrl_shift_v() {
+        const SHIFT: Scan = Scan {
+            code: 0x2A,
+            extended: false,
+        };
+        let inputs = shift_paste_inputs(Held::default(), CTRL, SHIFT, V).unwrap();
+        assert_eq!(
+            events(&inputs),
+            [
+                (VK_CONTROL, 0x1D, false, false),
+                (VK_SHIFT, 0x2A, false, false),
+                (VK_V, 0x2F, false, false),
+                (VK_V, 0x2F, true, false),
+                (VK_SHIFT, 0x2A, true, false),
+                (VK_CONTROL, 0x1D, true, false),
+            ]
+        );
+        let held = Held {
+            shift: true,
+            ..Held::default()
+        };
+        let inputs = shift_paste_inputs(held, CTRL, SHIFT, V).unwrap();
+        assert_eq!(
+            events(&inputs),
+            [
+                (VK_CONTROL, 0x1D, false, false),
+                (VK_V, 0x2F, false, false),
+                (VK_V, 0x2F, true, false),
+                (VK_CONTROL, 0x1D, true, false),
+            ]
+        );
+        let held = Held {
+            alt: true,
+            ..Held::default()
+        };
+        assert_eq!(
+            shift_paste_inputs(held, CTRL, SHIFT, V).err(),
+            Some(Modifier::Alt)
         );
     }
 
