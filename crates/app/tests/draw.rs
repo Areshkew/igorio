@@ -302,8 +302,8 @@ fn hint_sits_below_the_tallest_card_box() {
         1.0,
     ));
 
-    let one_top = first_row_above(&one, 80, 190, 90, 80).expect("hint in one-card scene");
-    let two_top = first_row_above(&two, 80, 190, 90, 80).expect("hint in two-card scene");
+    let one_top = first_row_above(&one, 130, 190, 60, 80).expect("hint in one-card scene");
+    let two_top = first_row_above(&two, 130, 190, 60, 80).expect("hint in two-card scene");
     assert!(
         two_top >= one_top + 6,
         "the taller lower card should push the hint down: {one_top} vs {two_top}"

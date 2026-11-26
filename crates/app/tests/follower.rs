@@ -1,8 +1,15 @@
 use igorio_app::follower::Follower;
+use igorio_app::layout::THUMB_MAX;
 use igorio_core::geom::{Point, Rect};
 
 const SCREEN: Rect = Rect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 };
 const MIDDLE: Point = Point { x: 960.0, y: 540.0 };
+/// The box the follower keeps on screen, logical px (see `target_origin`).
+const CONTENT_W: f64 = THUMB_MAX.width + 14.0;
+const CONTENT_H: f64 = THUMB_MAX.height + 40.0;
+/// Flipped window origin for a mouse at (1900, 1000) at scale 1.0.
+const FLIPPED_X: f64 = 1900.0 - 14.0 - CONTENT_W - 18.0;
+const FLIPPED_Y: f64 = 1000.0 - 18.0 - CONTENT_H - 18.0;
 
 fn distance(a: Point, b: Point) -> f64 {
     ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
@@ -30,12 +37,12 @@ fn near_the_right_edge_flips_to_the_left() {
     let follower = Follower::new();
     let mouse = Point::new(1900.0, 540.0);
     let origin = follower.target_origin(mouse, SCREEN, 1.0);
-    // content top-left x = 1900 - 14 - 126 = 1760, then minus the inset.
-    assert_eq!(origin.x, 1742.0);
+    // content top-left x = 1900 - 14 - content width, then minus the inset.
+    assert_eq!(origin.x, FLIPPED_X);
     assert_eq!(origin.y, 540.0);
     assert!(origin.x < mouse.x);
     // The whole content box now fits inside the work area.
-    assert!(origin.x + 18.0 + 126.0 <= SCREEN.max_x());
+    assert!(origin.x + 18.0 + CONTENT_W <= SCREEN.max_x());
 }
 
 #[test]
@@ -43,11 +50,11 @@ fn near_the_bottom_edge_flips_above() {
     let follower = Follower::new();
     let mouse = Point::new(960.0, 1000.0);
     let origin = follower.target_origin(mouse, SCREEN, 1.0);
-    // content top-left y = 1000 - 18 - 124 = 858, then minus the inset.
+    // content top-left y = 1000 - 18 - content height, then minus the inset.
     assert_eq!(origin.x, 956.0);
-    assert_eq!(origin.y, 840.0);
+    assert_eq!(origin.y, FLIPPED_Y);
     assert!(origin.y < mouse.y);
-    assert!(origin.y + 18.0 + 124.0 <= SCREEN.max_y());
+    assert!(origin.y + 18.0 + CONTENT_H <= SCREEN.max_y());
 }
 
 #[test]
@@ -55,7 +62,7 @@ fn in_the_bottom_right_corner_flips_both_ways() {
     let follower = Follower::new();
     let mouse = Point::new(1900.0, 1000.0);
     let origin = follower.target_origin(mouse, SCREEN, 1.0);
-    assert_eq!(origin, Point::new(1742.0, 840.0));
+    assert_eq!(origin, Point::new(FLIPPED_X, FLIPPED_Y));
 }
 
 #[test]
@@ -67,8 +74,9 @@ fn scale_multiplies_offsets_and_sizes() {
 
     let mouse = Point::new(1900.0, 1000.0);
     let origin = follower.target_origin(mouse, SCREEN, 1.5);
-    // content is 189 x 186 physical px; flipped top-left is mouse - 21 - size.
-    assert_eq!(origin, Point::new(1900.0 - 21.0 - 189.0 - 27.0, 1000.0 - 27.0 - 186.0 - 27.0));
+    // content is 1.5x in physical px; flipped top-left is mouse - offset - size.
+    assert_eq!(origin, Point::new(1900.0 - 21.0 - CONTENT_W * 1.5 - 27.0,
+            1000.0 - 27.0 - CONTENT_H * 1.5 - 27.0,));
 }
 
 #[test]
@@ -87,7 +95,7 @@ fn work_area_with_a_non_zero_origin() {
     let mouse = Point::new(-20.0, 540.0);
     let origin = follower.target_origin(mouse, left_monitor, 1.0);
     assert!(origin.x < mouse.x);
-    assert!(origin.x + 18.0 + 126.0 <= left_monitor.max_x());
+    assert!(origin.x + 18.0 + CONTENT_W <= left_monitor.max_x());
 }
 
 #[test]

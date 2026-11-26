@@ -175,6 +175,22 @@ folder picker and an "open folder" button. A change applies at once, with no res
 - Capabilities never read the setting directly. They ask the host (`Host::captures_folder`),
   as in the Swift `FairyHost.capturesFolder`.
 
+## Card size the user chooses
+
+The pile should not get in the user's way. The default card is 80 x 60 logical px
+(the macOS original uses 112 x 84). A setting in the settings window changes it:
+
+| Choice | Card box (logical px) |
+|---|---|
+| Small (default) | 80 x 60 |
+| Medium | 96 x 72 |
+| Large (as on macOS) | 112 x 84 |
+
+- Stored as `card_size` in `settings.json`. A change applies at once, with no restart.
+- Today the size is the constant `layout::THUMB_MAX`. The setting replaces it with a
+  value passed to the renderer (in `Scene`) and to the follower, which uses the card
+  box to flip at screen edges. The hint text size does not change.
+
 ## Milestones
 
 Each one ends with a check that must pass before the next starts.
@@ -226,12 +242,13 @@ This is the first usable version.
 
 ### M5. Settings and guide
 
-Settings JSON, settings window (capability switches, the two folder pickers, launch at
-login), first-run guide. The folder settings exist from M3 as JSON values; this adds
+Settings JSON, settings window (capability switches, the two folder pickers, card size,
+launch at login), first-run guide. The folder settings exist from M3 as JSON values; this adds
 the pickers.
 
 Check: switching a capability off stops its hooks; settings survive a restart; after
-changing the captures folder, the next kept screenshot lands in the new folder.
+changing the captures folder, the next kept screenshot lands in the new folder; changing
+the card size resizes the pile on screen at once.
 
 ### M6. Packaging
 
