@@ -43,6 +43,11 @@
 //!
 //! The total is capped at [`MAX_CALLS`] (rule 2); a typical lookup makes 6 to 14.
 //!
+//! A probe lookup (`Lookup::probe`, the paste's acceptance probe) makes steps 1 and 2, then
+//! instead of 3 to 5: the focused element's `ValueValue` (1 call; only its length and a
+//! hash are kept, never the text), its parents up to [`PROBE_ANCESTORS`] levels (1 call
+//! each) and one `FindAll` for images under the highest of them (1 call): at most 9.
+//!
 //! # Deadline and hung apps
 //!
 //! Each request has a deadline (default [`DEFAULT_DEADLINE`], 250 ms as in `AXNode.swift`).
@@ -110,6 +115,28 @@ pub const MAX_CALLS: u32 = 4 + MAX_ANCESTORS as u32;
 pub const STUCK_GRACE: Duration = Duration::from_millis(750);
 /// Worker threads alive at once, abandoned ones included.
 pub const MAX_WORKERS: usize = 3;
+/// Levels above the focused element a probe looks for the container whose images it
+/// counts (`AcceptanceProbe` in `PasteTarget.swift`: 5).
+pub const PROBE_ANCESTORS: usize = 5;
+/// Characters of the value hashed by a probe (`AcceptanceProbe`: 4000).
+pub const PROBE_VALUE_CHARS: usize = 4000;
+/// Native window classes of text-editing controls that may expose no Text or Value pattern,
+/// matched without case. An element with its own window of one of these classes takes typed
+/// text. The patterns already cover most of them; this list only adds, it never removes.
+pub const NATIVE_TEXT_CLASSES: &[&str] = &[
+    // Scintilla: Notepad++, SciTE, Notepad2 and other editors; exposes no UI Automation
+    // text pattern, only a generic MSAA window.
+    "Scintilla",
+    // RichEdit 4.1+ (msftedit.dll): WordPad, many dialogs. Usually has a Text pattern.
+    "RICHEDIT50W",
+    // RichEdit 2.0/3.0 (riched20.dll), wide and ANSI.
+    "RichEdit20W",
+    "RichEdit20A",
+    // RichEdit hosted by the new Notepad and other Windows 11 apps (D2D rendering).
+    "RichEditD2DPT",
+    // The classic Win32 edit control. Usually has a Value pattern.
+    "Edit",
+];
 /// Terminals, matched by exe name (ASCII case-insensitive). A paste there types the path.
 pub const TERMINAL_EXES: &[&str] = &[
     "WindowsTerminal.exe",
@@ -167,6 +194,9 @@ pub struct Lookup {
     pub want_focus: bool,
     /// Counted from the `request` call.
     pub deadline: Duration,
+    /// Fingerprint the focused element for the paste's acceptance probe ([`Probe`]),
+    /// instead of walking the hit's ancestors. Needs `want_focus`.
+    pub probe: bool,
 }
 
 impl Lookup {
@@ -176,6 +206,7 @@ impl Lookup {
             point,
             want_focus: true,
             deadline: DEFAULT_DEADLINE,
+            probe: false,
         }
     }
 }
@@ -234,6 +265,9 @@ pub enum Shell {
 /// What UI Automation saw at the point: plain data that outlives the COM objects.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
+    /// The point that was looked up (the request's), so a caller can check that the answer
+    /// is about the place it asked for.
+    pub point: (i32, i32),
     pub target: Target,
     /// The element at the point. Its parents run up to the top-level window (`AXWindow`),
     /// or in web content up to the page (`AXWebArea` with `url`), unless `truncated`.
@@ -247,6 +281,74 @@ pub struct Snapshot {
     pub elapsed: Duration,
     /// The parent walk stopped before the top-level window (call cap or an error).
     pub truncated: bool,
+    /// A probe lookup's fingerprint of the focused element; None for other lookups or
+    /// when nothing is focused.
+    pub probe: Option<Probe>,
+}
+
+/// The acceptance probe's fingerprint of a field (`AcceptanceProbe.Signature`): the length
+/// and a hash of its value, and the images in its container. Never the text itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Probe {
+    /// None when the element has no Value.
+    pub value: Option<ValueSignature>,
+    /// Image elements under the container; None when the search did not run.
+    pub images: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueSignature {
+    /// Characters in the value.
+    pub chars: usize,
+    /// Hash of the first [`PROBE_VALUE_CHARS`] characters (comparable within this process).
+    pub hash: u64,
+}
+
+impl ValueSignature {
+    pub fn of(text: &str) -> ValueSignature {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut chars = 0;
+        for c in text.chars() {
+            if chars < PROBE_VALUE_CHARS {
+                c.hash(&mut hasher);
+            }
+            chars += 1;
+        }
+        ValueSignature {
+            chars,
+            hash: hasher.finish(),
+        }
+    }
+}
+
+impl Probe {
+    /// The field visibly changed between two probes. Parts either probe lacks are not
+    /// compared.
+    pub fn changed_from(&self, before: &Probe) -> bool {
+        let value = matches!((self.value, before.value), (Some(a), Some(b)) if a != b)
+            || self.value.is_some() != before.value.is_some();
+        let images = matches!((self.images, before.images), (Some(a), Some(b)) if a != b);
+        value || images
+    }
+}
+
+/// How many of `roles` (the focused element's parents, nearest first) a probe searches
+/// under: it stops below a window, page or application (`AcceptanceProbe.init`).
+pub fn probe_container_levels(roles: &[&str]) -> usize {
+    roles
+        .iter()
+        .take(PROBE_ANCESTORS)
+        .take_while(|role| !["AXWindow", "AXWebArea", "AXApplication"].contains(role))
+        .count()
+}
+
+/// Is this element the window of a known native text control ([`NATIVE_TEXT_CLASSES`])?
+pub fn is_native_text_window(e: &ElementInfo) -> bool {
+    e.hwnd != 0
+        && NATIVE_TEXT_CLASSES
+            .iter()
+            .any(|class| class.eq_ignore_ascii_case(&e.class_name))
 }
 
 /// The properties of one element. The last three fields are derived by the role mapping.
@@ -460,6 +562,15 @@ impl Uia {
             return true;
         };
         let _ = self.inbox.send(Msg::Shutdown);
+        // The controller waits up to `SHUTDOWN_WAIT` for its worker; give it that plus a
+        // margin, then leave it (it only holds shared handles) rather than block the quit.
+        let until = Instant::now() + SHUTDOWN_WAIT + Duration::from_millis(500);
+        while !controller.is_finished() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(2));
+        }
+        if !controller.is_finished() {
+            return false;
+        }
         controller.join().unwrap_or(false)
     }
 
@@ -579,6 +690,10 @@ pub fn is_editable_text_root(e: &ElementInfo) -> bool {
         return false;
     }
     if e.text_edit_pattern {
+        return true;
+    }
+    // A native text control without patterns (Scintilla).
+    if is_native_text_window(e) && !is_web(e) {
         return true;
     }
     let ct = UIA_CONTROLTYPE_ID(e.control_type);
@@ -835,6 +950,7 @@ struct Job {
     id: RequestId,
     point: (i32, i32),
     want_focus: bool,
+    probe: bool,
     deadline: Instant,
     target: Target,
 }
@@ -1001,6 +1117,7 @@ impl Controller {
                             id,
                             point: lookup.point,
                             want_focus: lookup.want_focus,
+                            probe: lookup.probe,
                             deadline,
                             target,
                         })
@@ -1395,6 +1512,7 @@ struct UiaSession {
     walker: IUIAutomationTreeWalker,
     cache: IUIAutomationCacheRequest,
     nearby: IUIAutomationCondition,
+    images: IUIAutomationCondition,
     own_pid: u32,
     calls: Arc<AtomicU64>,
     _apartment: Apartment,
@@ -1419,12 +1537,20 @@ impl UiaSession {
             unsafe { cache.AddProperty(property)? };
         }
         let nearby = nearby_condition(&automation)?;
+        // SAFETY: in-process call; the variant holds no pointer and outlives the call.
+        let images = unsafe {
+            automation.CreatePropertyCondition(
+                UIA_ControlTypePropertyId,
+                &i32_variant(UIA_ImageControlTypeId.0),
+            )?
+        };
         Ok(UiaSession {
             automation,
             timeouts,
             walker,
             cache,
             nearby,
+            images,
             own_pid,
             calls,
             _apartment: apartment,
@@ -1473,6 +1599,7 @@ impl Session for UiaSession {
 
         // 2. The focused element, unless focus is in our own process (rule 3).
         let mut focused = None;
+        let mut focused_element = None;
         if job.want_focus && !foreground_is(self.own_pid) {
             // SAFETY: as above.
             match budget
@@ -1484,9 +1611,35 @@ impl Session for UiaSession {
                     let info = self.element_info(&element, window);
                     if info.pid != self.own_pid {
                         focused = Some(tree.push_root(info));
+                        focused_element = Some(element);
                     }
                 }
             }
+        }
+
+        // A probe: the focused element's fingerprint instead of steps 3 to 5.
+        if job.probe {
+            let probe = match &focused_element {
+                Some(element) => Some(self.probe(element, window, &mut budget)?),
+                None => None,
+            };
+            if budget.expired() {
+                return None;
+            }
+            let tree = Arc::new(tree);
+            return Some(Outcome::Found(Snapshot {
+                point: job.point,
+                target: job.target.clone(),
+                hit: UiaNode {
+                    tree: tree.clone(),
+                    index: hit_index,
+                },
+                focused: focused.map(|index| UiaNode { tree, index }),
+                calls: budget.calls,
+                elapsed: started.elapsed(),
+                truncated: false,
+                probe,
+            }));
         }
 
         // 3. Ancestors up to the top-level window, or up to the page in web content: above
@@ -1591,6 +1744,7 @@ impl Session for UiaSession {
             return None;
         }
         Some(Outcome::Found(Snapshot {
+            point: job.point,
             target: job.target.clone(),
             hit: UiaNode {
                 tree: tree.clone(),
@@ -1600,8 +1754,69 @@ impl Session for UiaSession {
             calls: budget.calls,
             elapsed: started.elapsed(),
             truncated,
+            probe: None,
         }))
     }
+}
+
+impl UiaSession {
+    /// The acceptance probe's fingerprint of `focused`. None when the deadline passed.
+    fn probe(
+        &self,
+        focused: &IUIAutomationElement,
+        window: isize,
+        budget: &mut Budget,
+    ) -> Option<Probe> {
+        let mut probe = Probe::default();
+        // The value: only its length and hash leave this function.
+        // SAFETY: COM objects of this thread.
+        match budget
+            .call(|| unsafe { focused.GetCurrentPropertyValueEx(UIA_ValueValuePropertyId, true) })
+        {
+            Err(Stop::Expired) => return None,
+            Err(Stop::Cap) | Ok(Err(_)) => {}
+            Ok(Ok(value)) => {
+                probe.value = take_string(value).map(|text| ValueSignature::of(&text));
+            }
+        }
+        // The container: the highest parent below a window, page or application.
+        let mut container = focused.clone();
+        let mut roles = Vec::new();
+        let mut current = focused.clone();
+        while roles.len() < PROBE_ANCESTORS {
+            // SAFETY: as above; `current` is alive.
+            let parent = match budget.call(|| unsafe {
+                self.walker
+                    .GetParentElementBuildCache(&current, &self.cache)
+            }) {
+                Err(Stop::Expired) => return None,
+                Err(Stop::Cap) | Ok(Err(_)) => break,
+                Ok(Ok(parent)) => parent,
+            };
+            let info = self.element_info(&parent, window);
+            roles.push(info.role);
+            if probe_container_levels(&roles) < roles.len() {
+                break;
+            }
+            container = parent.clone();
+            current = parent;
+        }
+        // SAFETY: as above; the condition lives in `self`.
+        match budget.call(|| unsafe { container.FindAll(TreeScope_Descendants, &self.images) }) {
+            Err(Stop::Expired) => return None,
+            Err(Stop::Cap) | Ok(Err(_)) => {}
+            Ok(Ok(array)) => {
+                // SAFETY: an in-process read of the array UI Automation returned.
+                probe.images = unsafe { array.Length() }.ok().map(|n| n.max(0) as u32);
+            }
+        }
+        Some(probe)
+    }
+}
+
+/// The exe file name of a process, for logs. None when it cannot be opened.
+pub fn exe_name_of(pid: u32) -> Option<String> {
+    Handle::process(pid).and_then(|h| h.exe_name())
 }
 
 /// The highest of the first `DEFAULT_ANCESTOR_LEVELS` ancestors below a boundary role: the
@@ -1900,6 +2115,103 @@ mod tests {
     }
 
     // --- Role mapping ---
+
+    #[test]
+    fn value_signatures_keep_length_and_hash_only() {
+        let a = ValueSignature::of("hello");
+        assert_eq!(a.chars, 5);
+        assert_eq!(a, ValueSignature::of("hello"));
+        assert_ne!(a, ValueSignature::of("hellp"));
+        // Only the first PROBE_VALUE_CHARS characters are hashed; all are counted.
+        let long = "x".repeat(PROBE_VALUE_CHARS);
+        let longer = format!("{long}yz");
+        let (a, b) = (ValueSignature::of(&long), ValueSignature::of(&longer));
+        assert_eq!(a.hash, b.hash);
+        assert_eq!(b.chars, PROBE_VALUE_CHARS + 2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn probes_compare_value_and_images() {
+        let sig = |t: &str| Some(ValueSignature::of(t));
+        let before = Probe {
+            value: sig("abc"),
+            images: Some(1),
+        };
+        assert!(!before.changed_from(&before));
+        assert!(
+            Probe {
+                value: sig("abcd"),
+                ..before
+            }
+            .changed_from(&before)
+        );
+        assert!(
+            Probe {
+                images: Some(2),
+                ..before
+            }
+            .changed_from(&before)
+        );
+        // A part one probe lacks is not compared.
+        assert!(
+            !Probe {
+                images: None,
+                ..before
+            }
+            .changed_from(&before)
+        );
+        // A value appearing or disappearing is a change.
+        assert!(
+            Probe {
+                value: None,
+                ..before
+            }
+            .changed_from(&before)
+        );
+    }
+
+    #[test]
+    fn probe_container_stops_below_a_boundary() {
+        assert_eq!(
+            probe_container_levels(&["AXGroup", "AXGroup", "AXWebArea", "AXGroup"]),
+            2
+        );
+        assert_eq!(probe_container_levels(&["AXWindow"]), 0);
+        assert_eq!(probe_container_levels(&["AXGroup"; 9]), PROBE_ANCESTORS);
+    }
+
+    #[test]
+    fn lookups_are_not_probes_unless_asked() {
+        assert!(!Lookup::at((1, 2)).probe);
+    }
+
+    #[test]
+    fn scintilla_and_rich_edit_windows_take_text() {
+        // Notepad++: a pane with its own window and no patterns.
+        let mut scintilla = el(UIA_PaneControlTypeId).focusable();
+        scintilla.class_name = "Scintilla".into();
+        scintilla.hwnd = 0x1234;
+        assert!(is_editable_text_root(&scintilla));
+        let hit = chain(vec![scintilla.clone(), window()]);
+        assert!(editable(&hit));
+        assert_eq!(hit.role().as_deref(), Some("AXGroup"));
+        // Without its own window (a web element with that class) it does not count.
+        let mut web = scintilla.clone().web();
+        web.hwnd = 0;
+        assert!(!is_editable_text_root(&web));
+        // Read-only or disabled stays out.
+        let mut disabled = scintilla.clone();
+        disabled.enabled = false;
+        assert!(!is_editable_text_root(&disabled));
+        // RichEdit is matched without case; an unknown class is not.
+        let mut rich = el(UIA_PaneControlTypeId);
+        rich.class_name = "richedit50w".into();
+        rich.hwnd = 7;
+        assert!(is_editable_text_root(&rich));
+        rich.class_name = "Button".into();
+        assert!(!is_editable_text_root(&rich));
+    }
 
     #[test]
     fn terminal_at_a_point_without_a_window_is_false() {
@@ -2367,6 +2679,7 @@ mod tests {
             point: (tag, ms),
             want_focus: false,
             deadline: Duration::from_millis(deadline_ms),
+            probe: false,
         }
     }
 

@@ -1,10 +1,11 @@
 //! Synthetic keystrokes for the paste, from `Keys.swift`: `Ctrl+V`, and the Right arrow and
 //! Escape that `PasteTarget.swift` presses before it.
 //!
-//! Rule 7: each call reads the modifier keys right before `SendInput`, fills scan codes from
-//! the foreground window's keyboard layout, and sends all its events in one `SendInput` call,
-//! so the user's own typing cannot land between them. The caller checks the foreground window
-//! with [`foreground_is`] right before calling.
+//! Rule 7: [`send_guarded`] is the only way keys go out. It runs the caller's last check (the
+//! clipboard still holds our staging), then reads the foreground window, its process, the
+//! focused control of its thread and the modifier keys, and sends the whole batch in one
+//! `SendInput` call, with nothing in between. Scan codes come from the keyboard layout of the
+//! thread just checked. The user's own typing cannot land inside a batch.
 //!
 //! Every event carries [`INJECTED_MARKER`] in `dwExtraInfo`, so the app's own low-level hooks
 //! can tell these events from the user's (`KBDLLHOOKSTRUCT::dwExtraInfo`).
@@ -22,7 +23,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_MENU, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GetAncestor, GetForegroundWindow, GetWindowThreadProcessId,
+    GA_ROOT, GUITHREADINFO, GetAncestor, GetForegroundWindow, GetGUIThreadInfo,
+    GetWindowThreadProcessId,
 };
 
 /// `dwExtraInfo` of every event this module sends ("IGOR").
@@ -42,10 +44,45 @@ pub enum Sent {
     /// Every event was sent.
     Done,
     /// The user is holding this modifier; nothing was sent. Wait and try again: with Shift,
-    /// `Ctrl+V` becomes "paste as plain text" in Chrome and Slack.
+    /// `Ctrl+V` becomes "paste as plain text" in Chrome and Slack, and a Ctrl released between
+    /// the check and the injection would turn the paste into a plain "v".
     Blocked(Modifier),
-    /// `SendInput` took only `sent` of `total` events; keys left down were released.
-    Incomplete { sent: u32, total: u32 },
+    /// `SendInput` took only `sent` of `total` events. Keys left down were released;
+    /// `released` says whether they read as up afterwards.
+    Incomplete {
+        sent: u32,
+        total: u32,
+        released: bool,
+    },
+    /// `SendInput` took none of the events (blocked input, a UIPI refusal it reports).
+    Failed,
+    /// The target window (or its process) is not in front; nothing was sent.
+    NotInFront,
+    /// The focused control of the target's thread is not the one of the first batch.
+    FocusMoved,
+    /// The caller's last check said no (the clipboard no longer holds our staging).
+    Refused,
+}
+
+/// What one send presses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Batch {
+    Key(Key),
+    /// Ctrl+V.
+    Paste,
+    /// Ctrl+Shift+V (WezTerm, Alacritty).
+    PasteWithShift,
+}
+
+/// What must still be true when a batch goes out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Guard {
+    /// The target's top-level window.
+    pub window: HWND,
+    /// Its process; 0 skips the check.
+    pub pid: u32,
+    /// The focused control of the window's thread at the first batch; None for the first.
+    pub focus: Option<HWND>,
 }
 
 /// Keys pressed before the paste.
@@ -77,41 +114,109 @@ pub fn held() -> Held {
     }
 }
 
-/// Presses `Ctrl+V`. If Ctrl is already down (the user holds it), sends only V.
-pub fn paste_shortcut() -> Sent {
-    let layout = foreground_layout();
-    let ctrl = scan(VK_CONTROL, layout);
-    let v = scan(VK_V, layout);
-    match paste_inputs(held(), ctrl, v) {
-        Ok(inputs) => send(&inputs),
-        Err(modifier) => Sent::Blocked(modifier),
+/// Sends one batch after the last checks, with nothing in between (rule 7). Returns the
+/// result and the focused control of the target's thread seen at the check, which the caller
+/// passes as `guard.focus` for the next batch of the same delivery.
+pub fn send_guarded(
+    guard: &Guard,
+    batch: Batch,
+    precheck: impl FnOnce() -> bool,
+) -> (Sent, Option<HWND>) {
+    if !precheck() {
+        return (Sent::Refused, None);
     }
-}
-
-/// Presses `Ctrl+Shift+V`, the paste shortcut of terminals that send a literal `^V` for
-/// `Ctrl+V` (WezTerm, Alacritty). A held Ctrl or Shift is used as it is; Alt or Win block.
-pub fn paste_shortcut_with_shift() -> Sent {
-    let layout = foreground_layout();
-    let ctrl = scan(VK_CONTROL, layout);
-    let shift = scan(VK_SHIFT, layout);
-    let v = scan(VK_V, layout);
-    match shift_paste_inputs(held(), ctrl, shift, v) {
-        Ok(inputs) => send(&inputs),
-        Err(modifier) => Sent::Blocked(modifier),
+    // SAFETY: no arguments.
+    let front = unsafe { GetForegroundWindow() };
+    if front.is_invalid() {
+        return (Sent::NotInFront, None);
     }
-}
-
-/// Presses and releases one key, with no modifier: blocked while any modifier is down
-/// (Ctrl+Right jumps a word; Ctrl+Escape opens Start).
-pub fn press(key: Key) -> Sent {
-    let vk = match key {
-        Key::Right => VK_RIGHT,
-        Key::Escape => VK_ESCAPE,
+    let mut front_pid = 0u32;
+    // SAFETY: `front_pid` is a local; plain value arguments otherwise.
+    let (thread, front_root, target_root) = unsafe {
+        let thread = GetWindowThreadProcessId(front, Some(&mut front_pid));
+        (
+            thread,
+            GetAncestor(front, GA_ROOT),
+            GetAncestor(guard.window, GA_ROOT),
+        )
     };
-    match key_inputs(held(), vk, scan(vk, foreground_layout())) {
-        Ok(inputs) => send(&inputs),
-        Err(modifier) => Sent::Blocked(modifier),
+    if !same_target(
+        front_root.0 as isize,
+        front_pid,
+        target_root.0 as isize,
+        guard.pid,
+    ) {
+        return (Sent::NotInFront, None);
     }
+    let focus = focused_control(thread);
+    if !focus_unchanged(guard.focus, focus) {
+        return (Sent::FocusMoved, focus);
+    }
+    // SAFETY: plain value argument: the thread just checked.
+    let layout = unsafe { GetKeyboardLayout(thread) };
+    let inputs = match batch {
+        Batch::Key(key) => {
+            let vk = match key {
+                Key::Right => VK_RIGHT,
+                Key::Escape => VK_ESCAPE,
+            };
+            key_inputs(held(), vk, scan(vk, layout))
+        }
+        Batch::Paste => paste_inputs(held(), scan(VK_CONTROL, layout), scan(VK_V, layout)),
+        Batch::PasteWithShift => shift_paste_inputs(
+            held(),
+            scan(VK_CONTROL, layout),
+            scan(VK_SHIFT, layout),
+            scan(VK_V, layout),
+        ),
+    };
+    match inputs {
+        Ok(inputs) => (send(&inputs), focus),
+        Err(modifier) => (Sent::Blocked(modifier), focus),
+    }
+}
+
+/// The foreground's top-level window is the target's, and so is its process (when known).
+fn same_target(front_root: isize, front_pid: u32, target_root: isize, target_pid: u32) -> bool {
+    target_root != 0 && front_root == target_root && (target_pid == 0 || front_pid == target_pid)
+}
+
+/// The focus seen now is the one of the first batch (nothing to compare at the first).
+fn focus_unchanged(expected: Option<HWND>, now: Option<HWND>) -> bool {
+    expected.is_none_or(|expected| now == Some(expected))
+}
+
+/// The control with the keyboard focus on `thread` (`GetGUIThreadInfo`; window manager
+/// state only, it waits on no other process).
+fn focused_control(thread: u32) -> Option<HWND> {
+    let mut info = GUITHREADINFO {
+        cbSize: size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `info` is a local with `cbSize` set, as the call requires.
+    unsafe { GetGUIThreadInfo(thread, &mut info) }.ok()?;
+    (!info.hwndFocus.is_invalid()).then_some(info.hwndFocus)
+}
+
+/// Whether the target is in front: its top-level window, and its process when both are known.
+pub fn foreground_matches(window: HWND, pid: u32) -> bool {
+    // SAFETY: no arguments.
+    let front = unsafe { GetForegroundWindow() };
+    if front.is_invalid() {
+        return false;
+    }
+    let mut front_pid = 0u32;
+    // SAFETY: `front_pid` is a local; plain value arguments.
+    let (front_root, target_root) = unsafe {
+        GetWindowThreadProcessId(front, Some(&mut front_pid));
+        (GetAncestor(front, GA_ROOT), GetAncestor(window, GA_ROOT))
+    };
+    same_target(
+        front_root.0 as isize,
+        front_pid,
+        target_root.0 as isize,
+        pid,
+    )
 }
 
 /// What must still be in front for the paste to go to the right place.
@@ -153,16 +258,6 @@ fn window_process(window: HWND) -> Option<u32> {
     // SAFETY: `pid` is a local.
     unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
     (pid != 0).then_some(pid)
-}
-
-/// The keyboard layout of the foreground window's thread, which is the one that will
-/// translate the keys.
-fn foreground_layout() -> HKL {
-    // SAFETY: no pointers; a null window gives thread 0, whose layout is our own.
-    unsafe {
-        let thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
-        GetKeyboardLayout(thread)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,48 +303,34 @@ fn keyboard(vk: VIRTUAL_KEY, scan: Scan, up: bool) -> INPUT {
     }
 }
 
-/// Shift, Alt or Win block the paste; a held Ctrl is used as it is.
+/// Ctrl+V, the full chord: any modifier the user holds blocks it (a held Ctrl released
+/// between the check and the injection would leave a plain "v").
 fn paste_inputs(held: Held, ctrl: Scan, v: Scan) -> Result<Vec<INPUT>, Modifier> {
-    blocker(held, false)?;
-    let v_down_up = [keyboard(VK_V, v, false), keyboard(VK_V, v, true)];
-    if held.ctrl {
-        return Ok(v_down_up.to_vec());
-    }
-    let mut inputs = vec![keyboard(VK_CONTROL, ctrl, false)];
-    inputs.extend(v_down_up);
-    inputs.push(keyboard(VK_CONTROL, ctrl, true));
-    Ok(inputs)
+    blocker(held, true)?;
+    Ok(vec![
+        keyboard(VK_CONTROL, ctrl, false),
+        keyboard(VK_V, v, false),
+        keyboard(VK_V, v, true),
+        keyboard(VK_CONTROL, ctrl, true),
+    ])
 }
 
-/// Ctrl+Shift+V: Alt or Win block; Ctrl or Shift already down are not pressed again.
+/// Ctrl+Shift+V, the full chord; any held modifier blocks it.
 fn shift_paste_inputs(
     held: Held,
     ctrl: Scan,
     shift: Scan,
     v: Scan,
 ) -> Result<Vec<INPUT>, Modifier> {
-    if held.alt {
-        return Err(Modifier::Alt);
-    }
-    if held.win {
-        return Err(Modifier::Win);
-    }
-    let mut inputs = Vec::new();
-    if !held.ctrl {
-        inputs.push(keyboard(VK_CONTROL, ctrl, false));
-    }
-    if !held.shift {
-        inputs.push(keyboard(VK_SHIFT, shift, false));
-    }
-    inputs.push(keyboard(VK_V, v, false));
-    inputs.push(keyboard(VK_V, v, true));
-    if !held.shift {
-        inputs.push(keyboard(VK_SHIFT, shift, true));
-    }
-    if !held.ctrl {
-        inputs.push(keyboard(VK_CONTROL, ctrl, true));
-    }
-    Ok(inputs)
+    blocker(held, true)?;
+    Ok(vec![
+        keyboard(VK_CONTROL, ctrl, false),
+        keyboard(VK_SHIFT, shift, false),
+        keyboard(VK_V, v, false),
+        keyboard(VK_V, v, true),
+        keyboard(VK_SHIFT, shift, true),
+        keyboard(VK_CONTROL, ctrl, true),
+    ])
 }
 
 fn key_inputs(held: Held, vk: VIRTUAL_KEY, scan: Scan) -> Result<Vec<INPUT>, Modifier> {
@@ -274,17 +355,34 @@ fn blocker(held: Held, ctrl_blocks: bool) -> Result<(), Modifier> {
 fn send(inputs: &[INPUT]) -> Sent {
     // SAFETY: a slice of fully initialised keyboard INPUTs with the right element size.
     let sent = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
+    outcome(inputs, sent, |releases| {
+        // SAFETY: as above.
+        unsafe { SendInput(releases, size_of::<INPUT>() as i32) };
+        releases.iter().all(|input| {
+            // SAFETY: every INPUT this module builds is a keyboard input.
+            let vk = unsafe { input.Anonymous.ki.wVk };
+            // SAFETY: plain value argument. The high bit is set while the key is down.
+            let state = unsafe { GetAsyncKeyState(vk.0 as i32) };
+            state >= 0
+        })
+    })
+}
+
+/// The result of a `SendInput` that took `sent` of `inputs`. `release` sends the key-ups for
+/// what was left down and says whether those keys then read as up.
+fn outcome(inputs: &[INPUT], sent: u32, release: impl FnOnce(&[INPUT]) -> bool) -> Sent {
     if sent as usize >= inputs.len() {
         return Sent::Done;
     }
-    let releases = releases(&inputs[..sent as usize]);
-    if !releases.is_empty() {
-        // SAFETY: as above.
-        unsafe { SendInput(&releases, size_of::<INPUT>() as i32) };
+    if sent == 0 {
+        return Sent::Failed;
     }
+    let releases = releases(&inputs[..sent as usize]);
+    let released = releases.is_empty() || release(&releases);
     Sent::Incomplete {
         sent,
         total: inputs.len() as u32,
+        released,
     }
 }
 
@@ -389,15 +487,9 @@ mod tests {
             shift: true,
             ..Held::default()
         };
-        let inputs = shift_paste_inputs(held, CTRL, SHIFT, V).unwrap();
         assert_eq!(
-            events(&inputs),
-            [
-                (VK_CONTROL, 0x1D, false, false),
-                (VK_V, 0x2F, false, false),
-                (VK_V, 0x2F, true, false),
-                (VK_CONTROL, 0x1D, true, false),
-            ]
+            shift_paste_inputs(held, CTRL, SHIFT, V).err(),
+            Some(Modifier::Shift)
         );
         let held = Held {
             alt: true,
@@ -410,16 +502,60 @@ mod tests {
     }
 
     #[test]
-    fn paste_with_ctrl_held_sends_only_v() {
+    fn paste_waits_while_the_user_holds_ctrl() {
         let held = Held {
             ctrl: true,
             ..Held::default()
         };
-        let inputs = paste_inputs(held, CTRL, V).unwrap();
+        assert_eq!(paste_inputs(held, CTRL, V).err(), Some(Modifier::Ctrl));
+    }
+
+    #[test]
+    fn a_send_that_took_nothing_failed_and_a_partial_one_is_released() {
+        let inputs = paste_inputs(Held::default(), CTRL, V).unwrap();
+        assert_eq!(outcome(&inputs, 4, |_| unreachable!()), Sent::Done);
+        assert_eq!(outcome(&inputs, 0, |_| unreachable!()), Sent::Failed);
+        let mut released_keys = Vec::new();
+        let sent = outcome(&inputs, 2, |up| {
+            released_keys = events(up);
+            true
+        });
         assert_eq!(
-            events(&inputs),
-            [(VK_V, 0x2F, false, false), (VK_V, 0x2F, true, false)]
+            sent,
+            Sent::Incomplete {
+                sent: 2,
+                total: 4,
+                released: true
+            }
         );
+        assert_eq!(
+            released_keys,
+            [(VK_V, 0x2F, true, false), (VK_CONTROL, 0x1D, true, false)]
+        );
+        // Still down after the release: reported, not hidden.
+        assert_eq!(
+            outcome(&inputs, 1, |_| false),
+            Sent::Incomplete {
+                sent: 1,
+                total: 4,
+                released: false
+            }
+        );
+    }
+
+    #[test]
+    fn the_target_must_be_in_front_with_its_process_and_focus() {
+        assert!(same_target(0x10, 100, 0x10, 100));
+        assert!(same_target(0x10, 100, 0x10, 0));
+        // Same window handle but another process (a reused handle): no.
+        assert!(!same_target(0x10, 7, 0x10, 100));
+        assert!(!same_target(0x20, 100, 0x10, 100));
+        assert!(!same_target(0, 100, 0, 100));
+        let (a, b) = (HWND(0x10 as *mut _), HWND(0x20 as *mut _));
+        assert!(focus_unchanged(None, Some(a)));
+        assert!(focus_unchanged(Some(a), Some(a)));
+        assert!(!focus_unchanged(Some(a), Some(b)));
+        assert!(!focus_unchanged(Some(a), None));
     }
 
     #[test]

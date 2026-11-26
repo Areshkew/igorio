@@ -8,12 +8,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use igorio_app::clipboard::Expect;
 use igorio_app::clipboard::Payload;
 use igorio_app::drop_router::*;
 use igorio_app::hook::{Button, MouseEvent};
-use igorio_app::input::{Key, Modifier, Sent};
+use igorio_app::input::{Batch, Key, Modifier, Sent};
 use igorio_app::state::FairyState;
-use igorio_app::uia::{ElementInfo, Outcome, Shell, Snapshot, Target, UiaNode};
+use igorio_app::uia::{
+    ElementInfo, Outcome, Probe, Shell, Snapshot, Target, UiaNode, ValueSignature,
+};
 use igorio_core::geom::{CardId, Rect};
 use igorio_kit::{HeldCard, Image};
 use windows::Win32::UI::Accessibility::*;
@@ -21,11 +24,17 @@ use windows::Win32::UI::Accessibility::*;
 // MARK: Fake environment
 
 type Snap = &'static str;
+/// A lookup the router asked for: (id, point, want_focus, deadline, probe).
+type LookupRec = (u64, (i32, i32), bool, f64, bool);
 
 #[derive(Default)]
 struct Fake {
     next: u64,
-    lookups: Vec<(u64, (i32, i32), bool, f64)>,
+    /// (id, point, want_focus, deadline, probe)
+    lookups: Vec<LookupRec>,
+    /// Probe lookups already answered by the rig.
+    answered: std::collections::HashSet<u64>,
+    probes_answered: u32,
     facts: ClipFacts,
     snapshots: Vec<u64>,
     stages: Vec<(u64, Payload)>,
@@ -45,6 +54,20 @@ struct Fake {
     /// Results for the paste keys, in order; `Done` once empty.
     pastes: VecDeque<Sent>,
     paste_keys: Vec<PasteKeys>,
+    /// What the guarded sends were given.
+    guards: Vec<SendGuard>,
+    /// The focused control the fake target reports; a later batch must see the same.
+    focus_now: isize,
+    /// The staging still owns the clipboard (B3's last check).
+    owns: bool,
+    /// The point is in the client area (silent terminals).
+    client: bool,
+    /// The user's key presses.
+    keys: u64,
+    /// The rollback copy the last fresh stage handed over, and the stages' expectations.
+    rollback_snap: Option<Snap>,
+    expects: Vec<(Expect, bool)>,
+    abandons: u32,
     pressed: Vec<Key>,
     sent: u32,
     log: Vec<String>,
@@ -74,9 +97,9 @@ impl Fake {
 impl Env for Fake {
     type Snap = Snap;
 
-    fn lookup(&mut self, point: (i32, i32), want_focus: bool, deadline: f64) -> u64 {
+    fn lookup(&mut self, point: (i32, i32), want_focus: bool, probe: bool, deadline: f64) -> u64 {
         let id = self.id();
-        self.lookups.push((id, point, want_focus, deadline));
+        self.lookups.push((id, point, want_focus, deadline, probe));
         id
     }
     fn clip_facts(&self, _now: f64) -> ClipFacts {
@@ -87,20 +110,34 @@ impl Env for Fake {
         self.snapshots.push(id);
         Ok(id)
     }
-    fn clip_stage(&mut self, payload: Payload) -> Result<u64, String> {
+    fn clip_stage(
+        &mut self,
+        payload: Payload,
+        expect: Expect,
+        rollback: Option<&Snap>,
+    ) -> Result<u64, String> {
         let id = self.id();
         self.stages.push((id, payload));
+        self.expects.push((expect, rollback.is_some()));
+        if let Some(snap) = rollback {
+            self.rollback_snap = Some(*snap);
+        }
         Ok(id)
     }
-    fn clip_restage(&mut self) -> Result<u64, String> {
+    fn clip_restage(&mut self, expect: Expect) -> Result<u64, String> {
         let id = self.id();
         self.restages.push(id);
+        self.expects.push((expect, false));
         Ok(id)
     }
-    fn clip_restore(&mut self, snap: &Snap, guard: RestoreGuard) -> Result<u64, String> {
+    fn clip_rollback(&mut self, guard: RestoreGuard) -> Result<u64, String> {
         let id = self.id();
+        let snap = self.rollback_snap.unwrap_or("none");
         self.restores.push((id, snap, guard));
         Ok(id)
+    }
+    fn clip_abandon(&mut self) {
+        self.abandons += 1;
     }
     fn save_png(&mut self, _card: &HeldCard) -> u64 {
         let id = self.id();
@@ -109,12 +146,13 @@ impl Env for Fake {
     }
     fn foreground_is(&self, window: isize, pid: u32) -> bool {
         self.checks.borrow_mut().push((window, pid));
-        let matches = if window != 0 {
-            window == self.fg_window
-        } else {
-            pid == self.fg_pid
-        };
-        self.front && matches
+        self.front && window == self.fg_window && (pid == 0 || pid == self.fg_pid)
+    }
+    fn point_in_client(&self, _window: isize, _point: (i32, i32)) -> bool {
+        self.client
+    }
+    fn key_presses(&self) -> u64 {
+        self.keys
     }
     fn primary_down(&self) -> bool {
         self.button
@@ -122,17 +160,40 @@ impl Env for Fake {
     fn terminal_at(&self, _point: (i32, i32)) -> bool {
         self.terminal
     }
-    fn press(&mut self, key: Key) -> Sent {
-        self.pressed.push(key);
-        Sent::Done
+    fn process_name(&self, pid: u32) -> Option<String> {
+        (pid == 4242).then(|| "copyq.exe".to_string())
     }
-    fn paste_shortcut(&mut self, keys: PasteKeys) -> Sent {
-        self.paste_keys.push(keys);
-        let result = self.pastes.pop_front().unwrap_or(Sent::Done);
-        if !matches!(result, Sent::Blocked(_)) {
-            self.sent += 1;
+    fn send(&mut self, batch: Batch, guard: SendGuard) -> (Sent, Option<isize>) {
+        self.guards.push(guard);
+        self.checks.borrow_mut().push((guard.window, guard.pid));
+        // The order of `input::send_guarded`.
+        if guard.stage.is_some() && !self.owns {
+            return (Sent::Refused, None);
         }
-        result
+        if !self.foreground_is(guard.window, guard.pid) {
+            return (Sent::NotInFront, None);
+        }
+        if guard.focus.is_some_and(|f| f != self.focus_now) {
+            return (Sent::FocusMoved, Some(self.focus_now));
+        }
+        match batch {
+            Batch::Key(key) => {
+                self.pressed.push(key);
+                (Sent::Done, Some(self.focus_now))
+            }
+            Batch::Paste | Batch::PasteWithShift => {
+                self.paste_keys.push(if batch == Batch::Paste {
+                    PasteKeys::CtrlV
+                } else {
+                    PasteKeys::CtrlShiftV
+                });
+                let result = self.pastes.pop_front().unwrap_or(Sent::Done);
+                if matches!(result, Sent::Done | Sent::Incomplete { .. }) {
+                    self.sent += 1;
+                }
+                (result, Some(self.focus_now))
+            }
+        }
     }
     fn log(&mut self, now: f64, line: &str) {
         self.log.push(format!("{now:.3} {line}"));
@@ -148,6 +209,28 @@ struct Rig {
     s: FairyState,
     e: Fake,
     now: f64,
+    /// Answers for probe lookups: the first of a delivery (the focus check) and the later
+    /// ones (after the paste keys). None leaves them unanswered.
+    focus: Option<Seen>,
+    after: Option<Seen>,
+}
+
+/// The focused element a good paste sees: an editable field of pid 100 under `AT`.
+fn focused_field(single_line: bool, value: &str) -> Seen {
+    let mut spot = nothing("notepad.exe");
+    spot.point = Some(AT);
+    spot.focused = Some(Focus {
+        pid: 100,
+        editable: true,
+        frame: Some(Rect::new(450.0, 380.0, 200.0, 40.0)),
+        single_line,
+        xterm: false,
+    });
+    spot.probe = Some(Probe {
+        value: Some(ValueSignature::of(value)),
+        images: Some(0),
+    });
+    Seen::Spot(Box::new(spot))
 }
 
 fn image() -> Arc<Image> {
@@ -172,6 +255,9 @@ impl Rig {
             front: true,
             fg_window: 0x10,
             fg_pid: 100,
+            focus_now: 0x77,
+            owns: true,
+            client: true,
             facts: ClipFacts {
                 sequence: 5,
                 ..ClipFacts::default()
@@ -183,6 +269,8 @@ impl Rig {
             s,
             e,
             now: 0.0,
+            focus: Some(focused_field(false, "")),
+            after: Some(focused_field(false, "")),
         }
     }
 
@@ -202,11 +290,13 @@ impl Rig {
 
     /// Runs every deadline up to `t`, as the main loop would.
     fn to(&mut self, t: f64) {
+        self.auto_answer();
         for _ in 0..100_000 {
             match self.r.next_deadline() {
                 Some(d) if d <= t => {
                     self.now = d.max(self.now);
                     self.r.tick(self.now, &mut self.s, &mut self.e);
+                    self.auto_answer();
                 }
                 _ => {
                     self.now = t.max(self.now);
@@ -217,9 +307,37 @@ impl Rig {
         panic!("the router does not settle before {t}");
     }
 
+    /// Answers probe lookups (the focus check, then the probes after the paste keys) at
+    /// once with `focus` / `after`.
+    fn auto_answer(&mut self) {
+        loop {
+            let next = self
+                .e
+                .lookups
+                .iter()
+                .find(|l| l.4 && !self.e.answered.contains(&l.0))
+                .map(|l| l.0);
+            let Some(id) = next else {
+                return;
+            };
+            self.e.answered.insert(id);
+            let first = self.e.probes_answered == 0;
+            self.e.probes_answered += 1;
+            let seen = if first {
+                self.focus.clone()
+            } else {
+                self.after.clone()
+            };
+            if let Some(seen) = seen {
+                self.r.seen(id, seen, self.now, &mut self.s, &mut self.e);
+            }
+        }
+    }
+
     fn mouse(&mut self, event: MouseEvent, t: f64) {
         self.to(t);
         self.r.mouse(event, &mut self.s, &mut self.e);
+        self.auto_answer();
     }
 
     fn down(&mut self, t: f64, click_count: u32) {
@@ -234,6 +352,8 @@ impl Rig {
                 time: t,
                 click_count,
                 injected: false,
+                window: 0x10,
+                touch: false,
             },
             t,
         );
@@ -267,16 +387,26 @@ impl Rig {
         );
     }
 
+    /// Answers the newest lookup that is not a probe.
     fn answer(&mut self, t: f64, seen: Seen) {
         self.to(t);
-        let id = self.e.lookups.last().expect("a lookup").0;
+        let id = self
+            .e
+            .lookups
+            .iter()
+            .rev()
+            .find(|l| !l.4)
+            .expect("a lookup")
+            .0;
         self.r.seen(id, seen, t, &mut self.s, &mut self.e);
+        self.auto_answer();
     }
 
     fn reply(&mut self, t: f64, ticket: u64, result: Result<ClipDone<Snap>, ClipFail>) {
         self.to(t);
         self.r
             .clip_reply(ClipReply { ticket, result }, t, &mut self.s, &mut self.e);
+        self.auto_answer();
     }
 
     fn snapshot_reply(&mut self, t: f64, ticket: u64, lost: Option<&str>) {
@@ -302,11 +432,24 @@ impl Rig {
         self.reply(t, ticket, Ok(ClipDone::Staged { sequence: 6 }));
     }
 
-    fn read(&mut self, t: f64, reads: u32) {
+    /// The target (pid 100) has read `total` formats by `t`.
+    fn read(&mut self, t: f64, total: u32) {
+        self.read_by(t, total, Some(100));
+    }
+
+    /// `total` formats rendered by `t`, the new ones read by `reader`.
+    fn read_by(&mut self, t: f64, total: u32, reader: Option<u32>) {
         self.to(t);
         let staged = self.e.facts.staged.as_mut().expect("staged");
-        staged.reads = reads;
+        let had = staged.renders.iter().flatten().count() as u32;
+        for _ in had..total {
+            if let Some(slot) = staged.renders.iter_mut().find(|r| r.is_none()) {
+                *slot = Some((reader, t));
+            }
+        }
+        staged.reads = total;
         staged.last_read_at = Some(t);
+        staged.last_reader = reader;
         self.r.clipboard_changed(t, &mut self.s, &mut self.e);
     }
 
@@ -318,6 +461,13 @@ impl Rig {
             staged.overwritten_at.get_or_insert(t);
         }
         self.r.clipboard_changed(t, &mut self.s, &mut self.e);
+    }
+
+    /// A double-click whose second mouse-down is at `t`.
+    fn double_click_at(&mut self, t: f64) {
+        self.down(t - 0.15, 1);
+        self.up(t - 0.07);
+        self.down(t, 2);
     }
 
     /// First click (remembers the clipboard) and the second mouse-down at 0.15 s.
@@ -569,6 +719,7 @@ fn a_focused_field_counts_only_when_the_click_is_inside_it() {
         pid: 100,
         editable: true,
         frame: Some(Rect::new(400.0, 380.0, 300.0, 40.0)),
+        ..Focus::default()
     });
     assert!(matches!(
         confirm_after_up(&spot, AT, Some(100), CanvasFacts::default()),
@@ -588,6 +739,7 @@ fn a_focused_field_counts_only_when_the_click_is_inside_it() {
         pid: 999,
         editable: true,
         frame: Some(Rect::new(400.0, 380.0, 300.0, 40.0)),
+        ..Focus::default()
     });
     assert_eq!(
         confirm_after_up(&spot, AT, Some(100), CanvasFacts::default()),
@@ -624,7 +776,7 @@ fn a_slow_app_gets_one_longer_lookup_after_the_mouse_up() {
     rig.up(0.42);
     rig.to(0.6);
     assert_eq!(rig.e.lookups.len(), 2);
-    let (_, point, focus, deadline) = rig.e.lookups[1];
+    let (_, point, focus, deadline, _) = rig.e.lookups[1];
     assert_eq!((point, focus, deadline), (AT, true, SLOW_DEADLINE));
     // It answers this time: a text field is at the click point.
     let mut spot = nothing("RobloxStudioBeta.exe");
@@ -670,17 +822,25 @@ fn a_lookup_that_never_answers_is_given_up() {
 }
 
 #[test]
-fn a_silent_terminal_is_still_pasted_into() {
+fn a_silent_console_is_pasted_into_only_in_its_text_area() {
+    let console = || {
+        let mut t = target("cmd.exe", true);
+        t.class_name = "ConsoleWindowClass".into();
+        Seen::TimedOut { target: t }
+    };
     let mut rig = Rig::new(1);
     rig.double_click();
-    rig.answer(
-        0.4,
-        Seen::TimedOut {
-            target: target("WindowsTerminal.exe", true),
-        },
-    );
+    rig.answer(0.4, console());
     assert!(rig.e.logged("→ Paste"));
     assert_eq!(rig.e.saves.len(), 1);
+
+    // Its title bar or scroll bar (outside the client area): no path typed blind.
+    let mut rig = Rig::new(1);
+    rig.e.client = false;
+    rig.double_click();
+    rig.answer(0.4, console());
+    assert!(rig.e.saves.is_empty());
+    assert_eq!(rig.s.hint(), Some(HINT_SLOW));
 }
 
 #[test]
@@ -855,9 +1015,23 @@ fn copy_on_select_after_the_paste_is_adopted_and_the_clipboard_still_restored() 
 }
 
 #[test]
-fn an_overwrite_before_any_read_writes_the_screenshot_again() {
+fn an_overwrite_before_any_read_writes_the_screenshot_again_in_a_terminal() {
     let mut rig = Rig::new(1);
-    let sent = paste_into_field(&mut rig);
+    rig.double_click();
+    rig.answer(0.17, terminal());
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    let job = rig.e.saves[0];
+    rig.r.saved(
+        job,
+        Ok(PathBuf::from(r"C:\p\a.png")),
+        0.26,
+        &mut rig.s,
+        &mut rig.e,
+    );
+    rig.to(0.5);
+    rig.staged_reply(0.5);
+    let sent = 0.5;
     rig.overwrite(sent + 0.05);
     assert_eq!(rig.e.restages.len(), 1);
     let ticket = rig.e.restages[0];
@@ -868,9 +1042,27 @@ fn an_overwrite_before_any_read_writes_the_screenshot_again() {
     assert_eq!(rig.e.restages.len(), 1);
     rig.read(sent + 0.1, 2);
     rig.to(sent + 0.3);
-    assert_eq!(rig.s.hint(), Some(HINT_PASTED));
+    assert_eq!(rig.s.hint(), Some(HINT_PASTED_PATH));
+    assert!(
+        matches!(rig.e.expects[1].0, Expect::Sequence(_)),
+        "the rewrite is guarded"
+    );
     rig.to(sent + 2.2);
     assert_eq!(rig.restored(), vec!["user"], "{:#?}", rig.e.log);
+}
+
+/// B4: outside terminals a write after our stage is the user copying: never rewrite, never
+/// restore.
+#[test]
+fn an_overwrite_in_a_field_is_the_user_copying() {
+    let mut rig = Rig::new(1);
+    let sent = paste_into_field(&mut rig);
+    rig.overwrite(sent + 0.05);
+    assert!(rig.e.restages.is_empty());
+    assert_eq!(rig.e.abandons, 1);
+    rig.to(sent + 10.0);
+    assert!(rig.e.restores.is_empty());
+    assert!(!rig.r.restore_pending());
 }
 
 #[test]
@@ -962,14 +1154,18 @@ fn a_locked_clipboard_delays_the_restore_and_then_gives_up() {
 }
 
 #[test]
-fn a_second_double_click_during_a_delivery_is_ignored() {
+fn another_press_during_a_delivery_stops_it_quietly() {
     let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
     rig.double_click();
     rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
     rig.down(0.3, 1);
-    rig.down(0.4, 2);
-    assert_eq!(rig.e.lookups.len(), 1);
-    assert!(rig.e.logged("busy=yes"));
+    rig.to(3.0);
+    assert!(rig.e.logged("another press → the delivery stops"));
+    assert!(rig.e.pressed.is_empty() && rig.e.stages.is_empty() && rig.e.sent == 0);
+    assert!(rig.s.card(id).is_some());
+    assert_ne!(rig.s.hint(), Some(HINT_PASTE_FAILED));
 }
 
 #[test]
@@ -1080,6 +1276,8 @@ fn the_click_copy_of_a_terminal_is_not_taken_for_the_users_clipboard() {
             time: 5.0,
             click_count: 2,
             injected: false,
+            window: 0x10,
+            touch: false,
         },
         5.0,
     );
@@ -1149,6 +1347,8 @@ fn injected_clicks_and_clicks_without_cards_do_nothing() {
             time: 0.1,
             click_count: 2,
             injected: true,
+            window: 0x10,
+            touch: false,
         },
         0.1,
     );
@@ -1345,6 +1545,7 @@ fn a_slow_app_needs_an_editable_element_at_the_point() {
         pid: 100,
         editable: true,
         frame: Some(Rect::new(450.0, 380.0, 200.0, 30.0)),
+        ..Focus::default()
     });
     rig.answer(1.1, Seen::Spot(Box::new(spot)));
     // No delivery starts: no clipboard snapshot, no keys, no stage.
@@ -1367,12 +1568,13 @@ fn a_stage_reply_after_the_timeout_is_still_undone() {
     assert_eq!(rig.e.stages.len(), 1);
     rig.to(0.39 + REPLY_TIMEOUT + 0.1);
     assert_eq!(rig.s.hint(), Some(HINT_PASTE_FAILED));
-    assert!(rig.e.restores.is_empty());
-    assert!(rig.r.restore_pending());
-    rig.staged_reply(5.0);
-    assert_eq!(rig.e.sent, 0, "no paste keys after giving up");
+    // B5: a rollback is queued behind the stage at once; the clipboard thread runs it after
+    // the stage, whenever that happens.
     assert_eq!(rig.restored(), vec!["user"]);
     assert_eq!(rig.e.restores[0].2, RestoreGuard::OwnStaging);
+    rig.staged_reply(5.0);
+    assert_eq!(rig.e.sent, 0, "no paste keys after giving up");
+    assert_eq!(rig.e.restores.len(), 1, "no second rollback");
 }
 
 /// Review item 5: A stage that failed before touching the clipboard restores nothing over the user's
@@ -1457,8 +1659,10 @@ fn quit_in_each_delivery_step() {
     rig.up(0.25);
     rig.to(0.4);
     let stage = rig.e.stages[0].0;
-    assert_eq!(rig.r.quit(0.4, &mut rig.e), Some(stage));
-    assert!(rig.e.restores.is_empty());
+    // B5: a rollback is queued behind the stage at once.
+    let rollback = rig.r.quit(0.4, &mut rig.e);
+    assert_eq!(rollback, Some(rig.e.restores[0].0));
+    assert_eq!(rig.e.restores[0].2, RestoreGuard::OwnStaging);
     rig.e.facts.staged = Some(StagedFacts {
         ticket: stage,
         ..StagedFacts::default()
@@ -1471,8 +1675,8 @@ fn quit_in_each_delivery_step() {
         0.45,
         &mut rig.e,
     );
-    assert_eq!(next, Some(rig.e.restores[0].0));
-    assert_eq!(rig.e.restores[0].2, RestoreGuard::OwnStaging);
+    assert_eq!(next, rollback, "still waiting for the rollback");
+    assert_eq!(rig.e.restores.len(), 1);
     assert_eq!(rig.e.sent, 0);
 
     // A stage in flight that then fails after emptying: restore over the empty clipboard.
@@ -1483,8 +1687,8 @@ fn quit_in_each_delivery_step() {
     rig.up(0.25);
     rig.to(0.4);
     let stage = rig.e.stages[0].0;
-    rig.r.quit(0.4, &mut rig.e);
-    rig.r.quit_reply(
+    let rollback = rig.r.quit(0.4, &mut rig.e);
+    let next = rig.r.quit_reply(
         ClipReply {
             ticket: stage,
             result: Err(ClipFail::Emptied { sequence: 7 }),
@@ -1492,7 +1696,10 @@ fn quit_in_each_delivery_step() {
         0.45,
         &mut rig.e,
     );
-    assert_eq!(rig.e.restores[0].2, RestoreGuard::Sequence(7));
+    // The queued rollback covers it: the clipboard thread counts the empty clipboard its
+    // own failed stage left as its own.
+    assert_eq!(next, rollback);
+    assert_eq!(rig.e.restores.len(), 1);
 
     // A stage in flight that then fails without touching the clipboard: nothing to do.
     let mut rig = Rig::new(1);
@@ -1502,7 +1709,7 @@ fn quit_in_each_delivery_step() {
     rig.up(0.25);
     rig.to(0.4);
     let stage = rig.e.stages[0].0;
-    rig.r.quit(0.4, &mut rig.e);
+    let rollback = rig.r.quit(0.4, &mut rig.e).unwrap();
     rig.r.quit_reply(
         ClipReply {
             ticket: stage,
@@ -1511,7 +1718,16 @@ fn quit_in_each_delivery_step() {
         0.45,
         &mut rig.e,
     );
-    assert!(rig.e.restores.is_empty(), "nothing was written");
+    // The clipboard thread finds nothing of ours there and writes nothing.
+    let done = rig.r.quit_reply(
+        ClipReply {
+            ticket: rollback,
+            result: Err(ClipFail::Other("nothing staged".into())),
+        },
+        0.46,
+        &mut rig.e,
+    );
+    assert_eq!(done, None);
 
     // While watching for reads, and with a restore already in flight.
     let mut rig = Rig::new(1);
@@ -1544,40 +1760,25 @@ fn reads_by_another_process_are_not_a_paste() {
     let mut rig = Rig::new(1);
     let id = rig.ids()[0];
     let sent = paste_into_field(&mut rig);
-    rig.to(sent + 0.02);
-    {
-        let staged = rig.e.facts.staged.as_mut().unwrap();
-        staged.reads = 2;
-        staged.last_read_at = Some(sent + 0.02);
-        staged.last_reader = Some(4242);
-    }
-    rig.r.clipboard_changed(sent + 0.02, &mut rig.s, &mut rig.e);
+    rig.read_by(sent + 0.02, 2, Some(4242));
+    // Its read may hide the target's: the probe looks, sees no change, and by the probe
+    // timeout the paste is not confirmed.
     rig.to(sent + 1.7);
+    assert!(rig.s.card(id).is_some());
+    rig.to(sent + 3.1);
     assert_eq!(rig.s.hint(), Some(HINT_PASTE_FAILED));
     assert!(rig.s.card(id).is_some());
-    assert!(rig.e.logged("not the target → not counted"));
+    assert!(rig.e.logged("(copyq.exe), not the target → not counted"));
     // A later read by the same other process is not a late paste either.
-    {
-        let staged = rig.e.facts.staged.as_mut().unwrap();
-        staged.reads = 3;
-        staged.last_reader = Some(4242);
-    }
-    rig.r.clipboard_changed(sent + 3.0, &mut rig.s, &mut rig.e);
-    rig.to(sent + 3.1);
+    rig.read_by(sent + 4.0, 3, Some(4242));
+    rig.to(sent + 4.1);
     assert!(rig.s.card(id).is_some());
 
     // The target's own process reading counts.
     let mut rig = Rig::new(1);
     let id = rig.ids()[0];
     let sent = paste_into_field(&mut rig);
-    rig.to(sent + 0.02);
-    {
-        let staged = rig.e.facts.staged.as_mut().unwrap();
-        staged.reads = 2;
-        staged.last_read_at = Some(sent + 0.02);
-        staged.last_reader = Some(100);
-    }
-    rig.r.clipboard_changed(sent + 0.02, &mut rig.s, &mut rig.e);
+    rig.read_by(sent + 0.02, 2, Some(100));
     rig.to(sent + 0.3);
     assert!(rig.s.card(id).is_none());
 }
@@ -1689,6 +1890,363 @@ fn title_bar_and_items_are_activating_but_an_address_bar_is_not() {
     assert!(spot.editable_hit && !spot.activating);
 }
 
+// MARK: Round 3: probe, focus, web terminals, Scintilla, readers
+
+/// Up to the paste keys with a single-line field (probe verifies).
+fn paste_into_single_line(rig: &mut Rig, after: &str) -> f64 {
+    rig.focus = Some(focused_field(true, "query"));
+    rig.after = Some(focused_field(true, after));
+    paste_into_field(rig)
+}
+
+/// Item 1a: Chromium reads the clipboard on Ctrl+V in any text input and drops an image it
+/// cannot use. A single-line field that was read but did not change refused the image.
+#[test]
+fn a_single_line_field_that_does_not_change_refused_the_image() {
+    let mut rig = Rig::new(2);
+    let ids = rig.ids();
+    let sent = paste_into_single_line(&mut rig, "query");
+    assert!(rig.e.logged("probe taken (verify)"));
+    rig.read(sent + 0.02, 1);
+    rig.to(sent + 1.0);
+    assert!(
+        rig.s.card(ids[0]).is_some(),
+        "a read alone is not acceptance"
+    );
+    rig.to(sent + 3.1);
+    assert_eq!(rig.s.hint(), Some(HINT_NO_IMAGES));
+    assert!(rig.s.card(ids[0]).is_some() && rig.s.card(ids[1]).is_some());
+    assert_eq!(rig.e.stages.len(), 1, "the rest of the pile is not tried");
+    // The probes went out every 0.2 s, each with focus and a probe, at the click point.
+    let probes: Vec<_> = rig.e.lookups.iter().filter(|l| l.4).collect();
+    assert!(probes.len() >= 10, "{} probes", probes.len());
+    assert!(probes.iter().all(|l| l.1 == AT && l.2));
+    // The clipboard is still put back.
+    rig.to(sent + 6.1);
+    assert_eq!(rig.restored(), vec!["user"]);
+}
+
+#[test]
+fn a_single_line_field_that_changes_took_the_image() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    let sent = paste_into_single_line(&mut rig, "query[image]");
+    rig.read(sent + 0.02, 1);
+    rig.to(sent + 0.5);
+    assert!(rig.s.card(id).is_none());
+    assert!(rig.e.logged("probe: the field changed"));
+}
+
+/// A probe that never answers is no evidence either way: the reads decide.
+#[test]
+fn a_probe_that_never_answers_falls_back_to_the_reads() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.focus = Some(focused_field(true, "query"));
+    rig.after = None;
+    let sent = paste_into_field(&mut rig);
+    rig.read(sent + 0.02, 1);
+    rig.to(sent + 2.9);
+    assert!(rig.s.card(id).is_some());
+    rig.to(sent + 3.1);
+    assert!(rig.s.card(id).is_none(), "{:#?}", rig.e.log);
+}
+
+/// The rule table of `paste_outcome`.
+#[test]
+fn paste_outcome_rules() {
+    use igorio_core::paste_policy::Outcome::*;
+    let view = |verify, answered, changed| {
+        Some(ProbeView {
+            verify,
+            answered,
+            changed,
+        })
+    };
+    // No probe: reads by the target decide; others never count.
+    assert_eq!(paste_outcome(0.2, 1, 0, false, None), Accepted);
+    assert_eq!(paste_outcome(1.7, 0, 3, false, None), Failed);
+    // A change is acceptance.
+    assert_eq!(
+        paste_outcome(0.3, 0, 1, false, view(false, true, true)),
+        Accepted
+    );
+    // Single-line, read, unchanged at 3 s: refused.
+    assert_eq!(
+        paste_outcome(3.0, 1, 0, false, view(true, true, false)),
+        Rejected
+    );
+    assert_eq!(
+        paste_outcome(2.0, 1, 0, false, view(true, true, false)),
+        Pending
+    );
+    // Masked multi-line, unchanged: not confirmed.
+    assert_eq!(
+        paste_outcome(3.0, 0, 1, false, view(false, true, false)),
+        Failed
+    );
+    // No probe answered: the reads decide.
+    assert_eq!(
+        paste_outcome(3.0, 1, 0, false, view(true, false, false)),
+        Accepted
+    );
+    assert_eq!(
+        paste_outcome(3.0, 0, 1, false, view(false, false, false)),
+        Failed
+    );
+    // Nothing read at all.
+    assert_eq!(
+        paste_outcome(1.7, 0, 0, false, view(true, true, false)),
+        Failed
+    );
+}
+
+/// Item 4: a clipboard manager read first and the target's read is invisible; the probe
+/// sees the image arrive in a multi-line composer.
+#[test]
+fn a_paste_hidden_by_a_clipboard_manager_is_confirmed_by_the_probe() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.after = Some(focused_field(false, "hello\u{fffc}"));
+    let sent = paste_into_field(&mut rig);
+    rig.read_by(sent + 0.025, 1, Some(4242));
+    rig.to(sent + 0.6);
+    assert!(rig.s.card(id).is_none(), "{:#?}", rig.e.log);
+    assert!(rig.e.logged("others 1, probe changed → accepted"));
+}
+
+/// Item 1c / (c): the double-click landed on text (a hidden input under it was the hit),
+/// and the keyboard focus is not in a visible field under the click: no key goes out.
+#[test]
+fn no_keys_when_the_focus_is_not_in_the_target_field() {
+    for focus in [
+        None,
+        // A hidden one-pixel input at the caret (Monaco, a read-only code view).
+        Some(Rect::new(500.0, 400.0, 1.0, 1.0)),
+        // A field elsewhere in the window.
+        Some(Rect::new(0.0, 900.0, 300.0, 40.0)),
+    ] {
+        let mut rig = Rig::new(1);
+        let mut spot = nothing("T3 Code (Beta).exe");
+        spot.point = Some(AT);
+        spot.focused = focus.map(|frame| Focus {
+            pid: 100,
+            editable: true,
+            frame: Some(frame),
+            ..Focus::default()
+        });
+        rig.focus = Some(Seen::Spot(Box::new(spot)));
+        rig.double_click();
+        rig.answer(0.17, field("T3 Code (Beta).exe"));
+        rig.remembered_arrives(0.18);
+        rig.up(0.25);
+        rig.to(3.0);
+        assert!(rig.e.pressed.is_empty() && rig.e.stages.is_empty() && rig.e.sent == 0);
+        assert_eq!(rig.s.hint(), Some(HINT_NOT_FOCUSED), "{focus:?}");
+        assert!(rig.s.is_holding());
+        assert!(rig.e.logged("focus is not in the target field"));
+    }
+}
+
+/// A focus lookup that does not answer is no evidence: no paste.
+#[test]
+fn no_keys_when_the_focus_check_times_out() {
+    let mut rig = Rig::new(1);
+    rig.focus = Some(Seen::TimedOut {
+        target: target("slow.exe", false),
+    });
+    rig.double_click();
+    rig.answer(0.17, field("slow.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(3.0);
+    assert!(rig.e.pressed.is_empty() && rig.e.stages.is_empty());
+    assert_eq!(rig.s.hint(), Some(HINT_SLOW));
+
+    // Never answered at all: given up after the deadline, same result.
+    let mut rig = Rig::new(1);
+    rig.focus = None;
+    rig.double_click();
+    rig.answer(0.17, field("slow.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(3.0);
+    assert!(rig.e.pressed.is_empty() && rig.e.stages.is_empty());
+    assert!(!rig.r.busy());
+}
+
+/// (b): an editable found only by the nearby search (not the hit or its ancestors) goes
+/// through the re-check, and then the focus must be in it.
+#[test]
+fn a_nearby_editable_needs_the_focus_in_it() {
+    let mut rig = Rig::new(1);
+    let mut label = nothing("chat.exe");
+    label.role = "AXStaticText".into();
+    label.editable = true; // found by the nearby search
+    label.field_role = Some("AXTextArea".into());
+    rig.focus = Some(Seen::Spot(Box::new(nothing("chat.exe"))));
+    rig.double_click();
+    rig.answer(0.17, Seen::Spot(Box::new(label.clone())));
+    assert!(rig.e.logged("CheckFocusAfterMouseUp"));
+    rig.up(0.25);
+    rig.to(0.36);
+    rig.answer(0.4, Seen::Spot(Box::new(label)));
+    rig.remembered_arrives(0.41);
+    rig.to(3.0);
+    assert!(rig.e.pressed.is_empty() && rig.e.stages.is_empty());
+    assert_eq!(rig.s.hint(), Some(HINT_NOT_FOCUSED));
+}
+
+/// (a): an answer about another point (a hover lookup for the composer) cannot decide a
+/// double-click elsewhere.
+#[test]
+fn an_answer_about_another_point_is_not_taken() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    let mut composer = match field("T3 Code (Beta).exe") {
+        Seen::Spot(spot) => spot,
+        _ => unreachable!(),
+    };
+    composer.point = Some((1340, 681));
+    rig.answer(0.17, Seen::Spot(composer));
+    assert!(
+        rig.e
+            .logged("answer about Some((1340, 681)), asked about (500, 400)")
+    );
+    rig.up(0.25);
+    rig.to(3.0);
+    assert!(rig.e.stages.is_empty() && rig.e.snapshots.is_empty());
+}
+
+/// The hover said "double-click to paste" over the composer; the double-click lands on
+/// text: its own lookup decides, and a late hover answer changes nothing.
+#[test]
+fn the_hover_hint_never_decides_a_double_click() {
+    let mut rig = Rig::new(1);
+    rig.moved(0.0, 1340, 681);
+    rig.to(0.23);
+    let hover = rig.e.lookups[0].0;
+    rig.double_click_at(0.3);
+    let click = rig.e.lookups.last().unwrap().0;
+    assert_ne!(hover, click);
+    // The hover's answer (the composer) arrives first, under its own id.
+    let mut composer = match field("T3 Code (Beta).exe") {
+        Seen::Spot(spot) => spot,
+        _ => unreachable!(),
+    };
+    composer.point = Some((1340, 681));
+    rig.r
+        .seen(hover, Seen::Spot(composer), 0.47, &mut rig.s, &mut rig.e);
+    assert!(
+        rig.r.busy(),
+        "still waiting for the double-click's own answer"
+    );
+    let mut text = nothing("T3 Code (Beta).exe");
+    text.role = "AXStaticText".into();
+    rig.r.seen(
+        click,
+        Seen::Spot(Box::new(text)),
+        0.48,
+        &mut rig.s,
+        &mut rig.e,
+    );
+    assert!(rig.e.logged("→ CheckFocusAfterMouseUp"));
+    rig.up(0.5);
+    rig.to(3.0);
+    assert!(rig.e.stages.is_empty());
+}
+
+/// Item 2: the debug line says what the hit and the focus are, without contents.
+#[test]
+fn the_double_click_line_describes_hit_and_surface() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    let mut spot = nothing("T3 Code (Beta).exe");
+    spot.editable_hit = true;
+    spot.editable = true;
+    spot.field_role = Some("AXTextField".into());
+    spot.hit_desc = Desc {
+        control: "Edit",
+        class: "inputarea monaco-mouse-cursor-text".into(),
+        name: "Editor content".into(),
+        aria: "textbox".into(),
+        role: "AXTextField".into(),
+    };
+    rig.answer(0.17, Seen::Spot(Box::new(spot)));
+    let line = rig
+        .e
+        .log
+        .iter()
+        .find(|l| l.contains("→ Paste"))
+        .expect("the decision line")
+        .clone();
+    for part in [
+        "hit Edit \"Editor content\" class=\"inputarea monaco-mouse-cursor-text\" aria=textbox role AXTextField",
+        "single-line",
+        "surface=Field",
+    ] {
+        assert!(line.contains(part), "{part} not in {line}");
+    }
+}
+
+/// Item 3: Notepad++ takes text only: the image is not read, the card stays with the
+/// honest hint.
+#[test]
+fn notepad_plus_plus_gets_the_honest_refusal() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.double_click();
+    let mut scintilla = nothing("notepad++.exe");
+    scintilla.role = "AXGroup".into();
+    scintilla.editable_hit = true;
+    scintilla.editable = true;
+    scintilla.field_role = Some("AXGroup".into());
+    rig.answer(0.17, Seen::Spot(Box::new(scintilla)));
+    assert!(rig.e.logged("→ Paste"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.45);
+    rig.staged_reply(0.45);
+    rig.to(2.2);
+    assert_eq!(rig.s.hint(), Some(HINT_PASTE_FAILED));
+    assert!(rig.s.card(id).is_some());
+}
+
+/// Item 1b: a double-click in an integrated xterm.js terminal pastes the path, without the
+/// Right arrow and without a focus check.
+#[test]
+fn an_integrated_terminal_gets_the_path() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    let mut spot = nothing("T3 Code (Beta).exe");
+    spot.web_terminal = true;
+    spot.editable = true;
+    rig.answer(0.17, Seen::Spot(Box::new(spot)));
+    rig.up(0.25);
+    rig.to(0.36);
+    let mut again = nothing("T3 Code (Beta).exe");
+    again.web_terminal = true;
+    again.editable = true;
+    rig.answer(0.4, Seen::Spot(Box::new(again)));
+    assert_eq!(rig.e.saves.len(), 1, "{:#?}", rig.e.log);
+    rig.remembered_arrives(0.41);
+    let job = rig.e.saves[0];
+    rig.r.saved(
+        job,
+        Ok(PathBuf::from(r"C:\p\a.png")),
+        0.42,
+        &mut rig.s,
+        &mut rig.e,
+    );
+    rig.to(0.8);
+    assert!(matches!(&rig.e.stages[0].1, Payload::Text(t) if t == r"C:\p\a.png "));
+    assert!(rig.e.pressed.is_empty());
+    assert!(
+        !rig.e.lookups.iter().any(|l| l.4),
+        "no focus check for a terminal"
+    );
+}
+
 // MARK: Snapshot → facts
 
 fn el(control: UIA_CONTROLTYPE_ID) -> ElementInfo {
@@ -1703,6 +2261,8 @@ fn el(control: UIA_CONTROLTYPE_ID) -> ElementInfo {
 
 fn snapshot(target: Target, chain: Vec<ElementInfo>, focused: Option<ElementInfo>) -> Snapshot {
     Snapshot {
+        point: AT,
+        probe: None,
         target,
         hit: UiaNode::from_chain(chain).unwrap(),
         focused: focused.map(|f| UiaNode::from_chain(vec![f]).unwrap()),
@@ -1871,4 +2431,503 @@ fn outcomes_become_facts() {
         seen_from_outcome(Outcome::TimedOut { target: t.clone() }, AT),
         Seen::TimedOut { target: t }
     );
+}
+
+fn web(control: UIA_CONTROLTYPE_ID, class: &str) -> ElementInfo {
+    ElementInfo {
+        framework: "Chrome".into(),
+        class_name: class.into(),
+        ..el(control)
+    }
+}
+
+fn page() -> ElementInfo {
+    web(UIA_DocumentControlTypeId, "")
+}
+
+#[test]
+fn an_xterm_canvas_with_the_helper_input_focused_is_a_terminal() {
+    // The canvas's terminal ancestors are not in the tree UI Automation shows.
+    let canvas = web(UIA_ImageControlTypeId, "");
+    let helper = ElementInfo {
+        value_pattern: true,
+        value_read_only: Some(false),
+        ..web(UIA_EditControlTypeId, "xterm-helper-textarea")
+    };
+    let s = snapshot(
+        target("Code.exe", false),
+        vec![canvas, web(UIA_GroupControlTypeId, "panel"), page()],
+        Some(helper),
+    );
+    let spot = spot_from_snapshot(&s, AT);
+    assert!(spot.web_terminal, "{spot:?}");
+    assert_eq!(spot.surface(), Surface::Terminal);
+    assert!(spot.focused.unwrap().xterm);
+}
+
+#[test]
+fn the_xterm_helper_input_itself_is_a_terminal() {
+    let helper = ElementInfo {
+        value_pattern: true,
+        value_read_only: Some(false),
+        ..web(UIA_EditControlTypeId, "xterm-helper-textarea")
+    };
+    let s = snapshot(
+        target("T3 Code (Beta).exe", false),
+        vec![helper, web(UIA_GroupControlTypeId, "xterm-helpers"), page()],
+        None,
+    );
+    let spot = spot_from_snapshot(&s, AT);
+    assert!(spot.web_terminal);
+    assert_eq!(spot.surface(), Surface::Terminal);
+}
+
+#[test]
+fn a_hit_deep_inside_xterm_screen_is_a_terminal() {
+    let mut chain = vec![web(UIA_TextControlTypeId, "")];
+    for _ in 0..9 {
+        chain.push(web(UIA_GroupControlTypeId, ""));
+    }
+    chain.push(web(UIA_GroupControlTypeId, "xterm-screen"));
+    chain.push(page());
+    let s = snapshot(target("Code.exe", false), chain, None);
+    assert!(spot_from_snapshot(&s, AT).web_terminal);
+}
+
+#[test]
+fn monaco_is_an_editor_not_a_terminal() {
+    let input = ElementInfo {
+        value_pattern: true,
+        value_read_only: Some(false),
+        ..web(UIA_EditControlTypeId, "inputarea monaco-mouse-cursor-text")
+    };
+    let s = snapshot(
+        target("Code.exe", false),
+        vec![input, web(UIA_GroupControlTypeId, "monaco-editor"), page()],
+        None,
+    );
+    let spot = spot_from_snapshot(&s, AT);
+    assert!(!spot.web_terminal);
+    assert!(spot.editable_hit);
+    assert_eq!(spot.field_role.as_deref(), Some("AXTextField"));
+    assert_eq!(lines(spot.field_role.as_deref()), "single-line");
+}
+
+#[test]
+fn a_scintilla_editor_is_an_editable_field() {
+    let scintilla = ElementInfo {
+        class_name: "Scintilla".into(),
+        hwnd: 0x4605ca,
+        focusable: true,
+        ..el(UIA_PaneControlTypeId)
+    };
+    let s = snapshot(
+        target("notepad++.exe", false),
+        vec![scintilla, window()],
+        None,
+    );
+    let spot = spot_from_snapshot(&s, AT);
+    assert!(spot.editable_hit && spot.editable);
+    assert_eq!(spot.role, "AXGroup");
+    assert_eq!(spot.surface(), Surface::Field);
+    assert!(spot.describe().contains("class=\"Scintilla\""));
+}
+
+#[test]
+fn the_focus_check_rules() {
+    let mut spot = nothing("app.exe");
+    let field = Rect::new(450.0, 380.0, 200.0, 40.0);
+    spot.focused = Some(Focus {
+        pid: 100,
+        editable: true,
+        frame: Some(field),
+        ..Focus::default()
+    });
+    let check = |spot: &Spot, surface| focus_evidence(spot, (100, 100), 0x10, AT, surface);
+    assert!(check(&spot, Surface::Field));
+    // Another window, another process, not editable, not under the click: no.
+    let mut other = spot.clone();
+    other.target.window = 0x20;
+    assert!(!check(&other, Surface::Field));
+    let mut other = spot.clone();
+    other.focused.as_mut().unwrap().pid = 7;
+    assert!(!check(&other, Surface::Field));
+    let mut other = spot.clone();
+    other.focused.as_mut().unwrap().editable = false;
+    assert!(!check(&other, Surface::Field));
+    let mut tiny = spot.clone();
+    tiny.focused.as_mut().unwrap().frame = Some(Rect::new(500.0, 400.0, 1.0, 1.0));
+    assert!(!check(&tiny, Surface::Field));
+    // A page-drawn document types into a hidden input: focus in the target is enough.
+    assert!(check(&tiny, Surface::Document));
+}
+
+// MARK: Round 4: keys to the wrong place, the user's clipboard, sending
+
+/// A1(i): the user starts typing after the double-click: nothing more goes out.
+#[test]
+fn a_key_press_stops_a_delivery_before_its_next_batch() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.e.keys += 1;
+    rig.up(0.25);
+    rig.to(3.0);
+    assert!(rig.e.pressed.is_empty() && rig.e.stages.is_empty() && rig.e.sent == 0);
+    assert!(rig.s.card(id).is_some());
+    assert!(rig.e.logged("the user typed"));
+}
+
+/// A1(ii): the focused control of the target thread must stay the one of the first batch.
+#[test]
+fn the_focused_control_must_not_change_between_batches() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.40);
+    assert_eq!(rig.e.pressed, vec![Key::Right]);
+    assert_eq!(
+        rig.e.guards[0].focus, None,
+        "the first batch records the focus"
+    );
+    // The user tabs to another control before Ctrl+V.
+    rig.e.focus_now = 0x88;
+    rig.staged_reply(0.41);
+    assert_eq!(rig.e.guards[1].focus, Some(0x77));
+    assert_eq!(rig.e.sent, 0);
+    assert_eq!(rig.s.hint(), Some(HINT_PASTE_FAILED));
+    assert_eq!(
+        rig.restored(),
+        vec!["user"],
+        "the staging is rolled back at once"
+    );
+}
+
+/// A1(iii): the window handle alone is not enough: the process must match too.
+#[test]
+fn the_target_process_must_be_in_front_too() {
+    let mut rig = Rig::new(1);
+    rig.e.fg_pid = 999;
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(3.0);
+    assert!(rig.e.pressed.is_empty() && rig.e.stages.is_empty());
+    assert!(rig.e.logged("the target is not in front"));
+}
+
+/// A2: two presses on different windows (a dialog closed by the first) are no double-click,
+/// and the answer must be about the window that was pressed.
+#[test]
+fn presses_and_answer_must_be_on_one_window() {
+    let mut rig = Rig::new(1);
+    rig.down(0.0, 1);
+    rig.up(0.08);
+    rig.to(0.15);
+    rig.e.button = true;
+    rig.r.mouse(
+        MouseEvent::Down {
+            button: Button::Left,
+            x: AT.0,
+            y: AT.1,
+            time: 0.15,
+            click_count: 2,
+            injected: false,
+            window: 0x20,
+            touch: false,
+        },
+        &mut rig.s,
+        &mut rig.e,
+    );
+    assert!(rig.e.lookups.is_empty());
+    assert!(rig.e.logged("presses on windows 0x10 and 0x20 → Ignore"));
+
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    let mut exposed = match field("notepad.exe") {
+        Seen::Spot(spot) => spot,
+        _ => unreachable!(),
+    };
+    exposed.target.window = 0x20;
+    rig.answer(0.17, Seen::Spot(exposed));
+    rig.up(0.25);
+    rig.to(3.0);
+    assert!(rig.e.stages.is_empty() && rig.e.snapshots.is_empty());
+    assert!(rig.e.logged("the presses were on 0x10 → Ignore"));
+}
+
+/// A3: a canvas first, a button after the release: no paste.
+#[test]
+fn a_recheck_that_finds_a_control_is_ignored() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    let mut canvas = nothing("Figma.exe");
+    canvas.canvas = CanvasFacts {
+        canvas: true,
+        known: true,
+        document: false,
+    };
+    rig.answer(0.17, Seen::Spot(Box::new(canvas)));
+    rig.up(0.25);
+    rig.to(0.36);
+    let mut button = nothing("Figma.exe");
+    button.role = "AXButton".into();
+    button.activating = true;
+    button.canvas = CanvasFacts {
+        canvas: true,
+        known: true,
+        document: false,
+    };
+    rig.answer(0.4, Seen::Spot(Box::new(button)));
+    rig.to(3.0);
+    assert!(rig.e.stages.is_empty() && rig.e.snapshots.is_empty());
+    assert!(rig.e.logged("after mouse-up:"));
+    assert!(rig.e.logged("is window chrome or a control → ignore"));
+}
+
+/// A4: Windows Terminal draws its tabs in the client area: silent, it is not pasted into.
+#[test]
+fn a_silent_windows_terminal_is_not_pasted_into() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(
+        0.4,
+        Seen::TimedOut {
+            target: target("WindowsTerminal.exe", true),
+        },
+    );
+    assert!(rig.e.saves.is_empty() && rig.e.snapshots.is_empty());
+    assert_eq!(rig.s.hint(), Some(HINT_SLOW));
+}
+
+/// A5: a pen or touch double-tap promoted to mouse presses starts nothing.
+#[test]
+fn a_touch_double_tap_starts_nothing() {
+    let mut rig = Rig::new(1);
+    for (t, count) in [(0.0, 1), (0.15, 2)] {
+        rig.mouse(
+            MouseEvent::Down {
+                button: Button::Left,
+                x: AT.0,
+                y: AT.1,
+                time: t,
+                click_count: count,
+                injected: false,
+                window: 0x10,
+                touch: true,
+            },
+            t,
+        );
+    }
+    assert!(rig.e.lookups.is_empty() && rig.e.snapshots.is_empty());
+}
+
+/// B1: the user copies between the snapshot and the stage: nothing is written over it.
+#[test]
+fn a_copy_between_the_snapshot_and_the_stage_is_kept() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.40);
+    // The first stage expects exactly the saved clipboard and hands over the rollback copy.
+    assert_eq!(rig.e.expects[0], (Expect::Sequence(5), true));
+    let ticket = rig.e.stages[0].0;
+    rig.reply(0.41, ticket, Err(ClipFail::Changed));
+    rig.to(10.0);
+    assert_eq!(rig.e.sent, 0);
+    assert!(rig.e.restores.is_empty());
+    assert!(rig.s.card(id).is_some());
+    assert_ne!(rig.s.hint(), Some(HINT_PASTE_FAILED), "quietly");
+}
+
+/// B1: a later card expects our own staging still there.
+#[test]
+fn later_cards_stage_only_over_our_own_staging() {
+    let mut rig = Rig::new(2);
+    let sent = paste_into_field(&mut rig);
+    rig.read(sent + 0.02, 2);
+    rig.to(sent + 1.0);
+    assert_eq!(rig.e.stages.len(), 2);
+    assert_eq!(rig.e.expects[1], (Expect::OwnStaging, false));
+}
+
+/// B3: someone wrote the clipboard after our stage: no Ctrl+V (it would paste their data).
+#[test]
+fn no_paste_keys_when_the_staging_lost_the_clipboard() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.e.owns = false;
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.40);
+    rig.staged_reply(0.41);
+    assert_eq!(rig.e.sent, 0);
+    assert_eq!(rig.e.guards.last().unwrap().stage, Some(rig.e.stages[0].0));
+    assert_eq!(rig.e.abandons, 1);
+    rig.to(10.0);
+    assert!(rig.e.restores.is_empty());
+    assert!(rig.s.card(id).is_some());
+}
+
+/// B5: no new gesture while an earlier stage has not answered.
+#[test]
+fn no_new_gesture_while_a_stage_is_unanswered() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.40);
+    rig.to(0.39 + REPLY_TIMEOUT + 0.1);
+    let lookups = rig.e.lookups.len();
+    rig.double_click_at(4.0);
+    assert_eq!(rig.e.lookups.len(), lookups);
+    assert!(rig.e.logged("an earlier stage has not answered → Ignore"));
+}
+
+/// B5: unanswered requests are polled for a bounded time, then left to the clipboard thread.
+#[test]
+fn unanswered_requests_stop_being_polled() {
+    // A rollback that never answers.
+    let mut rig = Rig::new(1);
+    let sent = paste_into_field(&mut rig);
+    rig.read(sent + 0.02, 2);
+    rig.to(sent + 60.0);
+    assert!(!rig.r.restore_pending());
+    assert_eq!(rig.r.next_deadline(), None);
+    assert!(rig.e.logged("abandoned"));
+
+    // A terminal rewrite that never answers: guarding stops, the restore still runs.
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, terminal());
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    let job = rig.e.saves[0];
+    rig.r.saved(
+        job,
+        Ok(PathBuf::from(r"C:\p\a.png")),
+        0.26,
+        &mut rig.s,
+        &mut rig.e,
+    );
+    rig.to(0.5);
+    rig.staged_reply(0.5);
+    rig.overwrite(0.55);
+    assert_eq!(rig.e.restages.len(), 1);
+    rig.to(0.55 + REPLY_TIMEOUT + 0.2);
+    assert!(rig.e.logged("the rewrite never answered"));
+}
+
+/// B6: a partial restore is tried again over itself.
+#[test]
+fn a_partial_restore_is_tried_again_over_itself() {
+    let mut rig = Rig::new(1);
+    let sent = paste_into_field(&mut rig);
+    rig.read(sent + 0.02, 2);
+    rig.to(sent + 2.1);
+    let ticket = rig.e.restores[0].0;
+    // The clipboard thread emptied the clipboard: our staging facts are gone.
+    rig.e.facts.staged = None;
+    rig.reply(sent + 2.15, ticket, Err(ClipFail::Partial));
+    rig.to(sent + 2.8);
+    assert_eq!(rig.e.restores.len(), 2);
+    assert_eq!(rig.e.restores[1].2, RestoreGuard::OwnStaging);
+}
+
+/// C1: the card is shaken off after the stage went out: no Ctrl+V.
+#[test]
+fn a_card_shaken_off_after_the_stage_gets_no_paste_keys() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.40);
+    rig.s.dissolve(0.405);
+    rig.staged_reply(0.41);
+    assert_eq!(rig.e.sent, 0);
+    assert!(rig.e.logged("the card left the pile → stopped"));
+    assert_eq!(rig.restored(), vec!["user"]);
+}
+
+/// C3: a send that took nothing is not a paste, even with a read before it.
+#[test]
+fn a_failed_send_is_not_a_paste() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.e.pastes = VecDeque::from([Sent::Failed]);
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.40);
+    rig.staged_reply(0.41);
+    rig.read(0.42, 1);
+    rig.to(3.0);
+    assert!(rig.s.card(id).is_some());
+    assert_eq!(rig.s.hint(), Some(HINT_PASTE_FAILED));
+}
+
+/// C4: only renders by the identified target after the send count.
+#[test]
+fn only_target_reads_after_the_send_count() {
+    // A read before the send (a clipboard manager on the stage).
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.40);
+    let ticket = rig.e.stages[0].0;
+    rig.e.facts.staged = Some(StagedFacts {
+        ticket,
+        reads: 1,
+        renders: {
+            let mut r = [None; igorio_app::clipboard::RENDER_LOG];
+            r[0] = Some((Some(100), 0.405));
+            r
+        },
+        ..StagedFacts::default()
+    });
+    rig.reply(0.41, ticket, Ok(ClipDone::Staged { sequence: 6 }));
+    rig.to(3.5);
+    assert!(rig.s.card(id).is_some(), "{:#?}", rig.e.log);
+
+    // An unknown reader alone.
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.after = None;
+    let sent = paste_into_field(&mut rig);
+    rig.read_by(sent + 0.02, 2, None);
+    rig.to(sent + 3.5);
+    assert!(rig.s.card(id).is_some());
+}
+
+#[test]
+fn aria_cells_options_and_tabs_are_activating() {
+    for aria in ["gridcell", "option", "tab", "treeitem", "columnheader"] {
+        let cell = ElementInfo {
+            aria_role: aria.into(),
+            framework: "Chrome".into(),
+            ..el(UIA_GroupControlTypeId)
+        };
+        let page = ElementInfo {
+            framework: "Chrome".into(),
+            ..el(UIA_DocumentControlTypeId)
+        };
+        let s = snapshot(target("chrome.exe", false), vec![cell, page], None);
+        assert!(spot_from_snapshot(&s, AT).activating, "{aria}");
+    }
 }

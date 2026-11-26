@@ -58,7 +58,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
 use igorio_core::drop_policy::{self, Action, DoubleClick};
@@ -69,18 +69,19 @@ use igorio_core::paste_policy::{
     RestoreStep, TerminalSettle,
 };
 use igorio_kit::HeldCard;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, POINT, RECT};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
-use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
+use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetSystemMetrics, SM_SWAPBUTTON};
 
-use crate::clipboard::{self, ClipError, Clipboard, Done, Payload, Reply};
-use crate::hook::{self, Button, MouseEvent};
-use crate::input::{self, Foreground, Key, Modifier, Sent};
+use crate::clipboard::{self, ClipError, Clipboard, Done, Expect, Payload, Reply, Ticket};
+use crate::hook::{self, Button, KeyWatch, MouseEvent};
+use crate::input::{self, Batch, Key, Modifier, Sent};
 use crate::saver;
 use crate::settings::{DefaultFolders, Settings};
 use crate::state::FairyState;
-use crate::uia::{self, Lookup, Outcome, Snapshot, Target, Uia, UiaNode};
+use crate::uia::{self, ElementInfo, Lookup, Outcome, Probe, Snapshot, Target, Uia, UiaNode};
 
 // MARK: Constants
 
@@ -116,17 +117,78 @@ pub const REPLY_TIMEOUT: f64 = 3.0;
 /// for this long.
 pub const RESTORE_RETRY: f64 = 0.5;
 pub const RESTORE_GIVE_UP: f64 = 10.0;
-/// A stage request whose reply did not come in time is waited for this long after it was
-/// sent, so a late write can still be undone.
-pub const STAGE_LATE_WAIT: f64 = 10.0;
+/// A clipboard request that never answers (a stage, a rewrite, a rollback) is polled for at
+/// most this long; then the router stops and logs it. The clipboard thread still owns the
+/// rollback and runs it in order, or when it stops.
+pub const UNANSWERED_LIMIT: f64 = 10.0;
 /// At quit, how long to wait for the clipboard replies that put the user's clipboard back.
 pub const QUIT_WAIT: Duration = Duration::from_secs(1);
+
+/// After the paste keys, the acceptance probe looks at the field this often
+/// (`PasteJob.pollOutcome`: 0.2 s).
+pub const PROBE_INTERVAL: f64 = 0.2;
+
+/// Roles of a field that holds one line (`AXTextField` is also a web `<textarea>`: UI
+/// Automation has no multi-line flag, and neither takes images). Pastes into these are
+/// verified by the acceptance probe, as `PasteTarget.swift` verifies single-line fields.
+pub const SINGLE_LINE_ROLES: &[&str] = &["AXTextField", "AXSearchField", "AXComboBox"];
+
+/// Class tokens that mark a terminal in web content (Chromium reports the HTML class
+/// attribute as the UI Automation class name):
+/// - `xterm…`: xterm.js, the terminal of VS Code, Cursor, Hyper, Tabby and most Electron
+///   apps. Its parts are `xterm`, `xterm-screen` (the canvas renderer's parent),
+///   `xterm-viewport`, `xterm-rows` (the DOM renderer) and `xterm-helper-textarea` (the
+///   hidden input that has the keyboard focus).
+/// - `terminal-wrapper`: VS Code's element around each xterm.js instance.
+///
+/// Not a terminal: Monaco (`monaco-editor`, `inputarea`), VS Code's code editor. It takes
+/// text only, and a file path typed into source code is not what a drop means.
+pub const WEB_TERMINAL_CLASS_PREFIXES: &[&str] = &["xterm", "terminal-wrapper"];
+
+/// ARIA roles (Chromium reports them as `AriaRole`) of things a double-click opens or
+/// activates although their control type maps to a generic group: grid and table cells and
+/// headers, list options, tree items, tabs, rows, links, buttons, menu items and switches.
+/// Calendar days are buttons or grid cells and are covered by those.
+pub const ACTIVATING_ARIA_ROLES: &[&str] = &[
+    "gridcell",
+    "cell",
+    "columnheader",
+    "rowheader",
+    "row",
+    "option",
+    "treeitem",
+    "tab",
+    "link",
+    "button",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "switch",
+    "checkbox",
+    "radio",
+];
+
+/// Terminals that may be pasted into when UI Automation did not answer, if the point is in
+/// the client area of the window (`GetClientRect`): there their client area is only text.
+/// The classic console (`ConsoleWindowClass`, title bar and scroll bars are non-client) and
+/// Alacritty (no tabs; native title bar). Windows Terminal (and its `OpenConsole`) and
+/// WezTerm draw their tab strip inside the client area, and nothing Win32 tells it from the
+/// text without asking the app, so a silent one is not pasted into.
+pub fn silent_terminal_pasteable(target: &Target) -> bool {
+    target.class_name == "ConsoleWindowClass"
+        || target
+            .exe
+            .as_deref()
+            .is_some_and(|exe| exe.eq_ignore_ascii_case("alacritty.exe"))
+}
 
 /// Roles (as `uia::map_role` gives them) where a double-click means "open", "maximise" or
 /// "activate", never "paste here": window chrome (title bar, toolbar, status bar and app
 /// bar map to `AXToolbar`), menus, tabs (`AXRadioButton`, `AXTabGroup`), list, tree and
-/// grid items (`AXRow`), buttons, links and value controls. Checked on the hit and its
-/// ancestors unless the hit itself takes text (an address bar sits inside a toolbar).
+/// grid items (`AXRow`), buttons and header items (`AXButton`), links and value controls.
+/// Checked on the hit and its ancestors unless the hit itself takes text (an address bar
+/// sits inside a toolbar), on the double-click's lookup and again on the re-check after the
+/// release; see also [`ACTIVATING_ARIA_ROLES`].
 pub const ACTIVATING_ROLES: &[&str] = &[
     "AXToolbar",
     "AXMenuBar",
@@ -161,6 +223,9 @@ pub const HINT_CLIPBOARD: &str = "can't save your clipboard · still holding it"
 pub const HINT_SLOW: &str = "this app didn't answer · still holding it";
 pub const HINT_FOLDERS_NEXT: &str = "saving to folders comes next";
 pub const HINT_RESTORE_FAILED: &str = "couldn't put your clipboard back";
+/// The keyboard focus is not in the target field (Swift's canvas text, used for "the paste
+/// would go nowhere").
+pub const HINT_NOT_FOCUSED: &str = HINT_CANVAS_FAILED;
 
 /// The hint after the user held a modifier through every retry.
 pub fn modifier_hint(modifier: Modifier) -> String {
@@ -186,11 +251,67 @@ pub struct CanvasFacts {
 }
 
 /// The focused element of the snapshot (it has no parents, so only itself is checked).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Focus {
     pub pid: u32,
     pub editable: bool,
     pub frame: Option<Rect>,
+    /// An editable field of one line ([`SINGLE_LINE_ROLES`]).
+    pub single_line: bool,
+    /// xterm.js's hidden input (`xterm-helper-textarea`) in web content.
+    pub xterm: bool,
+}
+
+/// What the log says about an element. Never its value.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Desc {
+    /// UI Automation control type name.
+    pub control: &'static str,
+    /// Class name, at most 60 characters.
+    pub class: String,
+    /// UI Automation name (a label, not the contents), at most 40 characters.
+    pub name: String,
+    pub aria: String,
+    /// The mapped role.
+    pub role: String,
+}
+
+impl Desc {
+    pub fn of(e: &ElementInfo) -> Desc {
+        Desc {
+            control: uia::control_type_name(e.control_type),
+            class: clip_chars(&e.class_name, 60),
+            name: clip_chars(&e.name, 40),
+            aria: e.aria_role.clone(),
+            role: e.role.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for Desc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {:?} class={:?}", self.control, self.name, self.class)?;
+        if !self.aria.is_empty() {
+            write!(f, " aria={}", self.aria)?;
+        }
+        write!(f, " role {}", self.role)
+    }
+}
+
+fn clip_chars(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
+}
+
+/// "single-line", "multi-line" or "-" for the role of the field a paste goes into.
+pub fn lines(field_role: Option<&str>) -> &'static str {
+    match field_role {
+        Some(role) if SINGLE_LINE_ROLES.contains(&role) => "single-line",
+        Some(_) => "multi-line",
+        None => "-",
+    }
 }
 
 /// A UI Automation snapshot reduced to the facts the router decides from (`DropSpotInfo`).
@@ -217,6 +338,15 @@ pub struct Spot {
     pub activating: bool,
     /// Only with `want_focus`.
     pub focused: Option<Focus>,
+    /// The point the answer is about (None for spots built by hand).
+    pub point: Option<(i32, i32)>,
+    /// The hit and the focused element, for the log.
+    pub hit_desc: Desc,
+    pub focus_desc: Option<Desc>,
+    /// Role of the editable element found (the hit, an ancestor or a nearby element).
+    pub field_role: Option<String>,
+    /// A probe lookup's fingerprint of the focused element.
+    pub probe: Option<Probe>,
 }
 
 impl Spot {
@@ -234,7 +364,32 @@ impl Spot {
             chromium: false,
             activating: false,
             focused: None,
+            point: None,
+            hit_desc: Desc::default(),
+            focus_desc: None,
+            field_role: None,
+            probe: None,
         }
+    }
+
+    /// The facts the debug log shows for this spot.
+    pub fn describe(&self) -> String {
+        let mut text = format!(
+            "{} pid {} window {:#x} hit {} {}",
+            self.target.exe.as_deref().unwrap_or("?"),
+            self.pid,
+            self.target.window,
+            self.hit_desc,
+            lines(self.field_role.as_deref()),
+        );
+        if let (Some(desc), Some(focus)) = (&self.focus_desc, &self.focused) {
+            text.push_str(&format!(
+                "; focused {desc} pid {} editable={}",
+                focus.pid,
+                yes(focus.editable)
+            ));
+        }
+        text
     }
 
     pub fn is_shell(&self) -> bool {
@@ -307,6 +462,8 @@ pub struct StagedFacts {
     /// Someone else wrote the clipboard after our last (re)write.
     pub overwritten_at: Option<f64>,
     pub last_reader: Option<u32>,
+    /// Every render: (reader process if known, time), oldest first.
+    pub renders: [Option<(Option<u32>, f64)>; clipboard::RENDER_LOG],
 }
 
 impl ClipFacts {
@@ -350,6 +507,9 @@ pub enum ClipFail {
     /// The clipboard was locked, the queue full or the request stale: nothing was written;
     /// worth another try.
     Retry(String),
+    /// A restore wrote some formats only; the clipboard thread kept its copy, and our partial
+    /// result counts as our own staging for the next try.
+    Partial,
     Other(String),
 }
 
@@ -363,11 +523,31 @@ pub enum RestoreGuard {
     Sequence(u32),
 }
 
+/// What must still hold when a batch of keys goes out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendGuard {
+    pub window: isize,
+    pub pid: u32,
+    /// The focused control seen at the first batch of this delivery.
+    pub focus: Option<isize>,
+    /// The staging that must still own the clipboard (the paste keys only).
+    pub stage: Option<u64>,
+}
+
 /// The keys that paste in the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasteKeys {
     CtrlV,
     CtrlShiftV,
+}
+
+impl PasteKeys {
+    fn batch(self) -> Batch {
+        match self {
+            PasteKeys::CtrlV => Batch::Paste,
+            PasteKeys::CtrlShiftV => Batch::PasteWithShift,
+        }
+    }
 }
 
 /// What each terminal of `uia::TERMINAL_EXES` gets, and why:
@@ -411,23 +591,42 @@ pub trait Env {
 
     /// Starts a UI Automation lookup; the answer comes as [`Router::lookup_answered`] or
     /// [`Router::seen`] with the returned id.
-    fn lookup(&mut self, point: (i32, i32), want_focus: bool, deadline: f64) -> u64;
+    fn lookup(&mut self, point: (i32, i32), want_focus: bool, probe: bool, deadline: f64) -> u64;
+    /// The exe name of a process, for the log.
+    fn process_name(&self, pid: u32) -> Option<String>;
     fn clip_facts(&self, now: f64) -> ClipFacts;
     fn clip_snapshot(&mut self) -> Result<u64, String>;
-    fn clip_stage(&mut self, payload: Payload) -> Result<u64, String>;
-    fn clip_restage(&mut self) -> Result<u64, String>;
-    fn clip_restore(&mut self, snap: &Self::Snap, guard: RestoreGuard) -> Result<u64, String>;
+    /// Stages only over the clipboard `expect` names (checked while it is open). With
+    /// `rollback`, the clipboard thread keeps that copy of the user's clipboard and owns the
+    /// rollback from then on.
+    fn clip_stage(
+        &mut self,
+        payload: Payload,
+        expect: Expect,
+        rollback: Option<&Self::Snap>,
+    ) -> Result<u64, String>;
+    fn clip_restage(&mut self, expect: Expect) -> Result<u64, String>;
+    /// Asks the clipboard thread to write its copy back if `guard` holds then.
+    fn clip_rollback(&mut self, guard: RestoreGuard) -> Result<u64, String>;
+    /// The user copied something: the clipboard thread forgets its copy.
+    fn clip_abandon(&mut self);
     /// Saves the card as a PNG into the pasted folder, off the UI thread; the result comes
     /// as [`Router::saved`] with the returned id.
     fn save_png(&mut self, card: &HeldCard) -> u64;
-    /// Is the target (its top-level window, or its process when `window` is 0) in front?
+    /// Is the target in front: its top-level window, and its process when both are known?
     fn foreground_is(&self, window: isize, pid: u32) -> bool;
+    /// Is `point` inside the client area of `window` (Win32 only)?
+    fn point_in_client(&self, window: isize, point: (i32, i32)) -> bool;
+    /// The user's key presses so far (a counter; modifiers and injected keys excluded).
+    fn key_presses(&self) -> u64;
     /// The user's main mouse button is down right now (the real state, not the hook's).
     fn primary_down(&self) -> bool;
     /// The top-level window at `point` is a terminal (Win32 only, no UI Automation).
     fn terminal_at(&self, point: (i32, i32)) -> bool;
-    fn press(&mut self, key: Key) -> Sent;
-    fn paste_shortcut(&mut self, keys: PasteKeys) -> Sent;
+    /// Sends one batch through `input::send_guarded`: the last checks (the staging still on
+    /// the clipboard, the window, its process, its focused control, the modifiers) and the
+    /// keys with nothing in between. Returns the focused control seen.
+    fn send(&mut self, batch: Batch, guard: SendGuard) -> (Sent, Option<isize>);
     /// One debug line. Only written when `FAIRY_DEBUG=1`.
     fn log(&mut self, now: f64, line: &str);
 }
@@ -469,19 +668,29 @@ pub fn quoted_path(path: &Path) -> String {
 /// xterm.js marks its elements with `xterm…` classes; Chromium reports the class attribute
 /// as the UI Automation class name.
 fn is_web_terminal(chain: &[UiaNode]) -> bool {
-    for node in chain.iter().take(8) {
+    for node in chain {
         let e = node.element();
         if e.role == "AXWebArea" {
             break;
         }
-        if e.class_name
-            .split_whitespace()
-            .any(|c| c.starts_with("xterm"))
-        {
+        if has_class_prefix(e, WEB_TERMINAL_CLASS_PREFIXES) {
             return true;
         }
     }
     false
+}
+
+fn has_class_prefix(e: &ElementInfo, prefixes: &[&str]) -> bool {
+    e.class_name
+        .split_whitespace()
+        .any(|class| prefixes.iter().any(|p| class.starts_with(p)))
+}
+
+/// xterm.js's hidden input, which has the keyboard focus while the terminal does.
+fn is_xterm_input(e: &ElementInfo) -> bool {
+    e.class_name
+        .split_whitespace()
+        .any(|class| class == "xterm-helper-textarea")
 }
 
 fn canvas_facts(chain: &[UiaNode], exe: Option<&str>) -> CanvasFacts {
@@ -516,10 +725,20 @@ pub fn spot_from_snapshot(snapshot: &Snapshot, point: (i32, i32)) -> Spot {
     let mut spot = Spot::new(snapshot.target.clone());
     spot.pid = e.pid;
     spot.role = e.role.to_string();
-    spot.focused = snapshot.focused.as_ref().map(|f| Focus {
-        pid: f.element().pid,
-        editable: editable_self_or_ancestor(f).is_some(),
-        frame: f.element().frame,
+    spot.point = Some(snapshot.point);
+    spot.hit_desc = Desc::of(e);
+    spot.probe = snapshot.probe;
+    spot.focus_desc = snapshot.focused.as_ref().map(|f| Desc::of(f.element()));
+    spot.focused = snapshot.focused.as_ref().map(|f| {
+        let editable = editable_self_or_ancestor(f).is_some();
+        let info = f.element();
+        Focus {
+            pid: info.pid,
+            editable,
+            frame: info.frame,
+            single_line: editable && SINGLE_LINE_ROLES.contains(&info.role),
+            xterm: is_xterm_input(info),
+        }
     });
     if spot.is_shell() {
         let ancestors: Vec<String> = chain[1..].iter().filter_map(|n| n.role()).collect();
@@ -529,7 +748,11 @@ pub fn spot_from_snapshot(snapshot: &Snapshot, point: (i32, i32)) -> Spot {
     spot.chromium = chain.iter().any(|n| n.element().framework == "Chrome");
     spot.canvas = canvas_facts(&chain, snapshot.target.exe.as_deref());
     let in_page = chain.iter().any(|n| n.element().role == "AXWebArea");
-    if in_page && is_web_terminal(&chain) {
+    // The hit can be the helper input itself, a canvas or a row inside the terminal, or an
+    // element whose terminal ancestors UI Automation does not show; then the focused
+    // helper input (after the click) tells.
+    let focused_xterm = spot.focused.is_some_and(|f| f.xterm && f.pid == e.pid);
+    if (in_page && is_web_terminal(&chain)) || is_xterm_input(e) || focused_xterm {
         spot.web_terminal = true;
         spot.editable = true;
         return spot;
@@ -538,14 +761,99 @@ pub fn spot_from_snapshot(snapshot: &Snapshot, point: (i32, i32)) -> Spot {
     // pattern, so UI Automation does not call it editable; it still takes pasted text, as
     // iTerm's `AXTextArea` does on macOS. Its tabs and title bar have no Text pattern.
     let terminal_text = snapshot.target.is_terminal && e.text_pattern;
-    spot.editable_hit = terminal_text || editable_self_or_ancestor(&hit).is_some();
+    let field = if terminal_text {
+        Some(hit.clone())
+    } else {
+        editable_self_or_ancestor(&hit)
+    };
+    spot.editable_hit = field.is_some();
+    spot.field_role = field.map(|f| f.element().role.to_string());
     spot.activating = !spot.editable_hit
-        && chain
-            .iter()
-            .any(|n| ACTIVATING_ROLES.contains(&n.element().role));
+        && chain.iter().any(|n| {
+            let e = n.element();
+            ACTIVATING_ROLES.contains(&e.role)
+                || ACTIVATING_ARIA_ROLES.contains(&e.aria_role.as_str())
+        });
     let at = Point::new(point.0 as f64, point.1 as f64);
-    spot.editable = spot.editable_hit || editable_target(at, &hit).is_some();
+    if spot.editable_hit {
+        spot.editable = true;
+    } else if let Some(nearby) = editable_target(at, &hit) {
+        spot.editable = true;
+        spot.field_role = Some(nearby.element().role.to_string());
+    }
     spot
+}
+
+/// Before any key goes out to a field or a document: does the keyboard focus show that the
+/// target field will get the paste? The focused element (from a focus lookup after the
+/// release) must belong to the target window's process (or the hit's), take text, and for a
+/// field be a visible field under the click; a page-drawn document catches typing in a
+/// hidden input, so there any focused text input of the target counts. Without this a
+/// double-click on text next to a field (or a hidden input a page keeps under the text)
+/// sends Ctrl+V to a page that reads the clipboard and drops the image.
+pub fn focus_evidence(
+    spot: &Spot,
+    pids: (u32, u32),
+    window: isize,
+    point: (i32, i32),
+    surface: Surface,
+) -> bool {
+    if spot.target.window != window {
+        return false;
+    }
+    let Some(focus) = spot.focused else {
+        return false;
+    };
+    if !(focus.pid == pids.0 || focus.pid == pids.1) || !focus.editable {
+        return false;
+    }
+    match surface {
+        Surface::Document => true,
+        _ => focus.frame.is_some_and(|frame| {
+            let at = Point::new(point.0 as f64, point.1 as f64);
+            drop_policy::is_visible_field(&frame) && frame.inset_by(-6.0, -6.0).contains(at)
+        }),
+    }
+}
+
+/// What the acceptance probe saw after the paste keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeView {
+    /// The field is single-line: a read with no change is a refusal.
+    pub verify: bool,
+    /// At least one probe after the paste answered.
+    pub answered: bool,
+    pub changed: bool,
+}
+
+/// The outcome of one paste. `target_reads`: formats the target process read;
+/// `foreign_reads`: formats another process read first (Windows keeps rendered data, so the
+/// target's read of the same format is then invisible). With a probe:
+/// - a change of the field is acceptance;
+/// - a single-line field that was read but did not change by the probe timeout refused it;
+/// - when reads were masked by another reader and the probe saw no change, the paste is
+///   not confirmed (failed, the card stays);
+/// - when no probe ever answered, the reads decide, as without a probe.
+///
+/// An unrelated reader alone never makes a paste accepted.
+pub fn paste_outcome(
+    elapsed: f64,
+    target_reads: u32,
+    foreign_reads: u32,
+    canvas: bool,
+    probe: Option<ProbeView>,
+) -> PasteOutcome {
+    let by_reads = || OutcomeRules::new(false, canvas).evaluate(elapsed, target_reads, false);
+    let Some(probe) = probe else {
+        return by_reads();
+    };
+    let rules = OutcomeRules::new(true, canvas);
+    match rules.evaluate(elapsed, target_reads + foreign_reads, probe.changed) {
+        PasteOutcome::Rejected if !probe.answered => by_reads(),
+        PasteOutcome::Rejected if !probe.verify => PasteOutcome::Failed,
+        PasteOutcome::Failed if !probe.answered && target_reads > 0 => by_reads(),
+        other => other,
+    }
 }
 
 pub fn seen_from_outcome(outcome: Outcome, point: (i32, i32)) -> Seen {
@@ -640,6 +948,12 @@ pub fn confirm_after_up(
 struct Click {
     point: (i32, i32),
     at: f64,
+    /// The top-level window under both presses (from the hook).
+    window: isize,
+    /// The first press of the double-click.
+    first_at: f64,
+    /// The user's key presses counted at the double-click.
+    keys: u64,
 }
 
 /// Where the keys go: the top-level window that was double-clicked.
@@ -651,23 +965,26 @@ struct Aim {
     /// Process of the hit element (a UWP app inside its frame host's window).
     element_pid: u32,
     keys: PasteKeys,
+    /// The double-click point.
+    point: (i32, i32),
 }
 
 impl Aim {
-    fn new(target: &Target, element_pid: u32) -> Aim {
+    fn new(target: &Target, element_pid: u32, point: (i32, i32)) -> Aim {
         Aim {
             pid: target.pid,
             window: target.window,
             element_pid,
             keys: paste_keys_for(target),
+            point,
         }
     }
 
-    /// A read counts as the target taking the paste when its reader is unknown or is the
-    /// target's window process or element process. Chromium and Electron read the clipboard
-    /// in the browser process, which owns the top-level window, so they count.
-    fn is_reader(&self, reader: Option<u32>) -> bool {
-        reader.is_none_or(|pid| pid == self.pid || pid == self.element_pid)
+    /// A read is the target's when its reader is the target's window process or element
+    /// process. Chromium and Electron read the clipboard in the browser process, which owns
+    /// the top-level window, so they count. An unknown reader never counts on its own.
+    fn is_target(&self, reader: Option<u32>) -> bool {
+        reader.is_some_and(|pid| pid == self.pid || pid == self.element_pid)
     }
 }
 
@@ -714,6 +1031,26 @@ struct Delivery {
     /// The user's clipboard: a snapshot reply still to come, or ready in `Router::restore`.
     clip: Option<u64>,
     job: Job,
+    probe: ProbeState,
+    click: Click,
+    /// The focused control of the target's thread at the first batch of keys.
+    focus: Option<isize>,
+    /// The user pressed again or typed: no more batches (the card being watched still
+    /// finds its outcome).
+    cancelled: Option<&'static str>,
+}
+
+/// The acceptance probe of the first card (`AcceptanceProbe`).
+#[derive(Debug, Default)]
+struct ProbeState {
+    /// The fingerprint taken with the focus check, before the paste keys.
+    before: Option<Probe>,
+    /// Single-line field: every paste is verified.
+    verify: bool,
+    after_req: Option<u64>,
+    last_check: Option<f64>,
+    answered: bool,
+    changed: bool,
 }
 
 struct Job {
@@ -737,10 +1074,18 @@ enum Pay {
 enum Step {
     Prepare,
     AfterUp(f64),
+    /// The focus lookup is out.
+    Focus(u64),
     Front(f64),
-    Keys { keys: Vec<Key>, since: f64 },
+    Keys {
+        keys: Vec<Key>,
+        since: f64,
+    },
     Gap(f64),
-    Staging { ticket: u64, since: f64 },
+    Staging {
+        ticket: u64,
+        since: f64,
+    },
     Send(f64),
     Watch(f64),
     Next(f64),
@@ -764,15 +1109,14 @@ struct StageRec {
     sent_at: Option<f64>,
     terminal: bool,
     aim: Aim,
-    /// Reads seen in the facts so far, and those made by the target.
-    seen_reads: u32,
-    reads: u32,
+    /// Foreign reads already logged.
+    logged_foreign: u32,
     /// `last_change` and sequence number of the foreign write taken for the click's own
     /// copy-on-select.
     adopted: Option<f64>,
     adopted_seq: Option<u32>,
     guarding: bool,
-    restaging: Option<u64>,
+    restaging: Option<(u64, f64)>,
 }
 
 impl StageRec {
@@ -785,8 +1129,7 @@ impl StageRec {
             sent_at: None,
             terminal,
             aim,
-            seen_reads: 0,
-            reads: 0,
+            logged_foreign: 0,
             adopted: None,
             adopted_seq: None,
             guarding: true,
@@ -810,6 +1153,13 @@ struct Restore<S> {
     retry_at: Option<f64>,
     /// The top card failed; a target read after this count means the app took it late.
     late: Option<(CardId, u32)>,
+    /// The sequence number of the clipboard the snapshot saved (read under the lock); the
+    /// first stage expects it.
+    expect: Option<u32>,
+    /// The user copied something over our staging: never restore.
+    user_copied: bool,
+    /// The last restore wrote only some formats: the next try writes over that.
+    partial: bool,
 }
 
 impl<S> Restore<S> {
@@ -823,6 +1173,9 @@ impl<S> Restore<S> {
             first_try: None,
             retry_at: None,
             late: None,
+            expect: None,
+            user_copied: false,
+            partial: false,
         }
     }
 }
@@ -873,6 +1226,8 @@ pub struct Router<S> {
     restore_wake: Option<f64>,
     hover_wake: Option<f64>,
     state_changed: bool,
+    /// The last first press: (time, top-level window).
+    first_down: Option<(f64, isize)>,
 }
 
 fn earlier(a: Option<f64>, b: Option<f64>) -> Option<f64> {
@@ -901,7 +1256,11 @@ fn untouched(stage: &StageRec, facts: &ClipFacts) -> bool {
 
 /// How to put the user's clipboard back over this staging, or None when nothing of ours is
 /// there to replace: only what we replaced is restored.
-fn restore_guard(stage: &StageRec, facts: &ClipFacts) -> Option<RestoreGuard> {
+fn restore_guard(stage: &StageRec, facts: &ClipFacts, partial: bool) -> Option<RestoreGuard> {
+    if partial {
+        // Our own partial restore is on the clipboard; the clipboard thread recognises it.
+        return Some(RestoreGuard::OwnStaging);
+    }
     if let Some(sequence) = stage.emptied {
         return Some(RestoreGuard::Sequence(sequence));
     }
@@ -916,28 +1275,42 @@ fn restore_guard(stage: &StageRec, facts: &ClipFacts) -> Option<RestoreGuard> {
     })
 }
 
-/// Adds the reads that appeared since the last look; reads by another process (a clipboard
-/// manager, the user pasting elsewhere) are not the target taking the paste.
-fn count_reads<E: Env>(stage: &mut StageRec, facts: &ClipFacts, now: f64, env: &mut E) {
-    let Some(staged) = facts.staged_for(stage.ticket) else {
-        return;
+/// Renders after the paste keys went out: (by the identified target, by anyone else or an
+/// unknown reader). Renders before a successful send never count.
+fn read_counts(stage: &StageRec, facts: &ClipFacts) -> (u32, u32) {
+    let (Some(staged), Some(sent)) = (facts.staged_for(stage.ticket), stage.sent_at) else {
+        return (0, 0);
     };
-    if staged.reads <= stage.seen_reads {
+    let mut counts = (0, 0);
+    for &(reader, at) in staged.renders.iter().flatten() {
+        if at < sent {
+            continue;
+        }
+        if stage.aim.is_target(reader) {
+            counts.0 += 1;
+        } else {
+            counts.1 += 1;
+        }
+    }
+    counts
+}
+
+/// Logs foreign renders not logged yet, with the reader's exe name.
+fn log_foreign_reads<E: Env>(stage: &mut StageRec, facts: &ClipFacts, now: f64, env: &mut E) {
+    let foreign = read_counts(stage, facts).1;
+    if foreign <= stage.logged_foreign {
         return;
     }
-    let new = staged.reads - stage.seen_reads;
-    stage.seen_reads = staged.reads;
-    if stage.aim.is_reader(staged.last_reader) {
-        stage.reads += new;
-    } else {
-        env.log(
-            now,
-            &format!(
-                "{new} read(s) by pid {:?}, not the target → not counted",
-                staged.last_reader
-            ),
-        );
-    }
+    let new = foreign - stage.logged_foreign;
+    stage.logged_foreign = foreign;
+    let reader = facts.staged_for(stage.ticket).and_then(|s| s.last_reader);
+    let name = reader
+        .and_then(|pid| env.process_name(pid))
+        .unwrap_or_else(|| "?".into());
+    env.log(
+        now,
+        &format!("{new} read(s) by pid {reader:?} ({name}), not the target → not counted"),
+    );
 }
 
 impl<S: Clone> Router<S> {
@@ -956,6 +1329,7 @@ impl<S: Clone> Router<S> {
             restore_wake: None,
             hover_wake: None,
             state_changed: false,
+            first_down: None,
         }
     }
 
@@ -1014,13 +1388,26 @@ impl<S: Clone> Router<S> {
                 time,
                 click_count,
                 injected: false,
-            } if button == self.primary => {
+                window,
+                touch,
+            } => {
+                // Any later press stops what is in progress (A1): the user moved on.
+                if matches!(button, Button::Left | Button::Right) && self.busy() {
+                    self.cancel("another press", time, env);
+                }
+                if button != self.primary || touch {
+                    self.run(time, state, env);
+                    return;
+                }
+                if click_count == 1 {
+                    self.first_down = Some((time, window));
+                }
                 if !state.is_holding() {
                     return;
                 }
                 match click_count {
                     1 => self.remember_clipboard((x, y), time, env),
-                    2 => self.double_click((x, y), time, state, env),
+                    2 => self.double_click((x, y), time, window, state, env),
                     _ => {}
                 }
                 self.run(time, state, env);
@@ -1065,7 +1452,17 @@ impl<S: Clone> Router<S> {
         let Some(index) = self.lookups.iter().position(|p| p.id == id) else {
             return;
         };
-        self.lookups.remove(index);
+        let pending = self.lookups.remove(index);
+        // An answer is only ever about the point its own request asked for.
+        let seen = match seen {
+            Seen::Spot(spot) if spot.point.is_some_and(|p| p != pending.point) => {
+                Seen::Failed(format!(
+                    "answer about {:?}, asked about {:?}",
+                    spot.point, pending.point
+                ))
+            }
+            seen => seen,
+        };
         self.answer(id, seen, now, state, env);
         self.run(now, state, env);
     }
@@ -1180,6 +1577,10 @@ impl<S: Clone> Router<S> {
                 Err(ClipFail::Retry(why)) => {
                     env.log(now, &format!("quit: restore refused ({why}), again"))
                 }
+                Err(ClipFail::Partial) => {
+                    restore.partial = true;
+                    env.log(now, "quit: partial restore, again");
+                }
                 Err(why) => {
                     env.log(now, &format!("quit: restore refused ({why:?}) → leave it"));
                     self.restore = None;
@@ -1200,11 +1601,28 @@ impl<S: Clone> Router<S> {
             return None;
         };
         if !stage.confirmed && stage.emptied.is_none() {
-            env.log(now, "quit: waiting for the stage in flight");
-            return Some(stage.ticket);
+            // The rollback runs after the stage on the clipboard thread.
+            env.log(
+                now,
+                "quit: a stage is in flight → rollback queued behind it",
+            );
+            return match env.clip_rollback(RestoreGuard::OwnStaging) {
+                Ok(ticket) => {
+                    restore.restoring = Some((ticket, now));
+                    Some(ticket)
+                }
+                Err(_) => {
+                    self.restore = None;
+                    None
+                }
+            };
+        }
+        if restore.user_copied {
+            self.restore = None;
+            return None;
         }
         let facts = env.clip_facts(now);
-        let Some(guard) = restore_guard(&stage, &facts) else {
+        let Some(guard) = restore_guard(&stage, &facts, restore.partial) else {
             env.log(
                 now,
                 "quit: the clipboard changed since the paste → leave it",
@@ -1212,7 +1630,7 @@ impl<S: Clone> Router<S> {
             self.restore = None;
             return None;
         };
-        match env.clip_restore(&restore.snap, guard) {
+        match env.clip_rollback(guard) {
             Ok(ticket) => {
                 env.log(now, &format!("quit: restoring the clipboard ({guard:?})"));
                 restore.restoring = Some((ticket, now));
@@ -1271,15 +1689,17 @@ impl<S: Clone> Router<S> {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn request(
         &mut self,
         point: (i32, i32),
         want_focus: bool,
+        probe: bool,
         deadline: f64,
         now: f64,
         env: &mut impl Env,
     ) -> u64 {
-        let id = env.lookup(point, want_focus, deadline);
+        let id = env.lookup(point, want_focus, probe, deadline);
         self.lookups.push(Pending {
             id,
             point,
@@ -1288,13 +1708,60 @@ impl<S: Clone> Router<S> {
         id
     }
 
+    /// The user pressed again (or typed): drop a pending gesture; stop a delivery before its
+    /// next batch, quietly, keeping the cards.
+    fn cancel<E: Env<Snap = S>>(&mut self, why: &'static str, now: f64, env: &mut E) {
+        match &mut self.phase {
+            Phase::Idle => {}
+            Phase::Delivering(d) => {
+                if d.cancelled.is_none() {
+                    env.log(now, &format!("{why} → the delivery stops"));
+                    d.cancelled = Some(why);
+                }
+            }
+            _ => {
+                env.log(now, &format!("{why} → the gesture is dropped"));
+                self.phase = Phase::Idle;
+                self.phase_wake = None;
+            }
+        }
+    }
+
     fn double_click<E: Env<Snap = S>>(
         &mut self,
         point: (i32, i32),
         now: f64,
+        window: isize,
         state: &mut FairyState,
         env: &mut E,
     ) {
+        // A2: both presses on the same top-level window, known.
+        let first_at = match self.first_down {
+            Some((at, first)) if first == window && window != 0 => at,
+            other => {
+                env.log(
+                    now,
+                    &format!(
+                        "double-click at {point:?}: presses on windows {:#x} and {window:#x} → Ignore",
+                        other.map_or(0, |(_, w)| w)
+                    ),
+                );
+                return;
+            }
+        };
+        // B5: no new gesture while an earlier stage has not answered.
+        let unanswered = self
+            .restore
+            .as_ref()
+            .and_then(|r| r.stage)
+            .is_some_and(|s| !s.confirmed && s.emptied.is_none());
+        if unanswered {
+            env.log(
+                now,
+                &format!("double-click at {point:?}: an earlier stage has not answered → Ignore"),
+            );
+            return;
+        }
         if self.busy() || state.hidden_for_capture() {
             let facts = DoubleClick {
                 is_holding: true,
@@ -1315,14 +1782,20 @@ impl<S: Clone> Router<S> {
         }
         // The hover hint must not look meanwhile.
         self.hover.in_flight = None;
-        let id = self.request(point, false, LOOKUP_DEADLINE, now, env);
+        let id = self.request(point, false, false, LOOKUP_DEADLINE, now, env);
         env.log(
             now,
             &format!("double-click at {point:?}: looking (lookup {id})"),
         );
         self.phase = Phase::Looking {
             id,
-            click: Click { point, at: now },
+            click: Click {
+                point,
+                at: now,
+                window,
+                first_at,
+                keys: env.key_presses(),
+            },
         };
     }
 
@@ -1339,7 +1812,35 @@ impl<S: Clone> Router<S> {
             self.apply_hover(&seen, now, state);
             return;
         }
+        if let Phase::Delivering(d) = &mut self.phase {
+            if d.job.step == Step::Focus(id) {
+                self.focus_answer(seen, now, state, env);
+                return;
+            }
+            if d.probe.after_req == Some(id) {
+                d.probe.after_req = None;
+                if let Seen::Spot(spot) = &seen
+                    && let (Some(after), Some(before)) = (spot.probe, d.probe.before)
+                    && spot
+                        .focused
+                        .is_some_and(|f| f.pid == d.aim.pid || f.pid == d.aim.element_pid)
+                {
+                    d.probe.answered = true;
+                    if after.changed_from(&before) {
+                        d.probe.changed = true;
+                        env.log(now, "probe: the field changed");
+                    }
+                }
+                return;
+            }
+        }
         match std::mem::replace(&mut self.phase, Phase::Idle) {
+            Phase::Looking { id: want, click }
+            | Phase::Recheck {
+                id: want, click, ..
+            } if want == id && env.key_presses() != click.keys => {
+                env.log(now, "the user typed → the gesture is dropped");
+            }
             Phase::Looking { id: want, click } if want == id => {
                 self.decide(click, seen, now, state, env);
             }
@@ -1373,15 +1874,24 @@ impl<S: Clone> Router<S> {
         let mut first = None;
         let mut surface = Surface::Field;
         let what = match &seen {
+            Seen::Spot(spot) if spot.target.window != click.window => {
+                env.log(
+                    now,
+                    &format!(
+                        "double-click at {:?}: the answer is about window {:#x}, the presses were on {:#x} → Ignore",
+                        click.point, spot.target.window, click.window
+                    ),
+                );
+                return;
+            }
             Seen::Spot(spot) => {
                 if spot.activating {
                     env.log(
                         now,
                         &format!(
-                            "double-click at {:?}: {} role {} is window chrome or a control → Ignore",
+                            "double-click at {:?}: {} is window chrome or a control → Ignore",
                             click.point,
-                            spot.target.exe.as_deref().unwrap_or("?"),
-                            spot.role
+                            spot.describe()
                         ),
                     );
                     return;
@@ -1390,7 +1900,7 @@ impl<S: Clone> Router<S> {
                 facts.finder_drop_spot = spot.drop_spot;
                 facts.editable_under_cursor = spot.editable_hit;
                 first = Some(First {
-                    aim: Aim::new(&spot.target, spot.pid),
+                    aim: Aim::new(&spot.target, spot.pid, click.point),
                     pid: Some(spot.pid),
                     before: spot.canvas,
                     chromium: spot.chromium,
@@ -1400,11 +1910,8 @@ impl<S: Clone> Router<S> {
                     surface = Surface::Terminal;
                 }
                 format!(
-                    "{} pid {} window {:#x} role {} editable={} terminal={} shell={:?} drop-spot={} canvas={}",
-                    spot.target.exe.as_deref().unwrap_or("?"),
-                    spot.pid,
-                    spot.target.window,
-                    spot.role,
+                    "{} editable={} terminal={} shell={:?} drop-spot={} canvas={}",
+                    spot.describe(),
                     yes(spot.editable_hit),
                     yes(spot.target.is_terminal || spot.web_terminal),
                     spot.target.shell,
@@ -1425,12 +1932,42 @@ impl<S: Clone> Router<S> {
                 self.state_changed = true;
                 return;
             }
+            Seen::TimedOut { target } if target.window != click.window => {
+                env.log(
+                    now,
+                    &format!(
+                        "double-click at {:?}: no answer, and window {:#x} is not the pressed {:#x} → Ignore",
+                        click.point, target.window, click.window
+                    ),
+                );
+                return;
+            }
+            Seen::TimedOut { target }
+                if target.is_terminal
+                    && !(silent_terminal_pasteable(target)
+                        && env.point_in_client(target.window, click.point)) =>
+            {
+                // A4: without an answer the text area cannot be told from a tab or the
+                // title bar: no path is typed blind.
+                env.log(
+                    now,
+                    &format!(
+                        "double-click at {:?}: {} did not answer and the point may be a tab or the title bar → refuse",
+                        click.point,
+                        target.exe.as_deref().unwrap_or("?")
+                    ),
+                );
+                state.reject(HINT_SLOW, now);
+                self.state_changed = true;
+                return;
+            }
             Seen::TimedOut { target } => {
-                // A terminal too busy to answer is still a terminal (`silentTerminal`).
+                // A terminal too busy to answer is still a terminal (`silentTerminal`),
+                // when the point is its text area.
                 facts.silent_terminal = target.is_terminal;
                 facts.is_finder = target.shell.is_some();
                 first = Some(First {
-                    aim: Aim::new(target, target.pid),
+                    aim: Aim::new(target, target.pid, click.point),
                     pid: None,
                     before: CanvasFacts::default(),
                     chromium: false,
@@ -1458,9 +1995,17 @@ impl<S: Clone> Router<S> {
             }
         };
         let action = drop_policy::decide(&facts);
+        let chosen = if action == Action::Paste {
+            format!(" surface={surface:?}")
+        } else {
+            String::new()
+        };
         env.log(
             now,
-            &format!("double-click at {:?}: {what} → {action:?}", click.point),
+            &format!(
+                "double-click at {:?}: {what} → {action:?}{chosen}",
+                click.point
+            ),
         );
         match (action, first) {
             (Action::SaveToFinder, _) => {
@@ -1469,7 +2014,7 @@ impl<S: Clone> Router<S> {
                 }
             }
             (Action::Paste, Some(first)) => {
-                self.start_delivery(first.aim, surface, false, click.at, now, state, env);
+                self.start_delivery(first.aim, surface, false, click, click.at, now, state, env);
             }
             (Action::CheckFocusAfterMouseUp, Some(first)) => {
                 self.phase = Phase::AwaitUp {
@@ -1552,6 +2097,17 @@ impl<S: Clone> Router<S> {
                 return;
             }
         };
+        // A3: the re-check found window chrome or a control (a canvas first, a button now).
+        if spot.activating {
+            env.log(
+                now,
+                &format!(
+                    "after mouse-up: {} is window chrome or a control → ignore",
+                    spot.describe()
+                ),
+            );
+            return;
+        }
         // The double-click opened or switched something (a file from an Open dialog, a
         // maximised window): what is under the point now is not what was clicked.
         if spot.target.window != first.aim.window {
@@ -1578,15 +2134,12 @@ impl<S: Clone> Router<S> {
         } else {
             confirm_after_up(&spot, click.point, first.pid, first.before)
         };
-        let focused = spot.focused.is_some_and(|f| f.editable);
         env.log(
             now,
             &format!(
-                "after mouse-up: {} role {} editable={} focused={} canvas={} (before: {}) → {confirmed:?}",
-                spot.target.exe.as_deref().unwrap_or("?"),
-                spot.role,
+                "after mouse-up: {} editable={} canvas={} (before: {}) → {confirmed:?}",
+                spot.describe(),
                 yes(spot.editable),
-                yes(focused),
                 yes(spot.canvas_here().canvas),
                 yes(first.before.canvas),
             ),
@@ -1605,7 +2158,68 @@ impl<S: Clone> Router<S> {
             element_pid: spot.pid,
             ..first.aim
         };
-        self.start_delivery(aim, surface, dismiss_editor, now, now, state, env);
+        // The focus check after the release compares against this element's process too.
+        self.start_delivery(aim, surface, dismiss_editor, click, now, now, state, env);
+    }
+
+    /// The focus lookup after the release answered. No key goes out unless the target field
+    /// has the keyboard focus ([`focus_evidence`]); a lookup that did not answer is no
+    /// evidence.
+    fn focus_answer<E: Env<Snap = S>>(
+        &mut self,
+        seen: Seen,
+        now: f64,
+        state: &mut FairyState,
+        env: &mut E,
+    ) {
+        let Phase::Delivering(mut d) = std::mem::replace(&mut self.phase, Phase::Idle) else {
+            return;
+        };
+        let refusal: Option<(Option<&str>, String)> = match &seen {
+            Seen::Spot(spot) => {
+                let pids = (d.aim.pid, d.aim.element_pid);
+                if focus_evidence(spot, pids, d.aim.window, d.aim.point, d.surface) {
+                    d.probe.verify =
+                        d.surface == Surface::Field && spot.focused.is_some_and(|f| f.single_line);
+                    d.probe.before = spot.probe;
+                    env.log(
+                        now,
+                        &format!(
+                            "focus: {} → in the target{}",
+                            spot.describe(),
+                            match (d.probe.before.is_some(), d.probe.verify) {
+                                (true, true) => ", probe taken (verify)",
+                                (true, false) => ", probe taken (standby)",
+                                _ => "",
+                            }
+                        ),
+                    );
+                    None
+                } else {
+                    Some((
+                        Some(HINT_NOT_FOCUSED),
+                        format!("focus is not in the target field ({})", spot.describe()),
+                    ))
+                }
+            }
+            Seen::OwnProcess => Some((None, "focus is in our own window".into())),
+            Seen::Elevated { pid } => Some((
+                Some(HINT_ELEVATED),
+                format!("focus check: elevated window (pid {pid})"),
+            )),
+            Seen::TimedOut { .. } => Some((Some(HINT_SLOW), "focus check timed out".into())),
+            Seen::Failed(why) => Some((Some(HINT_SLOW), format!("focus check failed: {why}"))),
+        };
+        match refusal {
+            None => {
+                d.job.step = Step::Front(now);
+                self.phase = Phase::Delivering(d);
+            }
+            Some((hint, why)) => {
+                let _ = self.end(&d, hint, &why, now, state, env);
+                self.finish_delivery(now, env);
+            }
+        }
     }
 
     // MARK: Delivery
@@ -1617,6 +2231,7 @@ impl<S: Clone> Router<S> {
         aim: Aim,
         surface: Surface,
         dismiss_editor: bool,
+        click: Click,
         clicked_at: f64,
         now: f64,
         state: &mut FairyState,
@@ -1664,6 +2279,10 @@ impl<S: Clone> Router<S> {
                 is_path: false,
                 step: Step::Prepare,
             },
+            probe: ProbeState::default(),
+            click,
+            focus: None,
+            cancelled: None,
         };
         env.log(
             now,
@@ -1710,7 +2329,11 @@ impl<S: Clone> Router<S> {
                     &format!("clipboard: using the copy from the first click (seq {sequence}, now {current}, {age:.2}s old)"),
                 );
                 match memory.rem {
-                    Some(Rem::Ready { snap, lost, .. }) => {
+                    Some(Rem::Ready {
+                        snap,
+                        lost,
+                        sequence,
+                    }) => {
                         if let Some(lost) = lost {
                             env.log(
                                 now,
@@ -1718,7 +2341,9 @@ impl<S: Clone> Router<S> {
                             );
                             return Err(());
                         }
-                        self.restore = Some(Restore::new(snap));
+                        let mut restore = Restore::new(snap);
+                        restore.expect = Some(sequence);
+                        self.restore = Some(restore);
                         return Ok(None);
                     }
                     Some(Rem::Waiting(ticket)) => return Ok(Some(ticket)),
@@ -1846,6 +2471,14 @@ impl<S: Clone> Router<S> {
         state: &mut FairyState,
         env: &mut E,
     ) -> Flow {
+        if !matches!(d.job.step, Step::Watch(_) | Step::Next(_)) {
+            if env.key_presses() != d.click.keys && d.cancelled.is_none() {
+                d.cancelled = Some("the user typed");
+            }
+            if let Some(why) = d.cancelled {
+                return self.end(d, None, &format!("{why} → stopped"), now, state, env);
+            }
+        }
         match d.job.step.clone() {
             Step::Prepare => {
                 let deadline = d.job.started + PREPARE_TIMEOUT;
@@ -1911,9 +2544,20 @@ impl<S: Clone> Router<S> {
                 if now < until {
                     return Flow::Wait(Some(until));
                 }
+                if d.job.first && matches!(d.surface, Surface::Field | Surface::Document) {
+                    // Evidence that the target field has the keyboard focus, and the probe's
+                    // fingerprint of it, in one lookup.
+                    let probe = d.surface == Surface::Field;
+                    let id = self.request(d.aim.point, true, probe, LOOKUP_DEADLINE, now, env);
+                    env.log(now, &format!("checking the keyboard focus (lookup {id})"));
+                    d.job.step = Step::Focus(id);
+                    // The answer, or the lookup's give-up, runs the router again.
+                    return Flow::Wait(None);
+                }
                 d.job.step = Step::Front(now);
                 Flow::Again
             }
+            Step::Focus(_) => Flow::Wait(None),
             Step::Front(since) => {
                 if env.foreground_is(d.aim.window, d.aim.pid) {
                     let mut keys = Vec::new();
@@ -1943,17 +2587,11 @@ impl<S: Clone> Router<S> {
             }
             Step::Keys { mut keys, since } => {
                 while let Some(&key) = keys.first() {
-                    if !env.foreground_is(d.aim.window, d.aim.pid) {
-                        return self.fail(
-                            d,
-                            Self::fail_hint(d),
-                            "the target left the front",
-                            now,
-                            state,
-                            env,
-                        );
-                    }
-                    match env.press(key) {
+                    let sent = match self.send_batch(d, Batch::Key(key), None, now, state, env) {
+                        Ok(sent) => sent,
+                        Err(flow) => return flow,
+                    };
+                    match sent {
                         Sent::Blocked(modifier) => {
                             let give_up = since + MODIFIER_WAIT;
                             if now >= give_up {
@@ -1970,9 +2608,19 @@ impl<S: Clone> Router<S> {
                             d.job.step = Step::Keys { keys, since };
                             return Flow::Wait(Some(give_up.min(now + MODIFIER_POLL)));
                         }
-                        sent => {
-                            env.log(now, &format!("pressed {key:?}: {sent:?}"));
+                        Sent::Done => {
+                            env.log(now, &format!("pressed {key:?}"));
                             keys.remove(0);
+                        }
+                        other => {
+                            return self.fail(
+                                d,
+                                Self::fail_hint(d),
+                                &format!("{key:?} not sent: {other:?}"),
+                                now,
+                                state,
+                                env,
+                            );
                         }
                     }
                 }
@@ -1995,12 +2643,33 @@ impl<S: Clone> Router<S> {
                 let Pay::Ready(payload) = &d.job.payload else {
                     return self.fail(d, Self::fail_hint(d), "no payload", now, state, env);
                 };
-                if self.restore.is_none() {
+                let Some(restore) = self.restore.as_ref() else {
                     return self.fail(d, HINT_CLIPBOARD, "no saved clipboard", now, state, env);
-                }
+                };
+                // B1: write only over what we expect. The first stage of a delivery with a
+                // fresh copy expects exactly the clipboard that copy saved, and hands the copy
+                // to the clipboard thread; later cards (and a taken-over restore) expect our
+                // own staging still there.
+                let fresh = restore.stage.is_none() && restore.prev.is_none();
+                let (expect, rollback) = if fresh {
+                    let mut expected = restore.expect.unwrap_or_default();
+                    let facts = env.clip_facts(now);
+                    // A terminal's copy-on-select after the first press is the click's own
+                    // (B4: terminals only).
+                    if d.terminal
+                        && facts.sequence != expected
+                        && facts.last_change.is_some_and(|c| c >= d.click.first_at)
+                    {
+                        env.log(now, "the terminal copied its selection → staged over it");
+                        expected = facts.sequence;
+                    }
+                    (Expect::Sequence(expected), Some(&restore.snap))
+                } else {
+                    (Expect::OwnStaging, None)
+                };
                 // Write the clipboard only now: a terminal's copy-on-select on the mouse-up
                 // would replace an earlier write.
-                match env.clip_stage(payload.clone()) {
+                match env.clip_stage(payload.clone(), expect, rollback) {
                     Ok(ticket) => {
                         if let Some(restore) = self.restore.as_mut() {
                             restore.prev = restore.stage.take();
@@ -2022,11 +2691,18 @@ impl<S: Clone> Router<S> {
             Step::Staging { since, .. } => {
                 let give_up = since + REPLY_TIMEOUT;
                 if now >= give_up {
-                    // The request may still run: the restore waits for its reply.
+                    // B5: the request may still run. A rollback queued behind it runs after it,
+                    // on the clipboard thread, whatever the router does meanwhile.
+                    if let Some(restore) = self.restore.as_mut()
+                        && let Ok(ticket) = env.clip_rollback(RestoreGuard::OwnStaging)
+                    {
+                        restore.restoring = Some((ticket, now));
+                        restore.first_try.get_or_insert(now);
+                    }
                     return self.fail(
                         d,
                         Self::fail_hint(d),
-                        "no stage reply in time (the restore waits for it)",
+                        "no stage reply in time (a rollback is queued behind it)",
                         now,
                         state,
                         env,
@@ -2035,18 +2711,16 @@ impl<S: Clone> Router<S> {
                 Flow::Wait(Some(give_up))
             }
             Step::Send(since) => {
-                // Rule 7: the foreground and the modifiers are checked right before.
-                if !env.foreground_is(d.aim.window, d.aim.pid) {
-                    return self.fail(
-                        d,
-                        Self::fail_hint(d),
-                        "the target left the front before the paste keys",
-                        now,
-                        state,
-                        env,
-                    );
-                }
-                match env.paste_shortcut(d.aim.keys) {
+                let ticket = self
+                    .restore
+                    .as_ref()
+                    .and_then(|r| r.stage)
+                    .map(|s| s.ticket);
+                let sent = match self.send_batch(d, d.aim.keys.batch(), ticket, now, state, env) {
+                    Ok(sent) => sent,
+                    Err(flow) => return flow,
+                };
+                match sent {
                     Sent::Blocked(modifier) => {
                         let give_up = since + MODIFIER_WAIT;
                         if now >= give_up {
@@ -2055,7 +2729,7 @@ impl<S: Clone> Router<S> {
                         }
                         Flow::Wait(Some(give_up.min(now + MODIFIER_POLL)))
                     }
-                    sent => {
+                    Sent::Done | Sent::Incomplete { .. } => {
                         env.log(now, &format!("sent {:?}: {sent:?}", d.aim.keys));
                         if let Some(stage) = self.restore.as_mut().and_then(|r| r.stage.as_mut()) {
                             stage.sent_at = Some(now);
@@ -2063,19 +2737,59 @@ impl<S: Clone> Router<S> {
                         d.job.step = Step::Watch(now);
                         Flow::Again
                     }
+                    Sent::Refused => {
+                        // B3: someone wrote the clipboard after our stage: the user's new
+                        // data is there; never paste it, never write over it.
+                        if let Some(restore) = self.restore.as_mut() {
+                            restore.user_copied = true;
+                        }
+                        env.clip_abandon();
+                        self.end(
+                            d,
+                            None,
+                            "the clipboard changed after the stage → no paste keys",
+                            now,
+                            state,
+                            env,
+                        )
+                    }
+                    other => self.fail(
+                        d,
+                        Self::fail_hint(d),
+                        &format!("paste keys not sent: {other:?}"),
+                        now,
+                        state,
+                        env,
+                    ),
                 }
             }
             Step::Watch(sent_at) => {
                 let facts = env.clip_facts(now);
                 self.reconcile(&facts, now, env);
-                let reads = self
+                let (reads, foreign) = self
                     .restore
                     .as_ref()
                     .and_then(|r| r.stage)
-                    .map_or(0, |s| s.reads);
+                    .map_or((0, 0), |s| read_counts(&s, &facts));
                 let canvas = matches!(d.surface, Surface::Canvas | Surface::Document);
-                let rules = OutcomeRules::new(false, canvas);
-                match rules.evaluate(now - sent_at, reads, false) {
+                // The probe verifies single-line fields, and any field whose target read
+                // another process may have hidden.
+                let masked = reads == 0 && foreign > 0;
+                let probing = d.job.first && d.probe.before.is_some() && (d.probe.verify || masked);
+                if probing
+                    && d.probe.after_req.is_none()
+                    && d.probe.last_check.is_none_or(|t| now >= t + PROBE_INTERVAL)
+                {
+                    let id = self.request(d.aim.point, true, true, LOOKUP_DEADLINE, now, env);
+                    d.probe.after_req = Some(id);
+                    d.probe.last_check = Some(now);
+                }
+                let view = probing.then_some(ProbeView {
+                    verify: d.probe.verify,
+                    answered: d.probe.answered,
+                    changed: d.probe.changed,
+                });
+                match paste_outcome(now - sent_at, reads, foreign, canvas, view) {
                     PasteOutcome::Pending => Flow::Wait(Some(now + OUTCOME_POLL)),
                     PasteOutcome::Accepted => {
                         let count = d.ids.len();
@@ -2091,15 +2805,19 @@ impl<S: Clone> Router<S> {
                         env.log(
                             now,
                             &format!(
-                                "card {}: the target read {reads} format(s) → accepted",
-                                d.job.id.0
+                                "card {}: the target read {reads} format(s), others {foreign}, probe {} → accepted",
+                                d.job.id.0,
+                                if d.probe.changed { "changed" } else { "-" }
                             ),
                         );
                         state.deliver(&[d.job.id], &hint, now);
                         self.state_changed = true;
-                        if d.ids[d.index + 1..]
-                            .iter()
-                            .any(|id| state.card(*id).is_some())
+                        if d.cancelled.is_none()
+                            && env.key_presses() == d.click.keys
+                            && !self.restore.as_ref().is_some_and(|r| r.user_copied)
+                            && d.ids[d.index + 1..]
+                                .iter()
+                                .any(|id| state.card(*id).is_some())
                         {
                             d.job.step = Step::Next(now + PILE_STEP);
                             Flow::Again
@@ -2113,7 +2831,14 @@ impl<S: Clone> Router<S> {
                         } else {
                             HINT_NO_IMAGES
                         };
-                        self.fail(d, hint, "the field did not change", now, state, env)
+                        self.fail(
+                            d,
+                            hint,
+                            "read, but the field did not change (probe)",
+                            now,
+                            state,
+                            env,
+                        )
                     }
                     PasteOutcome::Failed => {
                         if d.job.first
@@ -2148,6 +2873,50 @@ impl<S: Clone> Router<S> {
         }
     }
 
+    /// C1 and the guarded send: the gesture and the card are checked, then the environment
+    /// sends with its own last checks. `Err` ends the delivery quietly.
+    #[allow(clippy::too_many_arguments)]
+    fn send_batch<E: Env<Snap = S>>(
+        &mut self,
+        d: &mut Delivery,
+        batch: Batch,
+        stage: Option<u64>,
+        now: f64,
+        state: &mut FairyState,
+        env: &mut E,
+    ) -> Result<Sent, Flow> {
+        let why = if let Some(why) = d.cancelled {
+            Some(why)
+        } else if env.key_presses() != d.click.keys {
+            Some("the user typed")
+        } else if state.card(d.job.id).is_none() {
+            Some("the card left the pile")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            return Err(self.end(
+                d,
+                None,
+                &format!("{why} → stopped before {batch:?}"),
+                now,
+                state,
+                env,
+            ));
+        }
+        let guard = SendGuard {
+            window: d.aim.window,
+            pid: d.aim.pid,
+            focus: d.focus,
+            stage,
+        };
+        let (sent, focus) = env.send(batch, guard);
+        if d.focus.is_none() && matches!(sent, Sent::Done | Sent::Incomplete { .. }) {
+            d.focus = focus;
+        }
+        Ok(sent)
+    }
+
     /// Cards shaken off (or otherwise gone) meanwhile are skipped; new captures are not taken.
     fn next_card<E: Env<Snap = S>>(
         &mut self,
@@ -2169,10 +2938,13 @@ impl<S: Clone> Router<S> {
     /// Counts the target's reads, then `reconcileClipboard`: someone else wrote the
     /// clipboard after we did.
     fn reconcile<E: Env<Snap = S>>(&mut self, facts: &ClipFacts, now: f64, env: &mut E) {
-        let Some(stage) = self.restore.as_mut().and_then(|r| r.stage.as_mut()) else {
+        let Some(restore) = self.restore.as_mut() else {
             return;
         };
-        count_reads(stage, facts, now, env);
+        let Some(stage) = restore.stage.as_mut() else {
+            return;
+        };
+        log_foreign_reads(stage, facts, now, env);
         if !stage.guarding || stage.restaging.is_some() || !stage.confirmed {
             return;
         }
@@ -2192,11 +2964,25 @@ impl<S: Clone> Router<S> {
         if stage.adopted.is_some_and(|base| change <= base) {
             return;
         }
-        match paste_policy::overwrite_step(now - sent, stage.reads, staged.rewrites, stage.terminal)
-        {
-            OverwriteStep::Rewrite => match env.clip_restage() {
+        // B4: only a terminal's copy-on-select is the click's own. Anywhere else a write after
+        // our stage is the user copying: stop, never rewrite, never restore.
+        if !stage.terminal {
+            stage.guarding = false;
+            restore.user_copied = true;
+            env.clip_abandon();
+            env.log(now, "the user copied something → leave the clipboard alone");
+            return;
+        }
+        let target_reads = read_counts(stage, facts).0;
+        match paste_policy::overwrite_step(
+            now - sent,
+            target_reads,
+            staged.rewrites,
+            stage.terminal,
+        ) {
+            OverwriteStep::Rewrite => match env.clip_restage(Expect::Sequence(facts.sequence)) {
                 Ok(ticket) => {
-                    stage.restaging = Some(ticket);
+                    stage.restaging = Some((ticket, now));
                     env.log(now, "clipboard overwritten before the paste was read → writing the screenshot again");
                 }
                 Err(why) => {
@@ -2214,6 +3000,8 @@ impl<S: Clone> Router<S> {
             }
             OverwriteStep::Leave => {
                 stage.guarding = false;
+                restore.user_copied = true;
+                env.clip_abandon();
                 env.log(now, "the user copied something → leave the clipboard alone");
             }
         }
@@ -2255,7 +3043,9 @@ impl<S: Clone> Router<S> {
                     lost: None,
                 }) => {
                     env.log(now, &format!("clipboard: saved (seq {sequence})"));
-                    self.restore = Some(Restore::new(snap.clone()));
+                    let mut restore = Restore::new(snap.clone());
+                    restore.expect = Some(*sequence);
+                    self.restore = Some(restore);
                     None
                 }
                 Ok(ClipDone::Snapshot {
@@ -2309,6 +3099,15 @@ impl<S: Clone> Router<S> {
                         "stage failed after emptying the clipboard (seq {sequence})"
                     ))
                 }
+                Err(ClipFail::Changed) => {
+                    // B1: the clipboard is not what we saved (the user copied): nothing was
+                    // written; stop quietly, keep the cards, restore nothing.
+                    restore.stage = restore.prev.take();
+                    if restore.stage.is_none() {
+                        restore.user_copied = true;
+                    }
+                    Some("the clipboard changed before the stage → nothing written".to_string())
+                }
                 other => {
                     // Nothing was written: an earlier paste's staging (if any) is still there.
                     restore.stage = restore.prev.take();
@@ -2318,13 +3117,15 @@ impl<S: Clone> Router<S> {
                     ))
                 }
             };
+            let quiet = matches!(reply.result, Err(ClipFail::Changed));
             if let Some(why) = failure {
                 if staging_now {
                     let Phase::Delivering(d) = std::mem::replace(&mut self.phase, Phase::Idle)
                     else {
                         unreachable!("checked above");
                     };
-                    let _ = self.fail(&d, Self::fail_hint(&d), &why, now, state, env);
+                    let hint = (!quiet).then(|| Self::fail_hint(&d));
+                    let _ = self.end(&d, hint, &why, now, state, env);
                     self.finish_delivery(now, env);
                 } else {
                     env.log(now, &why);
@@ -2337,7 +3138,7 @@ impl<S: Clone> Router<S> {
         };
         // A restage.
         if let Some(stage) = restore.stage.as_mut()
-            && stage.restaging == Some(ticket)
+            && stage.restaging.is_some_and(|(t, _)| t == ticket)
         {
             stage.restaging = None;
             match &reply.result {
@@ -2366,6 +3167,12 @@ impl<S: Clone> Router<S> {
                     env.log(now, "clipboard restored");
                     self.restore = None;
                     self.remembered = None;
+                }
+                Err(ClipFail::Partial) => {
+                    // Our partial result is on the clipboard now: write it over at the next try.
+                    restore.partial = true;
+                    restore.now_please = true;
+                    self.retry_restore("partial restore", now, state, env);
                 }
                 Err(ClipFail::Changed) => {
                     env.log(
@@ -2482,7 +3289,7 @@ impl<S: Clone> Router<S> {
                     } else {
                         LOOKUP_DEADLINE
                     };
-                    let id = self.request(click.point, true, deadline, now, env);
+                    let id = self.request(click.point, true, false, deadline, now, env);
                     env.log(
                         now,
                         &format!(
@@ -2550,7 +3357,7 @@ impl<S: Clone> Router<S> {
             }
             restore.retry_at = None;
         }
-        if restore.stage.is_none() {
+        if restore.stage.is_none() || restore.user_copied {
             self.restore = None;
             return;
         }
@@ -2562,9 +3369,13 @@ impl<S: Clone> Router<S> {
         let Some(stage) = restore.stage else {
             return;
         };
+        if restore.user_copied {
+            self.restore = None;
+            return;
+        }
         // The app was busy and took the Ctrl+V after we had given up: the top card did land.
         if let Some((id, before)) = restore.late
-            && stage.reads > before
+            && read_counts(&stage, &facts).0 > before
         {
             restore.late = None;
             if state.card(id).is_some() {
@@ -2577,21 +3388,33 @@ impl<S: Clone> Router<S> {
             }
         }
         if !stage.confirmed && stage.emptied.is_none() {
-            // A stage request still in flight: its reply decides.
-            let give_up = stage.requested_at + STAGE_LATE_WAIT;
+            // A stage request still in flight: its reply decides (a rollback may already be
+            // queued behind it). Polled for a bounded time only.
+            let give_up = stage.requested_at + UNANSWERED_LIMIT;
             if now >= give_up {
-                env.log(now, "the stage never answered → nothing to restore");
+                env.log(
+                    now,
+                    "the stage never answered → the clipboard thread rolls back when it runs",
+                );
                 self.restore = None;
             } else {
                 self.restore_wake = Some(give_up);
             }
             return;
         }
-        if stage.restaging.is_some() {
-            self.restore_wake = Some(now + RESTORE_POLL);
-            return;
+        if let Some((_, since)) = stage.restaging {
+            if now >= since + REPLY_TIMEOUT {
+                env.log(now, "the rewrite never answered → stop guarding");
+                if let Some(stage) = restore.stage.as_mut() {
+                    stage.restaging = None;
+                    stage.guarding = false;
+                }
+            } else {
+                self.restore_wake = Some(now + RESTORE_POLL);
+                return;
+            }
         }
-        let guard = restore_guard(&stage, &facts);
+        let guard = restore_guard(&stage, &facts, restore.partial);
         let step = match stage.sent_at {
             Some(sent) if !restore.now_please => RestoreRules::default().step(
                 now - sent,
@@ -2606,7 +3429,7 @@ impl<S: Clone> Router<S> {
         };
         match (step, guard) {
             (RestoreStep::Wait, _) => self.restore_wake = Some(now + RESTORE_POLL),
-            (RestoreStep::Restore, Some(guard)) => match env.clip_restore(&restore.snap, guard) {
+            (RestoreStep::Restore, Some(guard)) => match env.clip_rollback(guard) {
                 Ok(ticket) => {
                     env.log(now, &format!("restoring the clipboard ({guard:?})"));
                     restore.first_try.get_or_insert(now);
@@ -2645,7 +3468,7 @@ impl<S: Clone> Router<S> {
             self.hover_wake = Some(at);
             return;
         }
-        let id = self.request(point, false, LOOKUP_DEADLINE, now, env);
+        let id = self.request(point, false, false, LOOKUP_DEADLINE, now, env);
         self.hover.in_flight = Some(id);
         self.hover.resolved = true;
         self.hover.last_request = Some(now);
@@ -2699,7 +3522,9 @@ impl DebugLog {
             return;
         }
         let line = format!("{now:10.3} {text}");
-        eprintln!("{line}");
+        // Never panics (D1): a missing stderr or a full disk only loses the line, also while
+        // a panic unwinds through the quit path.
+        let _ = writeln!(std::io::stderr().lock(), "{line}");
         if let Some(file) = self.file.as_mut() {
             let _ = writeln!(file, "{line}");
         }
@@ -2742,11 +3567,12 @@ impl Drop for WakeEvent {
 pub struct LiveEnv {
     uia: Option<Uia>,
     clip: Option<Clipboard>,
+    keys: Option<KeyWatch>,
     wake: Arc<WakeEvent>,
-    saves: Sender<(u64, Result<PathBuf, String>)>,
+    /// The one PNG saver thread (D2) and its job queue.
+    saver: Option<(SyncSender<SaveJob>, std::thread::JoinHandle<()>)>,
     saved: Receiver<(u64, Result<PathBuf, String>)>,
     next_save: u64,
-    settings: Settings,
     log: DebugLog,
     primary: Button,
     /// Converts the clipboard's `Instant`s to the `hook::now` clock.
@@ -2764,14 +3590,17 @@ impl LiveEnv {
         let clip =
             Clipboard::start(move || clip_wake.set()).map_err(|e| format!("clipboard: {e}"))?;
         let (saves, saved) = mpsc::channel();
+        let saver = spawn_saver(settings, saves, wake.clone());
+        // Without the key watch typing cannot stop a delivery; the rest still works.
+        let keys = KeyWatch::start().ok();
         Ok(LiveEnv {
             uia: Some(uia),
             clip: Some(clip),
+            keys,
             wake,
-            saves,
+            saver,
             saved,
             next_save: 1,
-            settings,
             log,
             primary: LiveEnv::primary_button(),
             origin: Instant::now(),
@@ -2850,18 +3679,63 @@ impl LiveEnv {
             }
             waiting = router.quit_reply(convert_reply(reply), hook::now(), self);
         }
-        // Dropping the clipboard renders what we still own, so the clipboard stays valid.
+        // Dropping the clipboard stops its thread: it rolls back if our staging is still
+        // there, else renders what we still own, so the clipboard stays valid.
         self.clip = None;
         if let Some(uia) = self.uia.take() {
             let _ = uia.shutdown();
         }
+        self.keys = None;
+        // The saver: no new jobs; the one running may finish within a second.
+        if let Some((jobs, thread)) = self.saver.take() {
+            drop(jobs);
+            let until = Instant::now() + Duration::from_secs(1);
+            while !thread.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
     }
+}
+
+/// One PNG to save for a terminal paste.
+struct SaveJob {
+    id: u64,
+    image: Arc<igorio_kit::Image>,
+    scale: f64,
+    captured_at: std::time::SystemTime,
+}
+
+/// The saver worker: one thread for every terminal-paste PNG, fed through a short queue.
+fn spawn_saver(
+    settings: Settings,
+    done: Sender<(u64, Result<PathBuf, String>)>,
+    wake: Arc<WakeEvent>,
+) -> Option<(SyncSender<SaveJob>, std::thread::JoinHandle<()>)> {
+    let (jobs, queue) = mpsc::sync_channel::<SaveJob>(2);
+    let thread = std::thread::Builder::new()
+        .name("paste-saver".into())
+        .spawn(move || {
+            while let Ok(job) = queue.recv() {
+                let folder = settings.pasted_dir(&DefaultFolders::from_system());
+                let result =
+                    saver::save_screenshot(&job.image, job.scale, job.captured_at, &folder)
+                        .map_err(|e| e.to_string());
+                let _ = done.send((job.id, result));
+                wake.set();
+            }
+        })
+        .ok()?;
+    Some((jobs, thread))
 }
 
 fn convert_reply(reply: Reply) -> ClipReply<clipboard::Snapshot> {
     let result = match reply.result {
         Ok(Done::Snapshot(snap)) => Ok(ClipDone::Snapshot {
-            sequence: snap.sequence(),
+            // The identity read under the lock: a stage expects exactly this state.
+            sequence: snap.held_sequence(),
             lost: snap.lost().map(|lost| format!("{lost:?}")),
             snap,
         }),
@@ -2869,6 +3743,7 @@ fn convert_reply(reply: Reply) -> ClipReply<clipboard::Snapshot> {
         Ok(Done::Restored { sequence }) => Ok(ClipDone::Restored { sequence }),
         Err(ClipError::Changed) => Err(ClipFail::Changed),
         Err(ClipError::Emptied { sequence, .. }) => Err(ClipFail::Emptied { sequence }),
+        Err(ClipError::Partial { .. }) => Err(ClipFail::Partial),
         Err(other @ (ClipError::Busy | ClipError::Stale | ClipError::Locked { .. })) => {
             Err(ClipFail::Retry(other.to_string()))
         }
@@ -2883,10 +3758,11 @@ fn convert_reply(reply: Reply) -> ClipReply<clipboard::Snapshot> {
 impl Env for LiveEnv {
     type Snap = clipboard::Snapshot;
 
-    fn lookup(&mut self, point: (i32, i32), want_focus: bool, deadline: f64) -> u64 {
+    fn lookup(&mut self, point: (i32, i32), want_focus: bool, probe: bool, deadline: f64) -> u64 {
         let lookup = Lookup {
             point,
             want_focus,
+            probe,
             deadline: Duration::from_secs_f64(deadline),
         };
         match &self.uia {
@@ -2910,6 +3786,7 @@ impl Env for LiveEnv {
                 last_read_at: s.last_read_at.map(|t| self.secs(t)),
                 overwritten_at: s.overwritten_at.map(|t| self.secs(t)),
                 last_reader: s.last_reader,
+                renders: s.renders.map(|r| r.map(|r| (r.reader, self.secs(r.at)))),
             }),
         }
     }
@@ -2919,54 +3796,81 @@ impl Env for LiveEnv {
         clip.snapshot().map(|t| t.0).map_err(|e| e.to_string())
     }
 
-    fn clip_stage(&mut self, payload: Payload) -> Result<u64, String> {
-        let clip = self.clip.as_ref().ok_or("no clipboard thread")?;
-        clip.stage(payload).map(|t| t.0).map_err(|e| e.to_string())
-    }
-
-    fn clip_restage(&mut self) -> Result<u64, String> {
-        let clip = self.clip.as_ref().ok_or("no clipboard thread")?;
-        clip.restage().map(|t| t.0).map_err(|e| e.to_string())
-    }
-
-    fn clip_restore(
+    fn clip_stage(
         &mut self,
-        snap: &clipboard::Snapshot,
-        guard: RestoreGuard,
+        payload: Payload,
+        expect: Expect,
+        rollback: Option<&clipboard::Snapshot>,
     ) -> Result<u64, String> {
         let clip = self.clip.as_ref().ok_or("no clipboard thread")?;
-        let ticket = match guard {
-            RestoreGuard::OwnStaging => clip.restore_over_staging(snap),
-            RestoreGuard::Sequence(sequence) => clip.restore(snap, Some(sequence)),
+        clip.stage_guarded(payload, expect, rollback)
+            .map(|t| t.0)
+            .map_err(|e| e.to_string())
+    }
+
+    fn clip_restage(&mut self, expect: Expect) -> Result<u64, String> {
+        let clip = self.clip.as_ref().ok_or("no clipboard thread")?;
+        clip.restage_guarded(expect)
+            .map(|t| t.0)
+            .map_err(|e| e.to_string())
+    }
+
+    fn clip_rollback(&mut self, guard: RestoreGuard) -> Result<u64, String> {
+        let clip = self.clip.as_ref().ok_or("no clipboard thread")?;
+        let when = match guard {
+            RestoreGuard::OwnStaging => clipboard::Rollback::OwnStaging,
+            RestoreGuard::Sequence(sequence) => clipboard::Rollback::Sequence(sequence),
         };
-        ticket.map(|t| t.0).map_err(|e| e.to_string())
+        clip.rollback(when).map(|t| t.0).map_err(|e| e.to_string())
+    }
+
+    fn clip_abandon(&mut self) {
+        if let Some(clip) = &self.clip {
+            let _ = clip.abandon();
+        }
     }
 
     fn save_png(&mut self, card: &HeldCard) -> u64 {
-        let job = self.next_save;
+        let id = self.next_save;
         self.next_save += 1;
-        let image = card.image.clone();
-        let (scale, captured_at) = (card.scale, card.captured_at);
-        let settings = self.settings.clone();
-        let saves = self.saves.clone();
-        let wake = self.wake.clone();
-        // The folder lookup, the encode and the write all run off the UI thread.
-        std::thread::spawn(move || {
-            let folder = settings.pasted_dir(&DefaultFolders::from_system());
-            let result = saver::save_screenshot(&image, scale, captured_at, &folder)
-                .map_err(|e| e.to_string());
-            let _ = saves.send((job, result));
-            wake.set();
-        });
-        job
+        let job = SaveJob {
+            id,
+            image: card.image.clone(),
+            scale: card.scale,
+            captured_at: card.captured_at,
+        };
+        // The folder lookup, the encode and the write run on the saver thread. With no
+        // saver or a full queue the save fails at once and the paste says so.
+        let queued = self
+            .saver
+            .as_ref()
+            .is_some_and(|(jobs, _)| jobs.try_send(job).is_ok());
+        if !queued {
+            self.log.line(hook::now(), "PNG saver busy or gone");
+        }
+        id
     }
 
     fn foreground_is(&self, window: isize, pid: u32) -> bool {
-        if window != 0 {
-            input::foreground_is(Foreground::Window(HWND(window as *mut _)))
-        } else {
-            input::foreground_is(Foreground::Process(pid))
-        }
+        input::foreground_matches(HWND(window as *mut _), pid)
+    }
+
+    fn point_in_client(&self, window: isize, (x, y): (i32, i32)) -> bool {
+        let hwnd = HWND(window as *mut _);
+        let mut rect = RECT::default();
+        let mut origin = POINT::default();
+        // SAFETY: locals outlive the calls; window manager state only, no message is sent.
+        let ok = unsafe {
+            GetClientRect(hwnd, &mut rect).is_ok() && ClientToScreen(hwnd, &mut origin).as_bool()
+        };
+        ok && x >= origin.x
+            && y >= origin.y
+            && x < origin.x + (rect.right - rect.left)
+            && y < origin.y + (rect.bottom - rect.top)
+    }
+
+    fn key_presses(&self) -> u64 {
+        self.keys.as_ref().map_or(0, KeyWatch::presses)
     }
 
     fn primary_down(&self) -> bool {
@@ -2983,15 +3887,25 @@ impl Env for LiveEnv {
         uia::terminal_at(point)
     }
 
-    fn press(&mut self, key: Key) -> Sent {
-        input::press(key)
+    fn process_name(&self, pid: u32) -> Option<String> {
+        uia::exe_name_of(pid)
     }
 
-    fn paste_shortcut(&mut self, keys: PasteKeys) -> Sent {
-        match keys {
-            PasteKeys::CtrlV => input::paste_shortcut(),
-            PasteKeys::CtrlShiftV => input::paste_shortcut_with_shift(),
-        }
+    fn send(&mut self, batch: Batch, guard: SendGuard) -> (Sent, Option<isize>) {
+        let clip = self.clip.as_ref();
+        // B3: right before the window checks, the exact staging must still own the clipboard.
+        let precheck = || {
+            guard
+                .stage
+                .is_none_or(|t| clip.is_some_and(|c| c.owns_staging(Ticket(t))))
+        };
+        let target = input::Guard {
+            window: HWND(guard.window as *mut _),
+            pid: guard.pid,
+            focus: guard.focus.map(|f| HWND(f as *mut _)),
+        };
+        let (sent, focus) = input::send_guarded(&target, batch, precheck);
+        (sent, focus.map(|f| f.0 as isize))
     }
 
     fn log(&mut self, now: f64, line: &str) {

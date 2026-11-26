@@ -240,12 +240,16 @@ pub enum ClipError {
     /// The clipboard thread is gone.
     Stopped,
     /// `stage` or `restage` failed after the clipboard was emptied: it is left empty (none
-    /// of the user's data is on it any more). `sequence` is read after `CloseClipboard`.
+    /// of the user's data is on it any more). `sequence` identifies that empty clipboard: it
+    /// is read while the clipboard is still open, so nobody else's write can be in it.
     /// Every other `stage` error leaves the clipboard as it was.
     Emptied {
         cause: Box<ClipError>,
         sequence: u32,
     },
+    /// A restore emptied the clipboard but `failed` formats could not be written. The
+    /// rollback copy is kept, so a `rollback` can write it again over this partial result.
+    Partial { failed: u32 },
 }
 
 impl fmt::Display for ClipError {
@@ -265,6 +269,9 @@ impl fmt::Display for ClipError {
             ClipError::Stopped => write!(f, "clipboard thread stopped"),
             ClipError::Emptied { cause, sequence } => {
                 write!(f, "clipboard left empty (seq {sequence}) after: {cause}")
+            }
+            ClipError::Partial { failed } => {
+                write!(f, "restore wrote all but {failed} format(s)")
             }
         }
     }
@@ -322,6 +329,43 @@ pub struct Staged {
     /// Someone else wrote the clipboard after our last (re)write (`WM_DESTROYCLIPBOARD`, or a
     /// foreign `WM_CLIPBOARDUPDATE`). Cleared by `restage`.
     pub overwritten_at: Option<Instant>,
+    /// Every render, oldest first, up to [`RENDER_LOG`] (later ones only count in `reads`).
+    pub renders: [Option<Render>; RENDER_LOG],
+}
+
+/// Renders kept with their reader in [`Staged::renders`].
+pub const RENDER_LOG: usize = 16;
+
+/// One format another process read (`WM_RENDERFORMAT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Render {
+    pub format: u32,
+    pub at: Instant,
+    /// Process of the window that had the clipboard open; None when it opened the clipboard
+    /// without a window.
+    pub reader: Option<u32>,
+}
+
+/// What a stage expects to find on the clipboard, checked while it is open and before it is
+/// emptied; otherwise nothing is written and the reply is [`ClipError::Changed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expect {
+    /// Anything (tools and tests).
+    Any,
+    /// The clipboard at this sequence number (the one the snapshot saved).
+    Sequence(u32),
+    /// Our own current staging (a later card of a pile, a rewrite).
+    OwnStaging,
+}
+
+/// When the clipboard thread may write the rollback copy back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rollback {
+    /// Only while our staging (or our own partial restore) is still on the clipboard.
+    OwnStaging,
+    /// Only while the clipboard is at this sequence number (after a stage that emptied it, or
+    /// after a terminal's copy-on-select was taken as the click's own).
+    Sequence(u32),
 }
 
 /// Why a format found on the clipboard is not in the snapshot.
@@ -358,7 +402,24 @@ pub enum Lost {
     Kind(Kind),
     /// The clipboard held content and none of it could be saved.
     Everything,
+    /// An embedded or linked OLE object ([`OLE_OBJECT_FORMATS`]) with no text of its own (an
+    /// Excel chart, an embedded object): only its pictures could be put back.
+    OleObject,
 }
+
+/// Formats that carry an embedded or linked OLE object (an Excel chart, an object copied from
+/// a document). App-private formats in general do not stop a paste: Chromium and Office add
+/// some to every copy, and their text, HTML and pictures come back the same.
+pub const OLE_OBJECT_FORMATS: &[&str] = &[
+    "Embed Source",
+    "Embedded Object",
+    "Link Source",
+    "Object Descriptor",
+    "Link Source Descriptor",
+    "Native",
+    "OwnerLink",
+    "ObjectLink",
+];
 
 /// The user's clipboard as saved bytes. Cheap to clone.
 #[derive(Debug, Clone)]
@@ -371,6 +432,7 @@ struct SnapshotData {
     lost: Option<Lost>,
     total: usize,
     sequence: u32,
+    held_sequence: u32,
     taken_at: Instant,
 }
 
@@ -382,9 +444,15 @@ struct Saved {
 }
 
 impl Snapshot {
-    /// Sequence number read after `CloseClipboard`.
+    /// Sequence number read after `CloseClipboard` (rule 4, for reports).
     pub fn sequence(&self) -> u32 {
         self.0.sequence
+    }
+
+    /// Sequence number read while the clipboard was still open, after every read: the
+    /// identity of exactly the state this snapshot saved (a stage expects it).
+    pub fn held_sequence(&self) -> u32 {
+        self.0.held_sequence
     }
 
     pub fn taken_at(&self) -> Instant {
@@ -514,13 +582,54 @@ impl Clipboard {
     /// Empties the clipboard and promises the payload (delayed rendering). Reply:
     /// [`Done::Staged`]. On failure the clipboard may be left empty: restore the snapshot.
     pub fn stage(&self, payload: Payload) -> Result<Ticket, ClipError> {
-        self.send(Request::Stage(payload))
+        self.send(Request::Stage(payload, Expect::Any, None))
+    }
+
+    /// `stage`, only if the clipboard is as `expect` says (checked while it is open, before
+    /// it is emptied; else [`ClipError::Changed`] and nothing is written). With `rollback`,
+    /// the clipboard thread keeps that copy of the user's clipboard from the moment it empties
+    /// the clipboard: [`Clipboard::rollback`] writes it back, and so does the thread itself
+    /// when it stops while our staging is still there. Without, an earlier copy is kept.
+    pub fn stage_guarded(
+        &self,
+        payload: Payload,
+        expect: Expect,
+        rollback: Option<&Snapshot>,
+    ) -> Result<Ticket, ClipError> {
+        self.send(Request::Stage(payload, expect, rollback.cloned()))
     }
 
     /// Writes the staged payload again (paste_policy's `OverwriteStep::Rewrite`). Read counts
     /// carry over; `overwritten_at` is cleared. Reply: [`Done::Staged`].
     pub fn restage(&self) -> Result<Ticket, ClipError> {
-        self.send(Request::Restage)
+        self.send(Request::Restage(Expect::Any))
+    }
+
+    /// `restage`, only if the clipboard is as `expect` says.
+    pub fn restage_guarded(&self, expect: Expect) -> Result<Ticket, ClipError> {
+        self.send(Request::Restage(expect))
+    }
+
+    /// Writes the kept rollback copy back if `when` holds at that moment; otherwise the copy
+    /// is dropped (someone else's data is there) and the reply is [`ClipError::Changed`].
+    /// Reply: [`Done::Restored`], or [`ClipError::Partial`] (copy kept for another try).
+    pub fn rollback(&self, when: Rollback) -> Result<Ticket, ClipError> {
+        self.send(Request::Rollback(when))
+    }
+
+    /// Drops the rollback copy: the user copied something, never write over it.
+    pub fn abandon(&self) -> Result<Ticket, ClipError> {
+        self.send(Request::Abandon)
+    }
+
+    /// Is the staging of `ticket` still what the clipboard holds (our window owns it and
+    /// nobody wrote since)? Window manager state and our own facts only: cheap, any thread.
+    pub fn owns_staging(&self, ticket: Ticket) -> bool {
+        let staged = self.client.shared.lock().staged;
+        let ours = staged.is_some_and(|s| s.ticket == ticket && s.overwritten_at.is_none());
+        // SAFETY: no arguments; reads window manager state, no open clipboard needed.
+        let owner = unsafe { GetClipboardOwner() }.ok();
+        ours && owner == Some(hwnd(self.client.window))
     }
 
     /// Writes the snapshot back. With `if_sequence`, writes only if the clipboard's sequence
@@ -732,9 +841,11 @@ impl Shared {
 
 enum Request {
     Snapshot,
-    Stage(Payload),
-    Restage,
+    Stage(Payload, Expect, Option<Snapshot>),
+    Restage(Expect),
     Restore(Snapshot, RestoreGuard),
+    Rollback(Rollback),
+    Abandon,
     InspectImage(
         ClipboardChange,
         Instant,
@@ -796,6 +907,13 @@ struct Owner {
     own: VecDeque<u32>,
     /// Last sequence number a `WM_CLIPBOARDUPDATE` was handled for.
     last_seen: u32,
+    /// The user's clipboard to put back over our staging (see `Clipboard::stage_guarded`).
+    rollback: Option<Snapshot>,
+    /// Our own partial restore still on the clipboard: (sequence under the lock, after).
+    partial: Option<(u32, u32)>,
+    /// Our own writes: sequence under the lock and after `CloseClipboard`, so a guard given
+    /// either one recognises the same state.
+    pairs: VecDeque<(u32, u32)>,
 }
 
 struct Stage {
@@ -824,6 +942,49 @@ impl Owner {
             self.own.pop_front();
         }
         self.own.push_back(sequence);
+    }
+
+    fn remember_pair(&mut self, held: u32, after: u32) {
+        if self.pairs.len() == OWN_SEQUENCES {
+            self.pairs.pop_front();
+        }
+        self.pairs.push_back((held, after));
+    }
+
+    /// Is `current` the state named by `expected` (directly, or as the after-close number of
+    /// the same write of ours)?
+    fn same_state(&self, expected: u32, current: u32) -> bool {
+        expected == current
+            || self
+                .pairs
+                .iter()
+                .any(|&(held, after)| held == expected && after == current)
+    }
+}
+
+/// Our staging, or our own partial restore, is what the clipboard holds now.
+fn own_staging(window: HWND) -> bool {
+    // SAFETY: no arguments; reads window manager state.
+    let owner_is_us = unsafe { GetClipboardOwner() }.is_ok_and(|owner| owner == window);
+    let current = sequence();
+    owner_is_us
+        && with_owner(|o| {
+            o.stage.as_ref().is_some_and(|s| s.owned)
+                || o.partial
+                    .is_some_and(|(held, after)| current == held || current == after)
+        })
+        .unwrap_or(false)
+}
+
+/// Does the clipboard (open by this thread) hold what `expect` says?
+fn expected(window: HWND, expect: Expect) -> bool {
+    match expect {
+        Expect::Any => true,
+        Expect::Sequence(s) => {
+            let current = sequence();
+            with_owner(|o| o.same_state(s, current)).unwrap_or(s == current)
+        }
+        Expect::OwnStaging => own_staging(window),
     }
 }
 
@@ -859,6 +1020,9 @@ fn run(
             stage: None,
             own: VecDeque::new(),
             last_seen: sequence(),
+            rollback: None,
+            partial: None,
+            pairs: VecDeque::new(),
         })
     });
     // SAFETY: our own window, on its thread.
@@ -906,6 +1070,11 @@ fn run(
             }
         }
     }
+    // Stopping with our staging still on the clipboard: put the user's clipboard back. A
+    // stage that was queued but did not run was answered `Stopped` above and wrote nothing.
+    if with_owner(|o| o.rollback.is_some()).unwrap_or(false) {
+        let _ = write_rollback(window, Rollback::OwnStaging);
+    }
     // SAFETY: our own window, on its thread. `DestroyWindow` sends `WM_RENDERALLFORMATS`
     // while we still own delayed formats; `OWNER` is still set for it.
     unsafe {
@@ -934,14 +1103,26 @@ fn execute(window: HWND, command: Command) -> Option<Reply> {
         }
         _ if queued.elapsed() > STALE_AFTER => Err(ClipError::Stale),
         Request::Snapshot => take_snapshot(window).map(Done::Snapshot),
-        Request::Stage(payload) => {
-            write_stage(window, ticket, Some(payload)).map(|sequence| Done::Staged { sequence })
+        Request::Stage(payload, expect, rollback) => {
+            write_stage(window, ticket, Some(payload), expect, rollback)
+                .map(|sequence| Done::Staged { sequence })
         }
-        Request::Restage => {
-            write_stage(window, ticket, None).map(|sequence| Done::Staged { sequence })
-        }
+        Request::Restage(expect) => write_stage(window, ticket, None, expect, None)
+            .map(|sequence| Done::Staged { sequence }),
         Request::Restore(snapshot, guard) => {
             write_restore(window, &snapshot, guard).map(|sequence| Done::Restored { sequence })
+        }
+        Request::Rollback(when) => {
+            write_rollback(window, when).map(|sequence| Done::Restored { sequence })
+        }
+        Request::Abandon => {
+            with_owner(|owner| {
+                owner.rollback = None;
+                owner.partial = None;
+            });
+            Ok(Done::Restored {
+                sequence: sequence(),
+            })
         }
     };
     Some(Reply { ticket, result })
@@ -1061,6 +1242,13 @@ fn on_render(format: u32) {
                 staged.first_read_at.get_or_insert(now);
                 staged.last_read_at = Some(now);
                 staged.last_reader = reader;
+                if let Some(slot) = staged.renders.iter_mut().find(|r| r.is_none()) {
+                    *slot = Some(Render {
+                        format,
+                        at: now,
+                        reader,
+                    });
+                }
             }
         });
     }
@@ -1233,23 +1421,36 @@ fn take_snapshot(window: HWND) -> Result<Snapshot, ClipError> {
         return Err(ClipError::OwnData);
     }
     let present = enumerate_formats()?;
+    // The time budget is checked between formats: one `GetClipboardData` that waits for a
+    // slow app to render cannot be cut short. The drop router gives up on its side after
+    // its own timeout (`PREPARE_TIMEOUT`), and requests queued meanwhile go stale.
     let built = build_snapshot(&present, SNAPSHOT_CAP, read_format, || {
         started.elapsed() > SNAPSHOT_TIME
     });
+    // Identity under the lock, after the reads (a source app's delayed render may advance
+    // it): nobody else can change the clipboard before `drop(open)`.
+    let held_sequence = sequence();
     drop(open);
     Ok(Snapshot(Arc::new(SnapshotData {
         formats: built.formats,
         skipped: built.skipped,
         lost: built.lost,
         total: built.total,
-        // Rule 4: after `CloseClipboard`.
+        // Rule 4: after `CloseClipboard`, for reports.
         sequence: sequence(),
+        held_sequence,
         taken_at: started,
     })))
 }
 
 /// `stage` (with a payload) or `restage` (without).
-fn write_stage(window: HWND, ticket: Ticket, payload: Option<Payload>) -> Result<u32, ClipError> {
+fn write_stage(
+    window: HWND,
+    ticket: Ticket,
+    payload: Option<Payload>,
+    expect: Expect,
+    rollback: Option<Snapshot>,
+) -> Result<u32, ClipError> {
     let ids = ids();
     let restage = payload.is_none();
     let payload = match payload {
@@ -1265,10 +1466,18 @@ fn write_stage(window: HWND, ticket: Ticket, payload: Option<Payload>) -> Result
         .map(|(format, bytes)| Ok((format, Global::new(&bytes)?)))
         .collect::<Result<Vec<_>, ClipError>>()?;
     let open = Open::new(window)?;
+    // B1: only over the state the caller saved (or our own staging); checked under the lock.
+    if !expected(window, expect) {
+        return Err(ClipError::Changed);
+    }
     let mut result = empty();
     let emptied = result.is_ok();
     if result.is_ok() {
         with_owner(|owner| {
+            if let Some(rollback) = rollback {
+                owner.rollback = Some(rollback);
+                owner.partial = None;
+            }
             let cache = match owner.stage.take() {
                 Some(old) if restage => old.cache,
                 _ => Vec::new(),
@@ -1296,17 +1505,26 @@ fn write_stage(window: HWND, ticket: Ticket, payload: Option<Payload>) -> Result
             let _ = empty();
         }
     }
+    // The identity of what we leave, under the lock (B2).
+    let held = sequence();
     drop(open);
-    // Rule 4: after `CloseClipboard`.
+    // Rule 4: after `CloseClipboard`, for reports.
     let sequence = sequence();
     let shared = with_owner(|owner| {
+        owner.remember_own(held);
         owner.remember_own(sequence);
+        owner.remember_pair(held, sequence);
         owner.shared.clone()
     })
     .ok_or(ClipError::Stopped)?;
     if let Err(err) = result {
+        if emptied {
+            // The empty clipboard we left is ours: a rollback "over our staging" may write
+            // over it (the copy kept from this stage is still there).
+            with_owner(|owner| owner.partial = Some((held, sequence)));
+        }
         shared.update(|facts| facts.staged = None);
-        return Err(after_empty(err, emptied, sequence));
+        return Err(after_empty(err, emptied, held));
     }
     let now = Instant::now();
     shared.update(|facts| match facts.staged.as_mut() {
@@ -1326,6 +1544,7 @@ fn write_stage(window: HWND, ticket: Ticket, payload: Option<Payload>) -> Result
                 last_read_at: None,
                 last_reader: None,
                 overwritten_at: None,
+                renders: [None; RENDER_LOG],
             })
         }
     });
@@ -1333,6 +1552,38 @@ fn write_stage(window: HWND, ticket: Ticket, payload: Option<Payload>) -> Result
 }
 
 fn write_restore(window: HWND, snapshot: &Snapshot, guard: RestoreGuard) -> Result<u32, ClipError> {
+    write_snapshot(window, snapshot, |current, own| guard.allows(current, own))
+}
+
+/// `rollback`: the kept copy, if `when` holds. A refusal drops the copy (someone else's data
+/// is there now and is never written over).
+fn write_rollback(window: HWND, when: Rollback) -> Result<u32, ClipError> {
+    let Some(snapshot) = with_owner(|o| o.rollback.clone()).flatten() else {
+        return Err(ClipError::NothingStaged);
+    };
+    let result = write_snapshot(window, &snapshot, |current, own| match when {
+        Rollback::OwnStaging => own,
+        Rollback::Sequence(s) => with_owner(|o| o.same_state(s, current)).unwrap_or(s == current),
+    });
+    if matches!(result, Ok(_) | Err(ClipError::Changed)) {
+        with_owner(|o| {
+            o.rollback = None;
+            o.partial = None;
+        });
+    }
+    result
+}
+
+/// Writes `snapshot` over the clipboard if `allowed(current sequence, own staging there)`,
+/// checked while it is open. All or nothing as far as the API allows (B6): if
+/// `EmptyClipboard` fails nothing changed and the staging stays; if a format fails the
+/// others are still written and [`ClipError::Partial`] says so, and our partial result counts
+/// as our own for the next try.
+fn write_snapshot(
+    window: HWND,
+    snapshot: &Snapshot,
+    allowed: impl FnOnce(u32, bool) -> bool,
+) -> Result<u32, ClipError> {
     let mut blocks = Vec::new();
     for saved in &snapshot.0.formats {
         blocks.push((saved.format, Global::new(&saved.bytes)?));
@@ -1342,29 +1593,34 @@ fn write_restore(window: HWND, snapshot: &Snapshot, guard: RestoreGuard) -> Resu
     }
     let open = Open::new(window)?;
     // Comparing while open is exact: nobody else can change the clipboard now.
-    // SAFETY: the clipboard is open by this thread.
-    let owner_is_us = unsafe { GetClipboardOwner() }.is_ok_and(|owner| owner == window);
-    let staged = with_owner(|o| o.stage.as_ref().is_some_and(|s| s.owned)).unwrap_or(false);
-    if !guard.allows(sequence(), owner_is_us && staged) {
+    if !allowed(sequence(), own_staging(window)) {
         return Err(ClipError::Changed);
     }
-    with_owner(|owner| owner.stage = None);
     empty()?;
-    let mut first_error = None;
+    with_owner(|owner| owner.stage = None);
+    let mut failed = 0;
     for (format, global) in blocks {
-        if let Err(err) = global.set(format) {
-            first_error.get_or_insert(err);
+        if global.set(format).is_err() {
+            failed += 1;
         }
     }
+    let held = sequence();
     drop(open);
     let sequence = sequence();
     if let Some(shared) = with_owner(|owner| {
+        owner.remember_own(held);
         owner.remember_own(sequence);
+        owner.remember_pair(held, sequence);
+        owner.partial = (failed > 0).then_some((held, sequence));
         owner.shared.clone()
     }) {
         shared.update(|facts| facts.staged = None);
     }
-    first_error.map_or(Ok(sequence), Err)
+    if failed > 0 {
+        Err(ClipError::Partial { failed })
+    } else {
+        Ok(sequence)
+    }
 }
 
 // MARK: Win32 helpers
@@ -1907,10 +2163,21 @@ fn build_snapshot(
 
     let kind = |i: usize| kind_of(present[i].0, present[i].1.as_deref());
     let content = plans.iter().any(|plan| *plan != Plan::Marker);
+    // An OLE object the restore cannot represent: its formats are there and the copy has
+    // no text of its own. Office puts "Object Descriptor" (and often "Embed Source") on every
+    // text copy, whose text, RTF and HTML come back the same; an Excel chart or an embedded
+    // object alone has only pictures besides the object.
+    let ole = present.iter().any(|(_, name)| {
+        name.as_deref()
+            .is_some_and(|n| OLE_OBJECT_FORMATS.iter().any(|o| o.eq_ignore_ascii_case(n)))
+    }) && !(0..present.len())
+        .any(|i| matches!(kind(i), Some(Kind::Text | Kind::RichText)));
     let lost = if over_cap {
         Some(Lost::OverCap)
     } else if timed_out {
         Some(Lost::OutOfTime)
+    } else if ole {
+        Some(Lost::OleObject)
     } else if content && kept.is_empty() {
         Some(Lost::Everything)
     } else {
@@ -1997,6 +2264,9 @@ mod tests {
             stage: None,
             own: VecDeque::new(),
             last_seen: 1,
+            rollback: None,
+            partial: None,
+            pairs: VecDeque::new(),
         };
         assert!(!owner.observe(1));
         assert!(owner.observe(2));
@@ -2213,6 +2483,66 @@ mod tests {
         assert_eq!(built.total, 42);
         assert_eq!(built.lost, None);
         assert_eq!(built.skipped.len(), 6);
+    }
+
+    #[test]
+    fn a_state_is_recognised_by_either_number_of_our_own_write() {
+        let mut owner = Owner {
+            shared: Arc::new(Shared {
+                facts: Mutex::new(Facts::default()),
+                wake: Box::new(|| {}),
+            }),
+            stage: None,
+            own: VecDeque::new(),
+            last_seen: 0,
+            rollback: None,
+            partial: None,
+            pairs: VecDeque::new(),
+        };
+        assert!(owner.same_state(7, 7));
+        assert!(!owner.same_state(7, 8));
+        // Our write was 7 under the lock and 8 after closing: both name it.
+        owner.remember_pair(7, 8);
+        assert!(owner.same_state(7, 8));
+        assert!(!owner.same_state(7, 9));
+        assert!(!owner.same_state(8, 7));
+    }
+
+    #[test]
+    fn a_word_text_copy_passes_but_an_ole_object_is_refused() {
+        // Word text: OLE formats alongside text, RTF and HTML.
+        let word = [
+            named(0xC001, "Object Descriptor"),
+            named(0xC005, "Embed Source"),
+            named(0xC006, "Link Source"),
+            named(0xC002, "Rich Text Format"),
+            named(0xC003, "HTML Format"),
+            plain(UNICODETEXT),
+        ];
+        let sizes = [(0xC002, 10), (0xC003, 20), (UNICODETEXT, 8)];
+        let built = build_snapshot(&word, 1000, fake_read(&sizes), || false);
+        assert_eq!(built.lost, None);
+        // An Excel chart: the object and its pictures.
+        let chart = [
+            named(0xC005, "Embed Source"),
+            named(0xC001, "Object Descriptor"),
+            named(0xC010, "PNG"),
+            plain(14),
+        ];
+        let built = build_snapshot(&chart, 1000, fake_read(&[(0xC010, 10)]), || false);
+        assert_eq!(built.lost, Some(Lost::OleObject));
+        // A linked or embedded object alone.
+        for name in [
+            "Native",
+            "OwnerLink",
+            "ObjectLink",
+            "Embedded Object",
+            "Link Source Descriptor",
+        ] {
+            let alone = [named(0xC020, name), plain(14)];
+            let built = build_snapshot(&alone, 1000, fake_read(&[]), || false);
+            assert_eq!(built.lost, Some(Lost::OleObject), "{name}");
+        }
     }
 
     #[test]
