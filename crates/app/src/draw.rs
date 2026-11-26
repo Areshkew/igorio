@@ -12,7 +12,7 @@ use tiny_skia::{
     Rect, Shader, SpreadMode, Stroke, Transform,
 };
 
-use crate::layout;
+use crate::layout::{self, CardSize};
 use crate::scene::{Leaving, Scene, SceneCard};
 
 /// How many reduced copies of source images are kept between frames.
@@ -32,6 +32,7 @@ struct CachedImage {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct CardKey {
     image: usize,
+    card_size: CardSize,
     width: u32,
     height: u32,
     tilt: u32,
@@ -90,7 +91,7 @@ pub struct Renderer {
     mask: Mask,
     /// Ping-pong buffer for the box blur.
     blur: Vec<u8>,
-    images: HashMap<(usize, u64), CachedImage>,
+    images: HashMap<(usize, u64, CardSize), CachedImage>,
     cards: HashMap<CardKey, CachedCard>,
     hint: Option<Arc<HintSprite>>,
     base: Option<StaticLayer>,
@@ -158,7 +159,7 @@ impl Renderer {
             && scene.hint.is_some()
             && scene.hint_opacity >= 1.0;
         if cacheable {
-            self.touch_static(&static_cards);
+            self.touch_static(&static_cards, scene.card_size);
             let hint = scene.hint.as_deref().unwrap_or_default();
             if let Some(full) = &self.full
                 && full.scale == scene.scale.to_bits()
@@ -184,7 +185,7 @@ impl Renderer {
                 &static_cards,
                 top_depth,
             );
-            self.touch_static(&static_cards);
+            self.touch_static(&static_cards, scene.card_size);
             if let Some(base) = &self.base {
                 if scene_opacity >= 256 {
                     pixmap.data_mut().copy_from_slice(base.pixmap.data());
@@ -232,13 +233,15 @@ impl Renderer {
             {
                 break;
             }
-            let Some((x, y, width, height)) = card_geometry(card, scene.scale) else {
+            let Some((x, y, width, height)) = card_geometry(card, scene.card_size, scene.scale)
+            else {
                 break;
             };
             let tilt = finite_tilt(card.tilt);
             cards.push(LayerCard {
                 key: CardKey {
                     image: Arc::as_ptr(&card.image) as usize,
+                    card_size: scene.card_size,
                     width: (width as f32).to_bits(),
                     height: (height as f32).to_bits(),
                     tilt: tilt.to_bits(),
@@ -253,12 +256,15 @@ impl Renderer {
         cards
     }
 
-    fn touch_static(&mut self, cards: &[LayerCard]) {
+    fn touch_static(&mut self, cards: &[LayerCard], card_size: CardSize) {
         for card in cards {
             if let Some(entry) = self.cards.get_mut(&card.key) {
                 entry.used = true;
             }
-            if let Some(entry) = self.images.get_mut(&(card.key.image, card.key.scale)) {
+            if let Some(entry) = self
+                .images
+                .get_mut(&(card.key.image, card.key.scale, card_size))
+            {
                 entry.used = true;
             }
         }
@@ -283,13 +289,14 @@ impl Renderer {
 
         let mut pixmap = Pixmap::new(width, height).expect("base layer");
         for (card, layer_card) in scene.cards.iter().zip(cards) {
-            let Some((_, _, cw, ch)) = card_geometry(card, scene.scale) else {
+            let Some((_, _, cw, ch)) = card_geometry(card, scene.card_size, scene.scale) else {
                 continue;
             };
             let radius = (theme::RADIUS_SM * scene.scale).clamp(0.0, cw.min(ch) / 2.0) as f32;
             let tilt = finite_tilt(card.tilt);
             let sprite = self.card_sprite(
                 &card.image,
+                scene.card_size,
                 scene.scale,
                 cw as f32,
                 ch as f32,
@@ -337,7 +344,7 @@ impl Renderer {
         pixmap: &mut Pixmap,
     ) {
         let depth = finite_depth(card.depth);
-        let Some((x, y, cw, ch)) = card_geometry(card, scene.scale) else {
+        let Some((x, y, cw, ch)) = card_geometry(card, scene.card_size, scene.scale) else {
             return;
         };
         let (x, y, cw, ch) = (x as f32, y as f32, cw as f32, ch as f32);
@@ -366,9 +373,13 @@ impl Renderer {
         let whole = depth.fract() == 0.0;
         // A fractional depth borrows the nearest whole-depth sprite and scales it.
         let sprite_depth = if whole { depth } else { depth.round().max(0.0) };
-        let Some((_, _, sprite_w, sprite_h)) =
-            card_geometry_at(&card.image, card.wobble, sprite_depth, scene.scale)
-        else {
+        let Some((_, _, sprite_w, sprite_h)) = card_geometry_at(
+            &card.image,
+            card.wobble,
+            sprite_depth,
+            scene.card_size,
+            scene.scale,
+        ) else {
             return;
         };
         let tilt = finite_tilt(card.tilt);
@@ -378,6 +389,7 @@ impl Renderer {
         let is_top = depth <= top_depth + f64::EPSILON;
         let sprite = self.card_sprite(
             &card.image,
+            scene.card_size,
             scene.scale,
             sprite_w as f32,
             sprite_h as f32,
@@ -471,6 +483,7 @@ impl Renderer {
     fn card_sprite(
         &mut self,
         image: &Arc<Image>,
+        card_size: CardSize,
         scale: f64,
         width: f32,
         height: f32,
@@ -482,6 +495,7 @@ impl Renderer {
     ) -> Arc<CardSprite> {
         let key = CardKey {
             image: Arc::as_ptr(image) as usize,
+            card_size,
             width: width.to_bits(),
             height: height.to_bits(),
             tilt: tilt.to_bits(),
@@ -498,13 +512,13 @@ impl Renderer {
             )
         });
         if let Some(sprite) = cached {
-            self.touch_image(image, scale);
+            self.touch_image(image, card_size, scale);
             return sprite;
         }
 
-        let sprite = Arc::new(
-            self.build_card_sprite(image, scale, width, height, radius, tilt, s, is_top, badge),
-        );
+        let sprite = Arc::new(self.build_card_sprite(
+            image, card_size, scale, width, height, radius, tilt, s, is_top, badge,
+        ));
         if self.cards.len() >= CACHE_LIMIT {
             self.cards.clear();
         }
@@ -519,8 +533,8 @@ impl Renderer {
         sprite
     }
 
-    fn touch_image(&mut self, image: &Arc<Image>, scale: f64) {
-        let key = (Arc::as_ptr(image) as usize, scale.to_bits());
+    fn touch_image(&mut self, image: &Arc<Image>, card_size: CardSize, scale: f64) {
+        let key = (Arc::as_ptr(image) as usize, scale.to_bits(), card_size);
         if let Some(entry) = self.images.get_mut(&key)
             && entry.source.as_ptr() == Arc::as_ptr(image)
         {
@@ -532,6 +546,7 @@ impl Renderer {
     fn build_card_sprite(
         &mut self,
         image: &Arc<Image>,
+        card_size: CardSize,
         scale: f64,
         width: f32,
         height: f32,
@@ -630,7 +645,7 @@ impl Renderer {
         let layer_path = local_path
             .clone()
             .transform(Transform::from_translate(pad, pad));
-        let reduced = self.reduced_image(image, scale);
+        let reduced = self.reduced_image(image, card_size, scale);
         let reduced_w = reduced.width() as f32;
         let reduced_h = reduced.height() as f32;
         let image_to_layer =
@@ -718,7 +733,8 @@ impl Renderer {
             .iter()
             .filter_map(|card| {
                 let shrink = 1.0 - finite_depth(card.depth) * 0.05;
-                fitted_card_size(&card.image, shrink, scale).map(|(_, height)| height)
+                fitted_card_size(&card.image, shrink, scene.card_size, scale)
+                    .map(|(_, height)| height)
             })
             .fold(0.0f64, f64::max);
         if tallest <= 0.0 {
@@ -731,9 +747,9 @@ impl Renderer {
             .cards
             .iter()
             .find(|card| finite_depth(card.depth) <= top_depth + f64::EPSILON)
-            .and_then(|card| fitted_card_size(&card.image, 1.0, scale))
-            .map_or(layout::THUMB_MAX.width, |(width, _)| width);
-        let centre_x = ((layout::INSET_X + top_width / 2.0) * scale) as f32;
+            .and_then(|card| fitted_card_size(&card.image, 1.0, scene.card_size, scale))
+            .map_or(scene.card_size.thumb_max().width, |(width, _)| width);
+        let centre_x = ((scene.card_size.inset_x() + top_width / 2.0) * scale) as f32;
         let anchor_y = ((layout::INSET + tallest + 7.0) * scale) as f32;
         let x = ((centre_x - sprite.pixmap.width() as f32 / 2.0).round() as i32).max(0);
         let y = (anchor_y + sprite.origin_y as f32).round() as i32;
@@ -825,8 +841,13 @@ impl Renderer {
         }
     }
 
-    fn reduced_image(&mut self, image: &Arc<Image>, scale: f64) -> Arc<Pixmap> {
-        let key = (Arc::as_ptr(image) as usize, scale.to_bits());
+    fn reduced_image(
+        &mut self,
+        image: &Arc<Image>,
+        card_size: CardSize,
+        scale: f64,
+    ) -> Arc<Pixmap> {
+        let key = (Arc::as_ptr(image) as usize, scale.to_bits(), card_size);
         if let Some(cached) = self.images.get_mut(&key)
             && cached.source.as_ptr() == Arc::as_ptr(image)
             && cached.source.strong_count() > 0
@@ -835,7 +856,7 @@ impl Renderer {
             return cached.reduced.clone();
         }
 
-        let (width, height) = fitted_card_size(image, 1.0, scale).unwrap_or((1.0, 1.0));
+        let (width, height) = fitted_card_size(image, 1.0, card_size, scale).unwrap_or((1.0, 1.0));
         let reduced = Arc::new(reduce_image(
             image,
             width.round().max(1.0) as u32,
@@ -921,18 +942,30 @@ fn leave_progress(progress: f64) -> f64 {
     }
 }
 
-/// Fits `THUMB_MAX * shrink` and adds the stack offset and wobble, in physical pixels.
-fn card_geometry(card: &SceneCard, scale: f64) -> Option<(f64, f64, f64, f64)> {
-    card_geometry_at(&card.image, card.wobble, finite_depth(card.depth), scale)
+/// Fits `card_size.thumb_max() * shrink` and adds the stack offset and wobble, in physical
+/// pixels.
+fn card_geometry(
+    card: &SceneCard,
+    card_size: CardSize,
+    scale: f64,
+) -> Option<(f64, f64, f64, f64)> {
+    card_geometry_at(
+        &card.image,
+        card.wobble,
+        finite_depth(card.depth),
+        card_size,
+        scale,
+    )
 }
 
 fn card_geometry_at(
     image: &Image,
     wobble: f64,
     depth: f64,
+    card_size: CardSize,
     scale: f64,
 ) -> Option<(f64, f64, f64, f64)> {
-    let (width, height) = fitted_card_size(image, shrink(depth), scale)?;
+    let (width, height) = fitted_card_size(image, shrink(depth), card_size, scale)?;
 
     let wobble = wobble.clamp(0.0, 1.0);
     let wobble_x = if wobble > 0.0 {
@@ -940,19 +973,25 @@ fn card_geometry_at(
     } else {
         0.0
     };
-    let x = (layout::INSET_X + depth * 3.0 + wobble_x) * scale;
+    let x = (card_size.inset_x() + depth * 3.0 + wobble_x) * scale;
     let y = (layout::INSET - depth * 4.0) * scale;
     Some((x, y, width, height))
 }
 
-fn fitted_card_size(image: &Image, shrink: f64, scale: f64) -> Option<(f64, f64)> {
+fn fitted_card_size(
+    image: &Image,
+    shrink: f64,
+    card_size: CardSize,
+    scale: f64,
+) -> Option<(f64, f64)> {
     let image_w = image.width as f64;
     let image_h = image.height as f64;
     if image_w <= 0.0 || image_h <= 0.0 {
         return None;
     }
-    let max_w = (layout::THUMB_MAX.width * shrink).max(1.0);
-    let max_h = (layout::THUMB_MAX.height * shrink).max(1.0);
+    let thumb_max = card_size.thumb_max();
+    let max_w = (thumb_max.width * shrink).max(1.0);
+    let max_h = (thumb_max.height * shrink).max(1.0);
     let fit = (max_w / image_w).min(max_h / image_h);
     Some((
         (image_w * fit * scale).round().max(1.0),
@@ -1580,6 +1619,7 @@ mod tests {
             hint: hint.map(str::to_string),
             hint_opacity: 1.0,
             opacity: 1.0,
+            card_size: CardSize::Small,
             scale: 1.0,
         }
     }

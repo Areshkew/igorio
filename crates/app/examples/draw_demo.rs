@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use igorio_app::draw::Renderer;
+use igorio_app::layout::CardSize;
 use igorio_app::scene::{Leaving, Scene, SceneCard};
 use igorio_kit::Image;
 use tiny_skia::Pixmap;
@@ -103,6 +104,17 @@ fn main() {
     }
     save(&dir, "11-restack.png", &restack);
 
+    for (name, size) in [
+        ("12-size-small.png", CardSize::Small),
+        ("13-size-medium.png", CardSize::Medium),
+        ("14-size-large.png", CardSize::Large),
+    ] {
+        let mut pile = three(&wide, &tall, &square, 1.25);
+        pile.hint = Some("3 held · shake to discard".to_string());
+        pile.card_size = size;
+        save(&dir, name, &pile);
+    }
+
     let four_a = four.with_scale(1.0);
     let four_b = four.with_scale(2.0);
     measure(&four_a);
@@ -117,6 +129,7 @@ fn scene(cards: Vec<SceneCard>, hint: Option<&str>, scale: f64) -> Scene {
         hint: hint.map(str::to_string),
         hint_opacity: 1.0,
         opacity: 1.0,
+        card_size: CardSize::Small,
         scale,
     }
 }

@@ -18,6 +18,8 @@ use windows::Win32::UI::Shell::{
     FOLDERID_Documents, FOLDERID_Screenshots, KF_FLAG_DONT_VERIFY, SHGetKnownFolderPath,
 };
 
+use crate::layout::CardSize;
+
 /// Sub-folder of Documents where notes are kept by default.
 const NOTES_FOLDER_NAME: &str = "Fairy Notes";
 /// Counter used to give temp files distinct names within one process.
@@ -34,6 +36,19 @@ pub struct Settings {
     /// Save every screenshot to the captures folder as it is taken. Default false.
     pub keep_every_screenshot: bool,
     pub launch_at_login: bool,
+    /// Size of the screenshot cards. An unknown value is ignored and gives the default.
+    #[serde(default, deserialize_with = "card_size_or_default")]
+    pub card_size: CardSize,
+}
+
+/// Reads one card size, falling back to the default for an unknown or malformed value so a
+/// bad `card_size` does not make the whole settings file fall back to defaults.
+fn card_size_or_default<'de, D>(deserializer: D) -> Result<CardSize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 impl Settings {

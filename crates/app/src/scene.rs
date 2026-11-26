@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use igorio_kit::Image;
 
+use crate::layout::CardSize;
+
 /// How a card is leaving, with progress from 0.0 (just started) to 1.0 (gone).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Leaving {
@@ -43,6 +45,8 @@ pub struct Scene {
     pub hint_opacity: f64,
     /// 0.0 to 1.0 for the whole overlay (0 while a system capture UI is up).
     pub opacity: f64,
+    /// The card size the user chose.
+    pub card_size: CardSize,
     /// Physical pixels per logical pixel (1.0 at 96 DPI, 1.25 at 120 DPI).
     pub scale: f64,
 }

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use igorio_app::draw::{Renderer, movie_label};
+use igorio_app::layout::CardSize;
 use igorio_app::scene::{Leaving, Scene, SceneCard};
 use igorio_kit::Image;
 use tiny_skia::Pixmap;
@@ -33,6 +34,7 @@ fn scene(cards: Vec<SceneCard>, hint: Option<&str>, scale: f64) -> Scene {
         hint: hint.map(str::to_string),
         hint_opacity: 1.0,
         opacity: 1.0,
+        card_size: CardSize::Small,
         scale,
     }
 }
@@ -154,6 +156,49 @@ fn scale_two_quadruples_the_card_area() {
     assert!(
         (ratio - 4.0).abs() <= 0.4,
         "expected about four times the pixels, got {ratio}"
+    );
+}
+
+#[test]
+fn changing_the_card_size_rebuilds_the_caches_and_small_comes_back_identical() {
+    let image = solid(1600, 1000, [210, 140, 90, 255]);
+    let build = |size| {
+        let mut scene = scene(vec![card(image.clone(), 0.0, 0.0)], None, 1.0);
+        scene.card_size = size;
+        scene
+    };
+    let small = build(CardSize::Small);
+    let large = build(CardSize::Large);
+
+    let mut renderer = Renderer::new();
+    let (width, height) = Renderer::pixmap_size(1.0);
+    let mut first = Pixmap::new(width, height).expect("first");
+    let mut big = Pixmap::new(width, height).expect("large");
+    let mut again = Pixmap::new(width, height).expect("small again");
+    renderer.render(&small, &mut first);
+    renderer.render(&large, &mut big);
+    renderer.render(&small, &mut again);
+    assert_eq!(
+        first.data(),
+        again.data(),
+        "returning to Small must draw exactly the first frame again"
+    );
+    assert_premultiplied(&first);
+    assert_premultiplied(&big);
+
+    let body_pixels = |pixmap: &Pixmap| {
+        pixmap
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[3] >= 250)
+            .count() as f64
+    };
+    let ratio = body_pixels(&big) / body_pixels(&first);
+    assert!(
+        (1.96 * 0.9..=1.96 * 1.1).contains(&ratio),
+        "a Large 16:10 card should cover about 1.96 times the pixels, got {ratio}"
     );
 }
 

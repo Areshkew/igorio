@@ -1,12 +1,16 @@
 use igorio_app::follower::Follower;
-use igorio_app::layout::{INSET_X, THUMB_MAX};
+use igorio_app::layout::{CardSize, PANEL_SIZE};
 use igorio_core::geom::{Point, Rect};
 
 const SCREEN: Rect = Rect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 };
 const MIDDLE: Point = Point { x: 960.0, y: 540.0 };
-/// The box the follower keeps on screen, logical px (see `target_origin`).
-const CONTENT_W: f64 = THUMB_MAX.width + 14.0;
-const CONTENT_H: f64 = THUMB_MAX.height + 40.0;
+/// The follow box for the default Small card, logical px (see `target_origin`).
+const THUMB_W: f64 = CardSize::Small.thumb_max().width;
+const THUMB_H: f64 = CardSize::Small.thumb_max().height;
+const CONTENT_W: f64 = THUMB_W + 14.0;
+const CONTENT_H: f64 = THUMB_H + 40.0;
+/// Horizontal inset that centres a Small card in the panel.
+const INSET_X: f64 = (PANEL_SIZE.width - THUMB_W) / 2.0;
 /// Flipped window origin for a mouse at (1900, 1000) at scale 1.0.
 const FLIPPED_X: f64 = 1900.0 - 14.0 - CONTENT_W - INSET_X;
 const FLIPPED_Y: f64 = 1000.0 - 18.0 - CONTENT_H - 18.0;
@@ -43,6 +47,24 @@ fn near_the_right_edge_flips_to_the_left() {
     assert!(origin.x < mouse.x);
     // The whole content box now fits inside the work area.
     assert!(origin.x + INSET_X + CONTENT_W <= SCREEN.max_x());
+}
+
+#[test]
+fn a_large_follower_flips_earlier_near_the_right_edge() {
+    let small = Follower::new();
+    let mut large = Follower::new();
+    large.card_size = CardSize::Large;
+    // At x = 1800 a Small box still fits (1800 + 14 + 94 = 1908), a Large one does not
+    // (1800 + 14 + 126 = 1940).
+    let mouse = Point::new(1800.0, 540.0);
+    let small_origin = small.target_origin(mouse, SCREEN, 1.0);
+    let large_origin = large.target_origin(mouse, SCREEN, 1.0);
+    assert_eq!(small_origin.x, mouse.x + 14.0 - INSET_X, "Small still sits right");
+    assert!(large_origin.x < mouse.x, "Large already flips to the left");
+    assert_eq!(
+        large_origin.x,
+        1800.0 - 14.0 - (112.0 + 14.0) - (300.0 - 112.0) / 2.0
+    );
 }
 
 #[test]

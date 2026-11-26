@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use igorio_app::layout::CardSize;
 use igorio_app::scene::{Leaving, SceneCard};
 use igorio_app::state::FairyState;
 use igorio_core::geom::CardId;
@@ -47,6 +48,18 @@ fn hold_shows_shake_hint_then_it_clears() {
     assert_eq!(state.hint(), Some("shake to discard"));
     state.tick(2.4);
     assert_eq!(state.hint(), None);
+}
+
+#[test]
+fn card_size_starts_small_and_reaches_the_scene_at_once() {
+    let mut state = FairyState::new(1);
+    hold(&mut state, 0.0);
+    assert_eq!(state.card_size(), CardSize::Small);
+    assert_eq!(state.scene(0.0, 1.0).card_size, CardSize::Small);
+
+    state.set_card_size(CardSize::Large, 0.0);
+    assert_eq!(state.card_size(), CardSize::Large);
+    assert_eq!(state.scene(0.0, 1.0).card_size, CardSize::Large);
 }
 
 #[test]

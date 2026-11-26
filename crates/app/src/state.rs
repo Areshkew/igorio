@@ -18,7 +18,7 @@ use igorio_core::geom::CardId;
 use igorio_core::pile::{HeldPile, LeaveStyle, ReleaseReason};
 use igorio_kit::{HeldCard, Image};
 
-use crate::layout;
+use crate::layout::{self, CardSize};
 use crate::scene::{Leaving, Scene, SceneCard};
 
 /// How long a hint takes to fade in, and to fade out.
@@ -136,6 +136,7 @@ pub struct FairyState {
     next_seq: u64,
     next_card_id: u64,
     rng: u64,
+    card_size: CardSize,
 }
 
 impl FairyState {
@@ -166,6 +167,7 @@ impl FairyState {
             } else {
                 seed
             },
+            card_size: CardSize::default(),
         }
     }
 
@@ -216,6 +218,16 @@ impl FairyState {
 
     pub fn hidden_for_capture(&self) -> bool {
         self.hidden_for_capture
+    }
+
+    /// The card size; the next frame is drawn at it.
+    pub fn card_size(&self) -> CardSize {
+        self.card_size
+    }
+
+    /// Changes the card size. There is no animation: the next frame draws the new size.
+    pub fn set_card_size(&mut self, size: CardSize, _now: f64) {
+        self.card_size = size;
     }
 
     /// The fairy steps out of the way while the system capture UI is up.
@@ -517,6 +529,7 @@ impl FairyState {
             hint,
             hint_opacity,
             opacity: self.opacity_now(now),
+            card_size: self.card_size,
             scale,
         }
     }

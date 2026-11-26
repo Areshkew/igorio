@@ -12,14 +12,15 @@
 //!   grows downward from its top edge.
 //! - Swift's panel origin is the bottom-left, so it adds the inset and subtracts the panel
 //!   height. The Windows window origin is the top-left, and the content top-left is inset
-//!   from it on both axes: `origin = contentTopLeft - (INSET_X, INSET)`.
+//!   from it on both axes: `origin = contentTopLeft - (inset_x, INSET)`.
 //!
-//! All logical values (offset, `THUMB_MAX`, `INSET`) are multiplied by `scale`, the monitor's
-//! physical pixels per logical pixel, before they meet physical mouse/work-area coordinates.
+//! All logical values (offset, the card size, `INSET`) are multiplied by `scale`, the
+//! monitor's physical pixels per logical pixel, before they meet physical mouse/work-area
+//! coordinates.
 
 use igorio_core::geom::{Point, Rect, Vector};
 
-use crate::layout::{INSET, INSET_X, THUMB_MAX};
+use crate::layout::{CardSize, INSET};
 
 /// Default offset of the content's top-left from the cursor hotspot, logical px.
 const DEFAULT_OFFSET: Vector = Vector::new(14.0, 18.0);
@@ -34,6 +35,8 @@ pub struct Follower {
     pub offset: Vector,
     /// Response speed in 1/s; higher snaps faster. Default 16.
     pub stiffness: f64,
+    /// Card size used for the flip box (the tallest/widest card plus padding).
+    pub card_size: CardSize,
     /// Window origin (top-left, physical px); the smoothed position.
     position: Point,
     /// Last origin handed to the caller, so tiny moves are not reported twice.
@@ -55,8 +58,9 @@ impl Follower {
     /// flipping to the left and/or above when it would leave `work_area`.
     pub fn target_origin(&self, mouse: Point, work_area: Rect, scale: f64) -> Point {
         // Sizes and offsets are logical; the cursor and work area are physical.
-        let content_w = (THUMB_MAX.width + CONTENT_PAD_X) * scale;
-        let content_h = (THUMB_MAX.height + CONTENT_PAD_Y) * scale;
+        let thumb_max = self.card_size.thumb_max();
+        let content_w = (thumb_max.width + CONTENT_PAD_X) * scale;
+        let content_h = (thumb_max.height + CONTENT_PAD_Y) * scale;
         let offset_x = self.offset.dx * scale;
         let offset_y = self.offset.dy * scale;
         let inset = INSET * scale;
@@ -77,7 +81,7 @@ impl Follower {
         }
 
         // The window top-left is the content top-left minus the insets.
-        Point::new(x - INSET_X * scale, y - inset)
+        Point::new(x - self.card_size.inset_x() * scale, y - inset)
     }
 
     /// Advances by `dt` seconds (clamped to 0.0..=0.05; NaN counts as 0).
@@ -140,6 +144,7 @@ impl Default for Follower {
         Self {
             offset: DEFAULT_OFFSET,
             stiffness: DEFAULT_STIFFNESS,
+            card_size: CardSize::default(),
             position: Point::ZERO,
             reported: Point::ZERO,
             started: false,

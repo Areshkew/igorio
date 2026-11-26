@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use igorio_app::layout::CardSize;
 use igorio_app::settings::{DefaultFolders, Settings, default_settings_path};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -49,10 +50,30 @@ fn defaults_are_empty_and_off() {
     assert_eq!(settings.captures_folder, None);
     assert!(!settings.keep_every_screenshot);
     assert!(!settings.launch_at_login);
+    assert_eq!(settings.card_size, CardSize::Small);
     assert_eq!(
         settings,
         Settings::load(&PathBuf::from("does-not-exist-anywhere.json")).unwrap()
     );
+}
+
+#[test]
+fn an_unknown_card_size_keeps_the_other_settings() {
+    let scratch = Scratch::new("card-size");
+    let path = scratch.path("settings.json");
+    fs::write(
+        &path,
+        r#"{"card_size": "huge", "launch_at_login": true}"#,
+    )
+    .unwrap();
+
+    let settings = Settings::load(&path).unwrap();
+    assert_eq!(settings.card_size, CardSize::Small);
+    assert!(settings.launch_at_login, "the rest of the file must survive");
+    assert!(!scratch.path("settings.json.bad").exists(), "the file was parsed");
+
+    fs::write(&path, r#"{"card_size": "large"}"#).unwrap();
+    assert_eq!(Settings::load(&path).unwrap().card_size, CardSize::Large);
 }
 
 #[test]
