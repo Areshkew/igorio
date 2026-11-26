@@ -133,18 +133,24 @@ pub struct Snip {
 impl Snip {
     /// The app must keep the clipboard thread running until this detector is shut down.
     pub fn start(clipboard: &Clipboard) -> Result<Self> {
-        Self::start_with_folder(clipboard, None)
+        Self::starter(clipboard)()
+    }
+
+    /// Take a reader on the UI thread, then run the bounded hook startup on a worker.
+    pub fn starter(clipboard: &Clipboard) -> impl FnOnce() -> Result<Self> + Send + use<> {
+        let reader = clipboard.screenshot_reader();
+        move || Self::start_with_folder(reader, None)
     }
 
     /// Watch an explicit directory, for isolated tests.
     pub fn start_in_folder(clipboard: &Clipboard, path: PathBuf) -> Result<Self> {
-        Self::start_with_folder(clipboard, Some(path))
+        Self::start_with_folder(clipboard.screenshot_reader(), Some(path))
     }
 
-    fn start_with_folder(clipboard: &Clipboard, folder: Option<PathBuf>) -> Result<Self> {
+    fn start_with_folder(clipboard: ScreenshotClipboard, folder: Option<PathBuf>) -> Result<Self> {
         now(); // Initialise the epoch before any callback.
         let mut detector = Self {
-            clipboard: clipboard.screenshot_reader(),
+            clipboard,
             folder,
             output: Arc::new(Output {
                 wake: Event::new(false)?,
@@ -2364,6 +2370,12 @@ fn decode_dib(bytes: &[u8]) -> std::result::Result<Image, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_task_can_leave_the_clipboard_owner_thread() {
+        fn spawnable<T: Send + 'static>(_: impl FnOnce() -> Result<T> + Send + 'static) {}
+        let _: fn(&Clipboard) = |clipboard| spawnable(Snip::starter(clipboard));
+    }
 
     #[test]
     fn the_snipping_tools_temp_copy_is_not_a_saved_file() {

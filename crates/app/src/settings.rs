@@ -8,11 +8,12 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::{ffi::OsStringExt, fs::OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+use windows::Win32::Storage::FileSystem::{FILE_ADD_FILE, FILE_FLAG_BACKUP_SEMANTICS};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
     FOLDERID_Documents, FOLDERID_Screenshots, KF_FLAG_DONT_VERIFY, SHGetKnownFolderPath,
@@ -106,8 +107,8 @@ impl Settings {
         result
     }
 
-    /// The folder to use for notes: the chosen one if it is an absolute path that exists or
-    /// can be created, otherwise the default. The returned folder is created when possible.
+    /// The folder to use for notes: a writable absolute path, otherwise the default.
+    /// The returned folder is created when possible.
     /// Returns (folder, used_fallback).
     pub fn notes_dir(&self, defaults: &DefaultFolders) -> (PathBuf, bool) {
         pick_folder(self.notes_folder.as_deref(), &defaults.notes)
@@ -130,7 +131,7 @@ impl Settings {
 /// caller can report the error when writing.
 fn pick_folder(chosen: Option<&Path>, default: &Path) -> (PathBuf, bool) {
     match chosen {
-        Some(chosen) if chosen.is_absolute() && fs::create_dir_all(chosen).is_ok() => {
+        Some(chosen) if chosen.is_absolute() && writable_folder(chosen).is_ok() => {
             (chosen.to_path_buf(), false)
         }
         Some(_) => {
@@ -142,6 +143,16 @@ fn pick_folder(chosen: Option<&Path>, default: &Path) -> (PathBuf, bool) {
             (default.to_path_buf(), false)
         }
     }
+}
+
+fn writable_folder(folder: &Path) -> io::Result<()> {
+    fs::create_dir_all(folder)?;
+    // Request permission to add files through a directory handle. This writes no probe file.
+    fs::OpenOptions::new()
+        .access_mode(FILE_ADD_FILE.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(folder)?;
+    Ok(())
 }
 
 /// The first free name for the copy of an unparsable file: `<file name>.bad`, then
@@ -228,5 +239,22 @@ fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
         let result = OsString::from_wide(path.as_wide());
         CoTaskMemFree(Some(path.0.cast()));
         Some(PathBuf::from(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_probe_creates_the_directory_without_leaving_a_file() {
+        let folder = std::env::temp_dir().join(format!(
+            "igorio-folder-check-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        writable_folder(&folder).unwrap();
+        assert!(fs::read_dir(&folder).unwrap().next().is_none());
+        fs::remove_dir(folder).unwrap();
     }
 }

@@ -3571,6 +3571,7 @@ pub struct LiveEnv {
     wake: Arc<WakeEvent>,
     /// The one PNG saver thread (D2) and its job queue.
     saver: Option<(SyncSender<SaveJob>, std::thread::JoinHandle<()>)>,
+    settings: Settings,
     saved: Receiver<(u64, Result<PathBuf, String>)>,
     next_save: u64,
     log: DebugLog,
@@ -3590,7 +3591,7 @@ impl LiveEnv {
         let clip =
             Clipboard::start(move || clip_wake.set()).map_err(|e| format!("clipboard: {e}"))?;
         let (saves, saved) = mpsc::channel();
-        let saver = spawn_saver(settings, saves, wake.clone());
+        let saver = spawn_saver(saves, wake.clone());
         // Without the key watch typing cannot stop a delivery; the rest still works.
         let keys = KeyWatch::start().ok();
         Ok(LiveEnv {
@@ -3599,6 +3600,7 @@ impl LiveEnv {
             keys,
             wake,
             saver,
+            settings,
             saved,
             next_save: 1,
             log,
@@ -3706,11 +3708,11 @@ struct SaveJob {
     image: Arc<igorio_kit::Image>,
     scale: f64,
     captured_at: std::time::SystemTime,
+    settings: Settings,
 }
 
 /// The saver worker: one thread for every terminal-paste PNG, fed through a short queue.
 fn spawn_saver(
-    settings: Settings,
     done: Sender<(u64, Result<PathBuf, String>)>,
     wake: Arc<WakeEvent>,
 ) -> Option<(SyncSender<SaveJob>, std::thread::JoinHandle<()>)> {
@@ -3719,7 +3721,7 @@ fn spawn_saver(
         .name("paste-saver".into())
         .spawn(move || {
             while let Ok(job) = queue.recv() {
-                let folder = settings.pasted_dir(&DefaultFolders::from_system());
+                let folder = job.settings.pasted_dir(&DefaultFolders::from_system());
                 let result =
                     saver::save_screenshot(&job.image, job.scale, job.captured_at, &folder)
                         .map_err(|e| e.to_string());
@@ -3838,6 +3840,7 @@ impl Env for LiveEnv {
             image: card.image.clone(),
             scale: card.scale,
             captured_at: card.captured_at,
+            settings: self.settings.clone(),
         };
         // The folder lookup, the encode and the write run on the saver thread. With no
         // saver or a full queue the save fails at once and the paste says so.
@@ -3942,6 +3945,12 @@ impl Drops {
         self.env.as_ref()?.clip.as_ref()
     }
 
+    pub fn set_settings(&mut self, settings: &Settings) {
+        if let Some(env) = &mut self.env {
+            env.settings = settings.clone();
+        }
+    }
+
     /// One pass of the UI loop: the hook events, then every answer and reply, then the
     /// deadline. Returns true when the state changed (redraw).
     pub fn run(&mut self, events: &[MouseEvent], state: &mut FairyState, now: f64) -> bool {
@@ -3974,6 +3983,33 @@ impl Drop for Drops {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_saver_uses_the_capture_folder_from_each_job() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("paste-saver-test-{}", std::process::id()));
+        let (done, results) = mpsc::channel();
+        let (jobs, worker) = spawn_saver(done, Arc::new(WakeEvent::new().unwrap())).unwrap();
+        let image = Arc::new(igorio_kit::Image::new(1, 1, vec![0, 0, 0, 255]).unwrap());
+        for (id, name) in [(1, "first"), (2, "updated")] {
+            let folder = root.join(name);
+            jobs.send(SaveJob {
+                id,
+                image: image.clone(),
+                scale: 1.0,
+                captured_at: std::time::SystemTime::now(),
+                settings: Settings { captures_folder: Some(folder.clone()), ..Settings::default() },
+            }).unwrap();
+            let (actual_id, saved) = results.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(actual_id, id);
+            let saved = saved.unwrap();
+            assert_eq!(saved.parent(), Some(folder.join("Pasted").as_path()));
+            std::fs::remove_file(saved).unwrap();
+        }
+        drop(jobs);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn paths_are_quoted_for_windows_shells() {
