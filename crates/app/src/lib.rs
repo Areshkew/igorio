@@ -6,6 +6,8 @@ pub mod scene;
 
 pub mod clipboard;
 pub mod draw;
+pub mod drop_router;
+pub mod explorer;
 pub mod follower;
 pub mod hook;
 pub mod input;
