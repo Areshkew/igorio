@@ -648,6 +648,11 @@ impl Renderer {
         self.mask.clear();
         self.mask.data_mut().copy_from_slice(&self.hint_alpha);
         box_blur_3(&mut self.mask, &mut self.blur, blur_radius);
+        // Thin glyphs blur to a faint haze, which makes the text look out of focus. Boost
+        // the halo so it is a compact light plate under the text.
+        for alpha in self.mask.data_mut() {
+            *alpha = (*alpha as u32 * 3).min(255) as u8;
+        }
         let glow = Paint {
             shader: Shader::SolidColor(Color::from_rgba8(
                 255,
