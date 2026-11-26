@@ -72,6 +72,16 @@ struct StaticLayer {
     pixmap: Pixmap,
 }
 
+/// A fully static frame: the cached cards plus a fully shown hint. Lets the resting
+/// overlay be one bitmap copy instead of a card layer plus a hint blit.
+struct FullFrame {
+    scale: u64,
+    cards: Vec<LayerCard>,
+    hint: String,
+    hint_opacity: u64,
+    pixmap: Pixmap,
+}
+
 pub struct Renderer {
     semibold: Font,
     /// Card content (image plus badge) drawn unrotated before it is placed in the sprite.
@@ -84,6 +94,7 @@ pub struct Renderer {
     cards: HashMap<CardKey, CachedCard>,
     hint: Option<Arc<HintSprite>>,
     base: Option<StaticLayer>,
+    full: Option<FullFrame>,
     #[cfg(test)]
     reductions: usize,
 }
@@ -102,6 +113,7 @@ impl Renderer {
             cards: HashMap::new(),
             hint: None,
             base: None,
+            full: None,
             #[cfg(test)]
             reductions: 0,
         }
@@ -119,48 +131,105 @@ impl Renderer {
 
     /// Clears `pixmap` to transparent and paints `scene` into it.
     pub fn render(&mut self, scene: &Scene, pixmap: &mut Pixmap) {
-        pixmap.fill(Color::TRANSPARENT);
         self.evict_caches();
 
         let scale = scene.scale;
         if !scale.is_finite() || scale <= 0.0 {
+            pixmap.fill(Color::TRANSPARENT);
             return;
         }
         let expected = Self::pixmap_size(scale);
         if pixmap.width() != expected.0 || pixmap.height() != expected.1 {
+            pixmap.fill(Color::TRANSPARENT);
             return;
         }
         if scene.cards.is_empty() || scene.opacity <= 0.0 {
+            pixmap.fill(Color::TRANSPARENT);
             return;
         }
 
         let s = scale as f32;
         let scene_opacity = opacity_units(scene.opacity);
-        let static_cards = self.static_prefix(scene);
+        let top_depth = lowest_depth(&scene.cards);
+        let static_cards = self.static_prefix(scene, top_depth);
         let prefix = static_cards.len();
+        let cacheable = scene_opacity >= 256
+            && prefix == scene.cards.len()
+            && scene.hint.is_some()
+            && scene.hint_opacity >= 1.0;
+        if cacheable {
+            self.touch_static(&static_cards);
+            let hint = scene.hint.as_deref().unwrap_or_default();
+            if let Some(full) = &self.full
+                && full.scale == scene.scale.to_bits()
+                && full.cards == static_cards
+                && full.hint == hint
+                && full.hint_opacity == scene.hint_opacity.to_bits()
+                && full.pixmap.width() == pixmap.width()
+                && full.pixmap.height() == pixmap.height()
+            {
+                pixmap.data_mut().copy_from_slice(full.pixmap.data());
+                return;
+            }
+        }
+        // A full-opacity base copy already overwrites every pixel, so the transparent
+        // fill is only needed when the base is missing or has to be blended in.
+        let mut cleared = false;
         if prefix > 0 {
-            self.ensure_base(scene, s, pixmap.width(), pixmap.height(), &static_cards);
+            self.ensure_base(
+                scene,
+                s,
+                pixmap.width(),
+                pixmap.height(),
+                &static_cards,
+                top_depth,
+            );
             self.touch_static(&static_cards);
             if let Some(base) = &self.base {
                 if scene_opacity >= 256 {
                     pixmap.data_mut().copy_from_slice(base.pixmap.data());
                 } else {
+                    pixmap.fill(Color::TRANSPARENT);
                     blit_sprite(&base.pixmap, pixmap, 0, 0, scene_opacity);
                 }
+                cleared = true;
             }
         }
+        if !cleared {
+            pixmap.fill(Color::TRANSPARENT);
+        }
         for card in &scene.cards[prefix..] {
-            self.draw_card(scene, card, s, scene_opacity, pixmap);
+            self.draw_card(scene, card, top_depth, s, scene_opacity, pixmap);
         }
         if let Some(hint) = &scene.hint {
-            self.draw_hint(scene, hint, s, scene_opacity, pixmap);
+            self.draw_hint(scene, hint, top_depth, s, scene_opacity, pixmap);
+        }
+        if cacheable {
+            let mut pixmap_copy = Pixmap::new(pixmap.width(), pixmap.height()).expect("full frame");
+            pixmap_copy.data_mut().copy_from_slice(pixmap.data());
+            self.full = Some(FullFrame {
+                scale: scene.scale.to_bits(),
+                cards: static_cards,
+                hint: scene.hint.clone().unwrap_or_default(),
+                hint_opacity: scene.hint_opacity.to_bits(),
+                pixmap: pixmap_copy,
+            });
         }
     }
 
-    fn static_prefix(&self, scene: &Scene) -> Vec<LayerCard> {
+    fn static_prefix(&self, scene: &Scene, top_depth: f64) -> Vec<LayerCard> {
         let mut cards = Vec::new();
         for card in &scene.cards {
-            if card.leaving.is_some() || card.wobble > 0.0 || card.wobble.is_nan() {
+            let depth = finite_depth(card.depth);
+            // Only a card at rest can join the cached layer: whole depth, fully appeared,
+            // and not wobbling or leaving.
+            if card.leaving.is_some()
+                || card.wobble > 0.0
+                || card.wobble.is_nan()
+                || appear_value(card.appear) < 1.0
+                || depth.fract() != 0.0
+                || depth >= layout::VISIBLE_CARDS as f64
+            {
                 break;
             }
             let Some((x, y, width, height)) = card_geometry(card, scene.scale) else {
@@ -174,7 +243,7 @@ impl Renderer {
                     height: (height as f32).to_bits(),
                     tilt: tilt.to_bits(),
                     scale: scene.scale.to_bits(),
-                    top: card.depth == 0,
+                    top: depth <= top_depth + f64::EPSILON,
                     badge: badge_key(card.movie),
                 },
                 x: (x as f32).round() as i32,
@@ -195,7 +264,15 @@ impl Renderer {
         }
     }
 
-    fn ensure_base(&mut self, scene: &Scene, s: f32, width: u32, height: u32, cards: &[LayerCard]) {
+    fn ensure_base(
+        &mut self,
+        scene: &Scene,
+        s: f32,
+        width: u32,
+        height: u32,
+        cards: &[LayerCard],
+        top_depth: f64,
+    ) {
         let scale = scene.scale.to_bits();
         if let Some(base) = &self.base
             && base.scale == scale
@@ -219,7 +296,7 @@ impl Renderer {
                 radius,
                 tilt,
                 s,
-                card.depth == 0,
+                finite_depth(card.depth) <= top_depth + f64::EPSILON,
                 badge_key(card.movie),
             );
             blit_sprite(
@@ -254,16 +331,23 @@ impl Renderer {
         &mut self,
         scene: &Scene,
         card: &SceneCard,
+        top_depth: f64,
         s: f32,
         scene_opacity: u32,
         pixmap: &mut Pixmap,
     ) {
+        let depth = finite_depth(card.depth);
         let Some((x, y, cw, ch)) = card_geometry(card, scene.scale) else {
             return;
         };
         let (x, y, cw, ch) = (x as f32, y as f32, cw as f32, ch as f32);
 
-        let (leave_scale, card_opacity, anchor_top_left) = match card.leaving {
+        let appear = appear_value(card.appear);
+        let appearing = appear < 1.0;
+        // A card crossing the VISIBLE_CARDS boundary fades during the move.
+        let depth_fade = (layout::VISIBLE_CARDS as f64 - depth).clamp(0.0, 1.0);
+
+        let (leave_scale, leave_opacity, leave_top_left) = match card.leaving {
             None => (1.0, 1.0, false),
             Some(Leaving::Dissolve(progress)) => {
                 let ease = leave_progress(progress).powi(2);
@@ -274,22 +358,33 @@ impl Renderer {
                 (1.0 - 0.65 * ease, 1.0 - ease, true)
             }
         };
+        let card_opacity = appear * leave_opacity * depth_fade;
         if card_opacity <= 0.0 {
             return;
         }
 
+        let whole = depth.fract() == 0.0;
+        // A fractional depth borrows the nearest whole-depth sprite and scales it.
+        let sprite_depth = if whole { depth } else { depth.round().max(0.0) };
+        let Some((_, _, sprite_w, sprite_h)) =
+            card_geometry_at(&card.image, card.wobble, sprite_depth, scene.scale)
+        else {
+            return;
+        };
         let tilt = finite_tilt(card.tilt);
-        let radius = (theme::RADIUS_SM * scene.scale).clamp(0.0, (cw.min(ch) / 2.0) as f64) as f32;
+        let radius =
+            (theme::RADIUS_SM * scene.scale).clamp(0.0, sprite_w.min(sprite_h) / 2.0) as f32;
         let badge = badge_key(card.movie);
+        let is_top = depth <= top_depth + f64::EPSILON;
         let sprite = self.card_sprite(
             &card.image,
             scene.scale,
-            cw,
-            ch,
+            sprite_w as f32,
+            sprite_h as f32,
             radius,
             tilt,
             s,
-            card.depth == 0,
+            is_top,
             badge,
         );
 
@@ -297,34 +392,79 @@ impl Renderer {
         if opacity == 0 {
             return;
         }
-        let x = x.round();
-        let y = y.round();
-        if card.leaving.is_none() {
+
+        let animated = appearing || card.leaving.is_some() || !whole;
+        if !animated {
             blit_sprite(
                 &sprite.pixmap,
                 pixmap,
-                x as i32 + sprite.origin_x,
-                y as i32 + sprite.origin_y,
+                x.round() as i32 + sprite.origin_x,
+                y.round() as i32 + sprite.origin_y,
                 opacity,
             );
-        } else {
-            let pivot = if anchor_top_left {
-                (0.0, 0.0)
-            } else {
-                (cw / 2.0, ch / 2.0)
-            };
-            blit_scaled(
-                &sprite.pixmap,
-                pixmap,
-                x,
-                y,
-                pivot,
-                leave_scale as f32,
-                sprite.origin_x,
-                sprite.origin_y,
-                opacity,
-            );
+            return;
         }
+
+        if !whole && !appearing && card.leaving.is_none() {
+            if (depth - sprite_depth).abs() <= 0.2 {
+                // Within a fifth of a depth the size difference is under a logical pixel,
+                // so the plain cached blit is enough and much cheaper.
+                blit_sprite(
+                    &sprite.pixmap,
+                    pixmap,
+                    x.round() as i32 + sprite.origin_x,
+                    y.round() as i32 + sprite.origin_y,
+                    opacity,
+                );
+            } else {
+                // Re-stacking scales by only a few percent. Nearest-neighbour sampling
+                // looks the same here and keeps four cards moving at once well inside the
+                // frame budget; the bilinear path stays for the bigger leave/grow scales.
+                blit_scaled_nearest(
+                    &sprite.pixmap,
+                    pixmap,
+                    x,
+                    y,
+                    (shrink(depth) / shrink(sprite_depth)) as f32,
+                    sprite.origin_x,
+                    sprite.origin_y,
+                    opacity,
+                );
+            }
+            return;
+        }
+
+        let appear_scale = 0.45 + 0.55 * appear;
+        let depth_scale = if whole {
+            1.0
+        } else {
+            shrink(depth) / shrink(sprite_depth)
+        };
+        // Scaling around the top-left keeps the unrotated corner put (the grow-in and drop
+        // anchors); otherwise the card shrinks around its centre.
+        let top_left = appearing || leave_top_left || (!whole && card.leaving.is_none());
+        let pivot = if top_left {
+            (0.0, 0.0)
+        } else {
+            (cw / 2.0, ch / 2.0)
+        };
+        let scale = (appear_scale * leave_scale * depth_scale) as f32;
+        let (bx, by) = if whole {
+            (x.round(), y.round())
+        } else {
+            (x, y)
+        };
+        blit_scaled(
+            &sprite.pixmap,
+            pixmap,
+            bx,
+            by,
+            pivot,
+            scale,
+            sprite.origin_x,
+            sprite.origin_y,
+            opacity,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -563,6 +703,7 @@ impl Renderer {
         &mut self,
         scene: &Scene,
         hint: &str,
+        top_depth: f64,
         s: f32,
         scene_opacity: u32,
         pixmap: &mut Pixmap,
@@ -576,7 +717,7 @@ impl Renderer {
             .cards
             .iter()
             .filter_map(|card| {
-                let shrink = 1.0 - card.depth as f64 * 0.05;
+                let shrink = 1.0 - finite_depth(card.depth) * 0.05;
                 fitted_card_size(&card.image, shrink, scale).map(|(_, height)| height)
             })
             .fold(0.0f64, f64::max);
@@ -589,7 +730,7 @@ impl Renderer {
         let top_width = scene
             .cards
             .iter()
-            .find(|card| card.depth == 0)
+            .find(|card| finite_depth(card.depth) <= top_depth + f64::EPSILON)
             .and_then(|card| fitted_card_size(&card.image, 1.0, scale))
             .map_or(layout::THUMB_MAX.width, |(width, _)| width);
         let centre_x = ((layout::INSET_X + top_width / 2.0) * scale) as f32;
@@ -655,7 +796,13 @@ impl Renderer {
         .into_iter()
         .flatten()
         {
-            pixmap.fill_path(&path, &opaque, FillRule::Winding, Transform::identity(), None);
+            pixmap.fill_path(
+                &path,
+                &opaque,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
         }
         for pixel in pixmap.data_mut().as_chunks_mut::<4>().0 {
             pixel[3] = (pixel[3] as u32 * HINT_PILL_ALPHA / 255) as u8;
@@ -742,6 +889,30 @@ fn finite_tilt(tilt: f64) -> f32 {
     if tilt.is_finite() { tilt } else { 0.0 }
 }
 
+fn finite_depth(depth: f64) -> f64 {
+    if depth.is_nan() { 0.0 } else { depth.max(0.0) }
+}
+
+fn appear_value(appear: f64) -> f64 {
+    if appear.is_nan() {
+        1.0
+    } else {
+        appear.clamp(0.0, 1.0)
+    }
+}
+
+fn shrink(depth: f64) -> f64 {
+    1.0 - depth * 0.05
+}
+
+/// The lowest depth in the scene gets the strong shadow and the top sprite.
+fn lowest_depth(cards: &[SceneCard]) -> f64 {
+    cards
+        .iter()
+        .map(|card| finite_depth(card.depth))
+        .fold(f64::INFINITY, f64::min)
+}
+
 fn leave_progress(progress: f64) -> f64 {
     if progress.is_nan() {
         0.0
@@ -752,17 +923,25 @@ fn leave_progress(progress: f64) -> f64 {
 
 /// Fits `THUMB_MAX * shrink` and adds the stack offset and wobble, in physical pixels.
 fn card_geometry(card: &SceneCard, scale: f64) -> Option<(f64, f64, f64, f64)> {
-    let shrink = 1.0 - card.depth as f64 * 0.05;
-    let (width, height) = fitted_card_size(&card.image, shrink, scale)?;
+    card_geometry_at(&card.image, card.wobble, finite_depth(card.depth), scale)
+}
 
-    let wobble = card.wobble.clamp(0.0, 1.0);
+fn card_geometry_at(
+    image: &Image,
+    wobble: f64,
+    depth: f64,
+    scale: f64,
+) -> Option<(f64, f64, f64, f64)> {
+    let (width, height) = fitted_card_size(image, shrink(depth), scale)?;
+
+    let wobble = wobble.clamp(0.0, 1.0);
     let wobble_x = if wobble > 0.0 {
         (wobble * std::f64::consts::PI * 6.0).sin() * 7.0 * (1.0 - wobble)
     } else {
         0.0
     };
-    let x = (layout::INSET_X + card.depth as f64 * 3.0 + wobble_x) * scale;
-    let y = (layout::INSET - card.depth as f64 * 4.0) * scale;
+    let x = (layout::INSET_X + depth * 3.0 + wobble_x) * scale;
+    let y = (layout::INSET - depth * 4.0) * scale;
     Some((x, y, width, height))
 }
 
@@ -998,8 +1177,16 @@ fn blit_sprite(src: &Pixmap, dst: &mut Pixmap, dx: i32, dy: i32, opacity: u32) {
                 continue;
             }
             let di = dst_row + x as usize * 4;
+            if opacity >= 256 && source >> 24 == 255 {
+                data[di..di + 4].copy_from_slice(&source.to_le_bytes());
+                continue;
+            }
             let below = u32::from_le_bytes([data[di], data[di + 1], data[di + 2], data[di + 3]]);
-            let out = source_over(below, source, opacity);
+            let out = if opacity >= 256 {
+                source_over_opaque(below, source)
+            } else {
+                source_over(below, source, opacity)
+            };
             data[di..di + 4].copy_from_slice(&out.to_le_bytes());
         }
     }
@@ -1121,6 +1308,94 @@ fn blit_scaled(
     }
 }
 
+/// Nearest-neighbour scale about the card's top-left corner. Used only for the small
+/// scale changes of a re-stack, where bilinear filtering is invisible but costly.
+#[allow(clippy::too_many_arguments)]
+fn blit_scaled_nearest(
+    src: &Pixmap,
+    dst: &mut Pixmap,
+    x: f32,
+    y: f32,
+    scale: f32,
+    origin_x: i32,
+    origin_y: i32,
+    opacity: u32,
+) {
+    if opacity == 0 || scale <= 0.0 || scale.is_nan() {
+        return;
+    }
+    let src_w = src.width() as f32;
+    let src_h = src.height() as f32;
+    let origin_xf = origin_x as f32;
+    let origin_yf = origin_y as f32;
+
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+    for (qx, qy) in [(0.0, 0.0), (src_w, 0.0), (src_w, src_h), (0.0, src_h)] {
+        let fx = x + scale * (qx + origin_xf);
+        let fy = y + scale * (qy + origin_yf);
+        min_x = min_x.min(fx);
+        min_y = min_y.min(fy);
+        max_x = max_x.max(fx);
+        max_y = max_y.max(fy);
+    }
+    let dst_w = dst.width() as i32;
+    let dst_h = dst.height() as i32;
+    // Stay one pixel inside the transformed rectangle so the source coordinate never
+    // needs clamping in the inner loop.
+    let left = (min_x.ceil() as i32 + 1).max(0);
+    let top = (min_y.ceil() as i32 + 1).max(0);
+    let right = (max_x.floor() as i32 - 1).min(dst_w);
+    let bottom = (max_y.floor() as i32 - 1).min(dst_h);
+    if right <= left || bottom <= top {
+        return;
+    }
+
+    let inv = (65536.0 / scale as f64).round().max(1.0) as i64;
+    let start_x = -origin_x as f64 * 65536.0;
+    let start_y = -origin_y as f64 * 65536.0;
+    let num_x = 1.0 - 2.0 * x as f64;
+    let num_y = 1.0 - 2.0 * y as f64;
+    let mut qy =
+        start_y.round() as i64 + (num_y * inv as f64 / 2.0).round() as i64 + top as i64 * inv;
+
+    let src_width = src.width() as usize;
+    let src_stride = src_width * 4;
+    let src_data = src.data();
+    let dst_stride = dst_w as usize * 4;
+    let data = dst.data_mut();
+    let opaque = opacity >= 256;
+
+    for py in top..bottom {
+        let mut qx =
+            start_x.round() as i64 + (num_x * inv as f64 / 2.0).round() as i64 + left as i64 * inv;
+        let dy = py as usize * dst_stride;
+        let sy = (qy >> 16) as usize;
+        let src_row = sy * src_stride;
+        for px in left..right {
+            let sx = (qx >> 16) as usize;
+            let source = packed_at(src_data, src_row + sx * 4);
+            let di = dy + px as usize * 4;
+            if opaque && source >> 24 == 255 {
+                data[di..di + 4].copy_from_slice(&source.to_le_bytes());
+            } else if source >> 24 != 0 {
+                let below =
+                    u32::from_le_bytes([data[di], data[di + 1], data[di + 2], data[di + 3]]);
+                let out = if opaque {
+                    source_over_opaque(below, source)
+                } else {
+                    source_over(below, source, opacity)
+                };
+                data[di..di + 4].copy_from_slice(&out.to_le_bytes());
+            }
+            qx += inv;
+        }
+        qy += inv;
+    }
+}
+
 fn packed_at(data: &[u8], index: usize) -> u32 {
     u32::from_le_bytes([
         data[index],
@@ -1144,6 +1419,17 @@ fn source_over(below: u32, source: u32, opacity: u32) -> u32 {
     let red = red + (((below & 0xff) * keep) >> 8);
     let green = green + ((((below >> 8) & 0xff) * keep) >> 8);
     let blue = blue + ((((below >> 16) & 0xff) * keep) >> 8);
+    let alpha = alpha + (((below >> 24) * keep) >> 8);
+    red | (green << 8) | (blue << 16) | (alpha << 24)
+}
+
+/// Source-over with a fully opaque source pixel (the re-stack path).
+fn source_over_opaque(below: u32, source: u32) -> u32 {
+    let alpha = source >> 24;
+    let keep = 255 - alpha;
+    let red = (source & 0xff) + (((below & 0xff) * keep) >> 8);
+    let green = ((source >> 8) & 0xff) + ((((below >> 8) & 0xff) * keep) >> 8);
+    let blue = ((source >> 16) & 0xff) + ((((below >> 16) & 0xff) * keep) >> 8);
     let alpha = alpha + (((below >> 24) * keep) >> 8);
     red | (green << 8) | (blue << 16) | (alpha << 24)
 }
@@ -1298,11 +1584,12 @@ mod tests {
         }
     }
 
-    fn card(image: Arc<Image>, tilt: f64, depth: usize) -> SceneCard {
+    fn card(image: Arc<Image>, tilt: f64, depth: f64) -> SceneCard {
         SceneCard {
             image,
             tilt,
             depth,
+            appear: 1.0,
             wobble: 0.0,
             leaving: None,
             movie: None,
@@ -1320,9 +1607,9 @@ mod tests {
 
         let three = scene(
             vec![
-                card(images[0].clone(), 10.0, 2),
-                card(images[1].clone(), -12.0, 1),
-                card(images[2].clone(), 9.0, 0),
+                card(images[0].clone(), 10.0, 2.0),
+                card(images[1].clone(), -12.0, 1.0),
+                card(images[2].clone(), 9.0, 0.0),
             ],
             Some("held"),
         );
@@ -1331,10 +1618,10 @@ mod tests {
 
         let four = scene(
             vec![
-                card(images[0].clone(), 10.0, 3),
-                card(images[1].clone(), -12.0, 2),
-                card(images[2].clone(), 9.0, 1),
-                card(images[3].clone(), -9.0, 0),
+                card(images[0].clone(), 10.0, 3.0),
+                card(images[1].clone(), -12.0, 2.0),
+                card(images[2].clone(), 9.0, 1.0),
+                card(images[3].clone(), -9.0, 0.0),
             ],
             Some("held"),
         );
@@ -1349,7 +1636,7 @@ mod tests {
     #[test]
     fn movie_layer_leaves_a_transparent_border() {
         let image = solid(1200, 900, [80, 150, 210, 255]);
-        let mut movie = card(image, -4.0, 0);
+        let mut movie = card(image, -4.0, 0.0);
         movie.movie = Some(Some(75.0));
         let scene = scene(vec![movie], None);
         let (width, height) = Renderer::pixmap_size(1.0);
@@ -1375,7 +1662,7 @@ mod tests {
     #[test]
     fn buffers_do_not_resize_between_frames() {
         let image = solid(1200, 900, [80, 150, 210, 255]);
-        let mut movie = card(image, -4.0, 0);
+        let mut movie = card(image, -4.0, 0.0);
         movie.movie = Some(Some(75.0));
         let scene = scene(vec![movie], Some("3 held · shake to discard"));
 

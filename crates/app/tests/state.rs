@@ -315,7 +315,7 @@ fn a_lone_card_has_no_tilt_and_depths_go_down_from_the_bottom() {
     let scene = state.scene(0.0, 2.0);
     assert_eq!(scene.cards.len(), 1);
     assert_eq!(scene.cards[0].tilt, 0.0);
-    assert_eq!(scene.cards[0].depth, 0);
+    assert_eq!(scene.cards[0].depth, 0.0);
     assert_eq!(scene.scale, 2.0);
 
     let mut state = FairyState::new(9);
@@ -323,8 +323,12 @@ fn a_lone_card_has_no_tilt_and_depths_go_down_from_the_bottom() {
         hold(&mut state, 0.0);
     }
     let scene = state.scene(0.0, 1.0);
-    let depths: Vec<usize> = scene.cards.iter().map(|card| card.depth).collect();
-    assert_eq!(depths, vec![3, 2, 1, 0], "bottom first, four visible");
+    let depths: Vec<f64> = scene.cards.iter().map(|card| card.depth).collect();
+    assert_eq!(
+        depths,
+        vec![3.0, 2.0, 1.0, 0.0],
+        "bottom first, four visible"
+    );
 }
 
 #[test]
@@ -518,4 +522,106 @@ fn a_restored_card_ignores_a_deliver_step_from_before_the_restore() {
     assert_eq!(state.leave_style(bottom), Some(LeaveStyle::Queued));
     state.tick(0.56);
     assert_eq!(state.leave_style(bottom), Some(LeaveStyle::Drop));
+}
+
+#[test]
+fn appear_grows_from_zero_to_one_over_0_22_s_after_hold() {
+    let mut state = FairyState::new(30);
+    hold(&mut state, 1.0);
+    approx(state.scene(1.0, 1.0).cards[0].appear, 0.0);
+    let halfway = state.scene(1.11, 1.0).cards[0].appear;
+    assert!(
+        halfway > 0.0 && halfway < 1.0,
+        "appear must pass through the middle, got {halfway}"
+    );
+    approx(halfway, 0.875);
+    approx(state.scene(1.22, 1.0).cards[0].appear, 1.0);
+}
+
+#[test]
+fn appear_grows_from_zero_to_one_after_restore_last() {
+    let mut state = FairyState::new(31);
+    hold(&mut state, 0.0);
+    state.dissolve(0.0);
+    state.tick(0.26);
+    assert!(state.stack().is_empty(), "the card has left");
+
+    state.restore_last(1.0);
+    approx(state.scene(1.0, 1.0).cards[0].appear, 0.0);
+    let halfway = state.scene(1.11, 1.0).cards[0].appear;
+    assert!(
+        halfway > 0.0 && halfway < 1.0,
+        "the restored card must grow in, got {halfway}"
+    );
+    approx(halfway, 0.875);
+    approx(state.scene(1.22, 1.0).cards[0].appear, 1.0);
+}
+
+#[test]
+fn is_animating_covers_the_appear_and_ends() {
+    let mut state = FairyState::new(32);
+    hold(&mut state, 0.0);
+    assert!(state.is_animating(0.0), "the card is appearing");
+    assert!(state.is_animating(0.21), "still appearing");
+    assert!(!state.is_animating(0.22), "the entrance is over");
+}
+
+#[test]
+fn a_second_hold_moves_the_first_card_from_depth_zero_to_one() {
+    let mut state = FairyState::new(33);
+    hold(&mut state, 0.0);
+    assert_eq!(state.scene(0.0, 1.0).cards[0].depth, 0.0);
+
+    hold(&mut state, 0.5);
+    approx(state.scene(0.5, 1.0).cards[0].depth, 0.0);
+    let halfway = state.scene(0.61, 1.0).cards[0].depth;
+    assert!(
+        halfway > 0.0 && halfway < 1.0,
+        "the depth must pass through a value between, got {halfway}"
+    );
+    approx(halfway, 0.875);
+    approx(state.scene(0.72, 1.0).cards[0].depth, 1.0);
+}
+
+#[test]
+fn the_card_under_a_leaving_top_card_moves_from_one_to_zero() {
+    let mut state = FairyState::new(34);
+    hold(&mut state, 0.0);
+    hold(&mut state, 0.5);
+    let under = state.stack()[0].id;
+    approx(state.scene(0.72, 1.0).cards[0].depth, 1.0);
+
+    state.dissolve(1.0);
+    state.tick(1.26);
+    let settled = state.scene(1.26, 1.0);
+    assert_eq!(settled.cards.len(), 1);
+    assert_eq!(state.stack()[0].id, under);
+    approx(settled.cards[0].depth, 1.0);
+
+    let halfway = state.scene(1.37, 1.0).cards[0].depth;
+    assert!(
+        halfway > 0.0 && halfway < 1.0,
+        "the card must slide up, got {halfway}"
+    );
+    approx(halfway, 0.125);
+    approx(state.scene(1.48, 1.0).cards[0].depth, 0.0);
+}
+
+#[test]
+fn the_fifth_card_is_drawn_only_while_fading_out() {
+    let mut state = FairyState::new(35);
+    for k in 0..4 {
+        hold(&mut state, k as f64);
+    }
+    assert_eq!(state.scene(3.5, 1.0).cards.len(), 4);
+    approx(state.scene(3.5, 1.0).cards[0].depth, 3.0);
+
+    hold(&mut state, 4.0);
+    assert_eq!(state.scene(4.0, 1.0).cards.len(), 5);
+    let fading = state.scene(4.11, 1.0);
+    assert_eq!(fading.cards.len(), 5, "the fifth card is still fading out");
+    approx(fading.cards[0].depth, 3.875);
+    let settled = state.scene(4.22, 1.0);
+    assert_eq!(settled.cards.len(), 4, "the fifth card is now hidden");
+    approx(settled.cards[0].depth, 3.0);
 }

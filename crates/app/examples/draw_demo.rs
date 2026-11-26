@@ -51,7 +51,7 @@ fn main() {
         [244, 196, 60],
     );
 
-    let one = scene(vec![card(&wide, 0.0, 0)], None, 1.0);
+    let one = scene(vec![card(&wide, 0.0, 0.0)], None, 1.0);
     save(&dir, "01-one-card.png", &one);
 
     let tilts = three(&wide, &tall, &square, 1.0);
@@ -59,22 +59,22 @@ fn main() {
 
     let four = scene(
         vec![
-            card(&wide, 8.0, 3),
-            card(&tall, -7.0, 2),
-            card(&square, 11.0, 1),
-            card(&wide_second, -9.0, 0),
+            card(&wide, 8.0, 3.0),
+            card(&tall, -7.0, 2.0),
+            card(&square, 11.0, 1.0),
+            card(&wide_second, -9.0, 0.0),
         ],
         Some("3 held · shake to discard"),
         1.0,
     );
     save(&dir, "03-four-hint.png", &four);
 
-    let mut movie_card = card(&wide_second, -4.0, 0);
+    let mut movie_card = card(&wide_second, -4.0, 0.0);
     movie_card.movie = Some(Some(75.0));
     let movie = scene(vec![movie_card], None, 1.0);
     save(&dir, "04-movie.png", &movie);
 
-    let mut wobble_card = card(&square, 0.0, 0);
+    let mut wobble_card = card(&square, 0.0, 0.0);
     wobble_card.wobble = 0.25;
     let wobble = scene(vec![wobble_card], None, 1.0);
     save(&dir, "05-wobble.png", &wobble);
@@ -92,6 +92,16 @@ fn main() {
 
     let scaled = three(&wide, &tall, &square, 2.0);
     save(&dir, "09-scale-2_0.png", &scaled);
+
+    let mut appear = three(&wide, &tall, &square, 1.0);
+    appear.cards.last_mut().expect("top card").appear = 0.5;
+    save(&dir, "10-appear.png", &appear);
+
+    let mut restack = three(&wide, &tall, &square, 1.0);
+    for (index, card) in restack.cards.iter_mut().enumerate() {
+        card.depth = (2 - index) as f64 + 0.5;
+    }
+    save(&dir, "11-restack.png", &restack);
 
     let four_a = four.with_scale(1.0);
     let four_b = four.with_scale(2.0);
@@ -111,11 +121,12 @@ fn scene(cards: Vec<SceneCard>, hint: Option<&str>, scale: f64) -> Scene {
     }
 }
 
-fn card(image: &Arc<Image>, tilt: f64, depth: usize) -> SceneCard {
+fn card(image: &Arc<Image>, tilt: f64, depth: f64) -> SceneCard {
     SceneCard {
         image: image.clone(),
         tilt,
         depth,
+        appear: 1.0,
         wobble: 0.0,
         leaving: None,
         movie: None,
@@ -125,9 +136,9 @@ fn card(image: &Arc<Image>, tilt: f64, depth: usize) -> SceneCard {
 fn three(wide: &Arc<Image>, tall: &Arc<Image>, square: &Arc<Image>, scale: f64) -> Scene {
     scene(
         vec![
-            card(wide, 10.0, 2),
-            card(tall, -12.0, 1),
-            card(square, 9.0, 0),
+            card(wide, 10.0, 2.0),
+            card(tall, -12.0, 1.0),
+            card(square, 9.0, 0.0),
         ],
         None,
         scale,
@@ -235,6 +246,18 @@ fn timing_table(base: &Scene) {
             }
         });
     }
+    time_scene("appear", base.with_scale(2.0), |_, scene| {
+        if let Some(top) = scene.cards.last_mut() {
+            top.appear = 0.5;
+        }
+    });
+    time_scene("restack", base.with_scale(2.0), |i, scene| {
+        let count = scene.cards.len();
+        let t = ((i % 200) as f64 + 0.5) / 200.0;
+        for (index, card) in scene.cards.iter_mut().enumerate() {
+            card.depth = (count - 1 - index) as f64 + t;
+        }
+    });
     first_frame_timing();
 }
 
@@ -271,19 +294,19 @@ fn first_frame_timing() {
         .collect();
     let three = scene(
         vec![
-            card(&large[0], 10.0, 2),
-            card(&large[1], -12.0, 1),
-            card(&large[2], 9.0, 0),
+            card(&large[0], 10.0, 2.0),
+            card(&large[1], -12.0, 1.0),
+            card(&large[2], 9.0, 0.0),
         ],
         None,
         2.0,
     );
     let four = scene(
         vec![
-            card(&large[0], 10.0, 3),
-            card(&large[1], -12.0, 2),
-            card(&large[2], 9.0, 1),
-            card(&large[3], -9.0, 0),
+            card(&large[0], 10.0, 3.0),
+            card(&large[1], -12.0, 2.0),
+            card(&large[2], 9.0, 1.0),
+            card(&large[3], -9.0, 0.0),
         ],
         None,
         2.0,

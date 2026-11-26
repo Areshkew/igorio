@@ -19,8 +19,13 @@ pub struct SceneCard {
     pub image: Arc<Image>,
     /// Degrees, clockwise. Already 0 when the pile has one card.
     pub tilt: f64,
-    /// 0 is the top card, 1 the one under it, and so on.
-    pub depth: usize,
+    /// 0.0 is the top card, 1.0 the one under it, and so on. Fractional while the card
+    /// slides to its new depth.
+    pub depth: f64,
+    /// 0.0 just entered, 1.0 fully shown. Already eased with `1 - (1 - t)^3` over the
+    /// 0.22 s entrance (`state` owns the easing); draw scales the card by
+    /// `0.45 + 0.55 * appear` and uses `appear` as its opacity.
+    pub appear: f64,
     /// 0.0 to 1.0 within one "no" wobble; 0.0 when not wobbling.
     pub wobble: f64,
     pub leaving: Option<Leaving>,
@@ -30,7 +35,8 @@ pub struct SceneCard {
 
 #[derive(Debug, Clone)]
 pub struct Scene {
-    /// Bottom card first, top card last. At most `layout::VISIBLE_CARDS`.
+    /// Bottom card first, top card last. At most `layout::VISIBLE_CARDS` at rest, plus a
+    /// card that is still fading across that boundary while its depth moves.
     pub cards: Vec<SceneCard>,
     pub hint: Option<String>,
     /// 0.0 to 1.0, for the hint fading in and out.

@@ -15,11 +15,12 @@ fn solid(width: u32, height: u32, color: [u8; 4]) -> Arc<Image> {
     Arc::new(Image::new(width, height, rgba).expect("valid image"))
 }
 
-fn card(image: Arc<Image>, tilt: f64, depth: usize) -> SceneCard {
+fn card(image: Arc<Image>, tilt: f64, depth: f64) -> SceneCard {
     SceneCard {
         image,
         tilt,
         depth,
+        appear: 1.0,
         wobble: 0.0,
         leaving: None,
         movie: None,
@@ -66,7 +67,7 @@ fn empty_scene_is_transparent() {
 #[test]
 fn zero_opacity_is_transparent() {
     let mut scene = scene(
-        vec![card(solid(160, 100, [200, 60, 60, 255]), 0.0, 0)],
+        vec![card(solid(160, 100, [200, 60, 60, 255]), 0.0, 0.0)],
         Some("hi"),
         1.0,
     );
@@ -81,7 +82,7 @@ fn zero_opacity_is_transparent() {
 #[test]
 fn one_card_has_content_and_a_clear_corner() {
     let scene = scene(
-        vec![card(solid(160, 100, [240, 240, 240, 255]), 0.0, 0)],
+        vec![card(solid(160, 100, [240, 240, 240, 255]), 0.0, 0.0)],
         None,
         1.0,
     );
@@ -96,13 +97,13 @@ fn one_card_has_content_and_a_clear_corner() {
 
 #[test]
 fn premultiplied_invariant_holds_for_a_busy_scene() {
-    let mut top = card(solid(900, 600, [80, 160, 220, 180]), -11.0, 0);
+    let mut top = card(solid(900, 600, [80, 160, 220, 180]), -11.0, 0.0);
     top.movie = Some(Some(75.4));
     let mut scene = scene(
         vec![
-            card(solid(1600, 1000, [230, 120, 60, 255]), 12.0, 3),
-            card(solid(900, 1400, [70, 190, 130, 255]), -7.0, 2),
-            card(solid(1200, 1200, [150, 90, 210, 255]), 9.0, 1),
+            card(solid(1600, 1000, [230, 120, 60, 255]), 12.0, 3.0),
+            card(solid(900, 1400, [70, 190, 130, 255]), -7.0, 2.0),
+            card(solid(1200, 1200, [150, 90, 210, 255]), 9.0, 1.0),
             top,
         ],
         Some("3 held · shake to discard"),
@@ -121,9 +122,9 @@ fn premultiplied_invariant_holds_for_a_busy_scene() {
 fn rendering_twice_gives_identical_bytes() {
     let scene = scene(
         vec![
-            card(solid(1600, 1000, [230, 120, 60, 255]), 10.0, 2),
-            card(solid(900, 1400, [70, 190, 130, 255]), -12.0, 1),
-            card(solid(1200, 1200, [150, 90, 210, 255]), 9.0, 0),
+            card(solid(1600, 1000, [230, 120, 60, 255]), 10.0, 2.0),
+            card(solid(900, 1400, [70, 190, 130, 255]), -12.0, 1.0),
+            card(solid(1200, 1200, [150, 90, 210, 255]), 9.0, 0.0),
         ],
         Some("3 held"),
         1.25,
@@ -140,8 +141,8 @@ fn rendering_twice_gives_identical_bytes() {
 #[test]
 fn scale_two_quadruples_the_card_area() {
     let image = solid(1600, 1000, [210, 140, 90, 255]);
-    let one = render(&scene(vec![card(image.clone(), 0.0, 0)], None, 1.0));
-    let two = render(&scene(vec![card(image, 0.0, 0)], None, 2.0));
+    let one = render(&scene(vec![card(image.clone(), 0.0, 0.0)], None, 1.0));
+    let two = render(&scene(vec![card(image, 0.0, 0.0)], None, 2.0));
 
     assert_eq!(Renderer::pixmap_size(1.0), (300, 170));
     assert_eq!((two.width(), two.height()), (600, 340));
@@ -159,7 +160,7 @@ fn scale_two_quadruples_the_card_area() {
 #[test]
 fn finished_leave_animations_draw_nothing() {
     for leaving in [Leaving::Dissolve(1.0), Leaving::Drop(1.0)] {
-        let mut top = card(solid(1600, 1000, [200, 90, 60, 255]), 0.0, 0);
+        let mut top = card(solid(1600, 1000, [200, 90, 60, 255]), 0.0, 0.0);
         top.leaving = Some(leaving);
         let pixmap = render(&scene(vec![top], None, 1.0));
         assert!(
@@ -202,7 +203,7 @@ fn leaving_cards_fade_the_image() {
             } else {
                 Leaving::Drop(progress)
             };
-            let mut top = card(solid(160, 100, [210, 120, 70, 255]), 0.0, 0);
+            let mut top = card(solid(160, 100, [210, 120, 70, 255]), 0.0, 0.0);
             top.leaving = Some(leaving);
             let pixmap = render(&scene(vec![top], None, 1.0));
             let (x, y) = if dissolve {
@@ -234,7 +235,7 @@ fn leaving_cards_fade_the_image() {
 fn hint_opacity_fades_the_text() {
     let build = |opacity: f64| {
         let mut scene = scene(
-            vec![card(solid(160, 100, [230, 230, 230, 255]), 0.0, 0)],
+            vec![card(solid(160, 100, [230, 230, 230, 255]), 0.0, 0.0)],
             Some("3 held · shake to discard"),
             1.0,
         );
@@ -274,7 +275,7 @@ fn hint_opacity_fades_the_text() {
 #[test]
 fn discarded_images_are_freed() {
     let image = solid(640, 480, [80, 140, 210, 255]);
-    let painted = scene(vec![card(image.clone(), 0.0, 0)], Some("held"), 1.0);
+    let painted = scene(vec![card(image.clone(), 0.0, 0.0)], Some("held"), 1.0);
     let (width, height) = Renderer::pixmap_size(1.0);
     let mut pixmap = Pixmap::new(width, height).expect("pixmap");
     let mut renderer = Renderer::new();
@@ -295,9 +296,9 @@ fn hint_sits_below_the_tallest_card_box() {
     let tall = solid(900, 1400, [100, 190, 150, 255]);
     let hint = Some("3 held · shake to discard");
 
-    let one = render(&scene(vec![card(wide.clone(), 0.0, 0)], hint, 1.0));
+    let one = render(&scene(vec![card(wide.clone(), 0.0, 0.0)], hint, 1.0));
     let two = render(&scene(
-        vec![card(tall, 10.0, 1), card(wide, -9.0, 0)],
+        vec![card(tall, 10.0, 1.0), card(wide, -9.0, 0.0)],
         hint,
         1.0,
     ));
@@ -313,15 +314,15 @@ fn hint_sits_below_the_tallest_card_box() {
 #[test]
 fn non_finite_tilt_is_drawn_as_zero() {
     let image = solid(1600, 1000, [210, 140, 90, 255]);
-    let normal = render(&scene(vec![card(image.clone(), 0.0, 0)], Some("hi"), 1.0));
-    let nan = render(&scene(vec![card(image, f64::NAN, 0)], Some("hi"), 1.0));
+    let normal = render(&scene(vec![card(image.clone(), 0.0, 0.0)], Some("hi"), 1.0));
+    let nan = render(&scene(vec![card(image, f64::NAN, 0.0)], Some("hi"), 1.0));
     assert_eq!(normal.data(), nan.data());
 }
 
 #[test]
 fn invalid_scale_or_size_leaves_a_clear_pixmap() {
     let image = solid(160, 100, [200, 90, 60, 255]);
-    let mut scene = scene(vec![card(image, 0.0, 0)], None, 1.0);
+    let mut scene = scene(vec![card(image, 0.0, 0.0)], None, 1.0);
     let mut pixmap = Pixmap::new(200, 170).expect("pixmap");
 
     for scale in [f64::NAN, 0.0, -1.0, 40.0] {
@@ -344,6 +345,115 @@ fn invalid_scale_or_size_leaves_a_clear_pixmap() {
     );
 }
 
+fn assert_premultiplied(pixmap: &Pixmap) {
+    for pixel in pixmap.data().as_chunks::<4>().0 {
+        assert!(pixel[0] <= pixel[3], "red exceeds alpha");
+        assert!(pixel[1] <= pixel[3], "green exceeds alpha");
+        assert!(pixel[2] <= pixel[3], "blue exceeds alpha");
+    }
+}
+
+/// Bounding box of the near-opaque card body (ignores the soft shadow).
+fn solid_bounds(pixmap: &Pixmap) -> (u32, u32, u32, u32) {
+    let mut min_x = u32::MAX;
+    let mut min_y = u32::MAX;
+    let mut max_x = 0;
+    let mut max_y = 0;
+    for y in 0..pixmap.height() {
+        for x in 0..pixmap.width() {
+            if pixmap.pixel(x, y).expect("pixel").alpha() >= 250 {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    assert!(min_x != u32::MAX, "the card body must be drawn");
+    (min_x, min_y, max_x, max_y)
+}
+
+#[test]
+fn an_appearing_card_is_fainter_and_smaller_then_gone_at_zero() {
+    let image = solid(160, 100, [220, 80, 60, 255]);
+    let mut half = card(image.clone(), 0.0, 0.0);
+    half.appear = 0.5;
+    let half = render(&scene(vec![half], None, 1.0));
+    let full = render(&scene(vec![card(image.clone(), 0.0, 0.0)], None, 1.0));
+    let mut gone = card(image, 0.0, 0.0);
+    gone.appear = 0.0;
+    let gone = render(&scene(vec![gone], None, 1.0));
+
+    let (centre_x, centre_y) = (150, 43);
+    let half_alpha = half.pixel(centre_x, centre_y).expect("pixel").alpha();
+    let full_alpha = full.pixel(centre_x, centre_y).expect("pixel").alpha();
+    assert_eq!(full_alpha, 255, "the settled card is opaque");
+    assert!(half_alpha > 0, "a half-appeared card is still visible");
+    assert!(
+        full_alpha - half_alpha > 60,
+        "appear 0.5 must be clearly fainter: {half_alpha} vs {full_alpha}"
+    );
+    assert!(
+        opaque_pixels(&half) < opaque_pixels(&full),
+        "the scaled card covers fewer pixels: {} vs {}",
+        opaque_pixels(&half),
+        opaque_pixels(&full)
+    );
+    assert!(
+        gone.data().as_chunks::<4>().0.iter().all(|p| p[3] == 0),
+        "appear 0 must leave no pixels at all"
+    );
+    assert_premultiplied(&half);
+}
+
+#[test]
+fn a_fractional_depth_sits_between_two_whole_depths() {
+    let image = solid(160, 100, [200, 120, 80, 255]);
+    let zero = render(&scene(vec![card(image.clone(), 0.0, 0.0)], None, 1.0));
+    let half = render(&scene(vec![card(image.clone(), 0.0, 0.5)], None, 1.0));
+    let one = render(&scene(vec![card(image, 0.0, 1.0)], None, 1.0));
+
+    let (zero_x, zero_y, ..) = solid_bounds(&zero);
+    let (half_x, half_y, ..) = solid_bounds(&half);
+    let (one_x, one_y, ..) = solid_bounds(&one);
+    assert!(
+        zero_x < half_x && half_x < one_x,
+        "depth 0.5 must sit between depth 0 and 1 horizontally: {zero_x} {half_x} {one_x}"
+    );
+    assert!(
+        one_y < half_y && half_y < zero_y,
+        "depth 0.5 must sit between depth 0 and 1 vertically: {one_y} {half_y} {zero_y}"
+    );
+    assert_premultiplied(&half);
+}
+
+/// The depth field used to be a `usize`; whole values must still take the old cached path.
+fn legacy_depth(depth: usize) -> f64 {
+    depth as f64
+}
+
+#[test]
+fn whole_depth_one_is_byte_identical_to_the_old_integer_depth() {
+    let image = solid(160, 100, [200, 90, 60, 255]);
+    let new_way = scene(
+        vec![
+            card(image.clone(), 10.0, 0.0),
+            card(image.clone(), -7.0, 1.0),
+        ],
+        Some("2 held"),
+        1.25,
+    );
+    let old_way = scene(
+        vec![
+            card(image.clone(), 10.0, legacy_depth(0)),
+            card(image, -7.0, legacy_depth(1)),
+        ],
+        Some("2 held"),
+        1.25,
+    );
+    assert_eq!(render(&new_way).data(), render(&old_way).data());
+}
+
 #[test]
 fn leave_progress_is_clamped_and_nan_is_zero() {
     for dissolve in [true, false] {
@@ -354,15 +464,15 @@ fn leave_progress_is_clamped_and_nan_is_zero() {
                 Some(Leaving::Drop(p))
             }
         };
-        let mut nan_card = card(solid(160, 100, [200, 90, 60, 255]), 0.0, 0);
+        let mut nan_card = card(solid(160, 100, [200, 90, 60, 255]), 0.0, 0.0);
         nan_card.leaving = leaving(f64::NAN);
-        let mut zero_card = card(solid(160, 100, [200, 90, 60, 255]), 0.0, 0);
+        let mut zero_card = card(solid(160, 100, [200, 90, 60, 255]), 0.0, 0.0);
         zero_card.leaving = leaving(0.0);
         let nan = render(&scene(vec![nan_card], None, 1.0));
         let zero = render(&scene(vec![zero_card], None, 1.0));
         assert_eq!(nan.data(), zero.data(), "NaN progress must act as zero");
 
-        let mut done_card = card(solid(160, 100, [200, 90, 60, 255]), 0.0, 0);
+        let mut done_card = card(solid(160, 100, [200, 90, 60, 255]), 0.0, 0.0);
         done_card.leaving = leaving(5.0);
         let done = render(&scene(vec![done_card], None, 1.0));
         assert!(

@@ -27,6 +27,8 @@ const HINT_FADE: f64 = 0.18;
 const CAPTURE_FADE: f64 = 0.15;
 /// One "no" wobble of the top card.
 const WOBBLE: f64 = 0.42;
+/// A new (or restored) card growing in, and a card sliding to a new depth.
+const STACK_ANIMATION: f64 = 0.22;
 /// Leave animations (`FairyView.swift`); the card is dropped a little after the animation ends.
 const DISSOLVE_ANIMATION: f64 = 0.22;
 const DROP_ANIMATION: f64 = 0.26;
@@ -54,6 +56,55 @@ struct Scheduled {
     task: Task,
 }
 
+/// Where a card's depth is moving from, and when the move started.
+#[derive(Debug, Clone, Copy)]
+struct DepthMove {
+    from: f64,
+    to: f64,
+    at: f64,
+}
+
+impl DepthMove {
+    fn value_at(&self, now: f64) -> f64 {
+        let t = ((now - self.at) / STACK_ANIMATION).clamp(0.0, 1.0);
+        if t <= 0.0 {
+            self.from
+        } else if t >= 1.0 {
+            self.to
+        } else {
+            self.from + (self.to - self.from) * ease_out(t)
+        }
+    }
+}
+
+/// Which appear value a card started from (0 for a brand-new card; the opacity it had for a
+/// card restored in the middle of leaving), and when the entrance started.
+#[derive(Debug, Clone, Copy)]
+struct Appearance {
+    from: f64,
+    at: f64,
+}
+
+impl Appearance {
+    fn value_at(&self, now: f64) -> f64 {
+        let from = self.from.clamp(0.0, 1.0);
+        let t = ((now - self.at) / STACK_ANIMATION).clamp(0.0, 1.0);
+        if t <= 0.0 {
+            from
+        } else if t >= 1.0 {
+            1.0
+        } else {
+            from + (1.0 - from) * ease_out(t)
+        }
+    }
+}
+
+/// The stacking ease (SwiftUI's spring is replaced with an ease-out cubic).
+fn ease_out(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
 /// Everything the overlay shows and does, as a pure value: the pile, the hint, the last "no",
 /// and the animations that are still running.
 ///
@@ -77,6 +128,10 @@ pub struct FairyState {
     opacity_target: f64,
     /// When each leaving card got its current leave style (for the animation progress).
     leave_started: HashMap<CardId, f64>,
+    /// The depth each card is moving from, and when that move started.
+    depth_moves: HashMap<CardId, DepthMove>,
+    /// When each card entered the pile, and the appear value it started from.
+    appearances: HashMap<CardId, Appearance>,
     tasks: Vec<Scheduled>,
     next_seq: u64,
     next_card_id: u64,
@@ -100,6 +155,8 @@ impl FairyState {
             opacity_at: 0.0,
             opacity_target: 1.0,
             leave_started: HashMap::new(),
+            depth_moves: HashMap::new(),
+            appearances: HashMap::new(),
             tasks: Vec::new(),
             next_seq: 0,
             next_card_id: 1,
@@ -187,7 +244,11 @@ impl FairyState {
     ) {
         let is_movie = movie.is_some();
         let card = self.make_card(image, scale, captured_at, kept, movie, duration);
+        let id = card.id;
         self.pile.push(card);
+        self.appearances
+            .insert(id, Appearance { from: 0.0, at: now });
+        self.sync_depths(now);
         let count = self.pile.active().len();
         let verb = if kept {
             "saved · shake to let go"
@@ -274,19 +335,32 @@ impl FairyState {
     pub fn discard_all(&mut self, now: f64) {
         self.pile.discard_all(ReleaseReason::DiscardedAll, now);
         self.leave_started.clear();
+        self.depth_moves.clear();
+        self.appearances.clear();
         self.clear_hint(now);
     }
 
     /// Bring back what last left the pile (shaken off, discarded, or delivered).
     pub fn restore_last(&mut self, now: f64) {
+        // A card restored while leaving carries on from the opacity it had, so it does not
+        // blink out and back in. Cards that had already left start from fully transparent.
+        let leaving_opacities: HashMap<CardId, f64> = self
+            .pile
+            .cards()
+            .iter()
+            .filter_map(|card| self.leave_opacity_now(card.id, now).map(|a| (card.id, a)))
+            .collect();
         let restored = self.pile.restore_last(now);
         if restored.is_empty() {
             return;
         }
         let restored_ids: Vec<CardId> = restored.iter().map(|card| card.id).collect();
         for id in &restored_ids {
+            let from = leaving_opacities.get(id).copied().unwrap_or(0.0);
+            self.appearances.insert(*id, Appearance { from, at: now });
             self.leave_started.remove(id);
         }
+        self.sync_depths(now);
         // A leave or delivery scheduled before the restore must not reach the card now that it
         // is back on the pile. Drop its deliver steps and its share of pending finishes.
         self.tasks
@@ -366,13 +440,16 @@ impl FairyState {
         }
     }
 
-    /// Whether pixels still change: something is fading, wobbling or leaving. Pending
-    /// deadlines alone do not count, so a static hint does not drive a redraw loop.
+    /// Whether pixels still change: something is fading, wobbling, leaving, appearing or
+    /// sliding to a new depth. Pending deadlines alone do not count, so a static hint does
+    /// not drive a redraw loop.
     pub fn is_animating(&self, now: f64) -> bool {
         self.hint_fading(now)
             || self.opacity_fading(now)
             || self.wobble_active(now)
             || self.leaving_active(now)
+            || self.appearing_active(now)
+            || self.depth_active(now)
     }
 
     // MARK: Drawing
@@ -380,16 +457,21 @@ impl FairyState {
     /// The frame to draw at `now`.
     pub fn scene(&self, now: f64, scale: f64) -> Scene {
         let all = self.pile.cards();
-        let start = all.len().saturating_sub(layout::VISIBLE_CARDS);
-        let visible = &all[start..];
         let top_id = all.last().map(|card| card.id);
         let wobble = self.wobble_now(now);
+        let last_depth = layout::VISIBLE_CARDS as f64;
 
-        let cards: Vec<SceneCard> = visible
+        let cards: Vec<SceneCard> = all
             .iter()
             .enumerate()
-            .map(|(index, card)| {
-                let depth = visible.len() - 1 - index;
+            .filter_map(|(index, card)| {
+                let target = (all.len() - 1 - index) as f64;
+                let depth = self.depth_at(card.id, target, now);
+                // At rest only depths 0..VISIBLE_CARDS-1 are drawn. A card crossing the
+                // boundary (3 <-> 4) stays in the scene while its depth is still inside.
+                if depth >= last_depth {
+                    return None;
+                }
                 let leaving = match self.pile.style(card.id) {
                     Some(LeaveStyle::Dissolve) => {
                         let at = self.leave_started.get(&card.id).copied().unwrap_or(now);
@@ -403,11 +485,12 @@ impl FairyState {
                     }
                     _ => None,
                 };
-                SceneCard {
+                Some(SceneCard {
                     image: card.image.clone(),
                     // A lone screenshot sits straight; tilts only appear once there is a pile.
                     tilt: if all.len() > 1 { card.tilt } else { 0.0 },
                     depth,
+                    appear: self.appear_at(card.id, now),
                     wobble: if Some(card.id) == top_id { wobble } else { 0.0 },
                     leaving,
                     movie: if card.is_movie() {
@@ -415,7 +498,7 @@ impl FairyState {
                     } else {
                         None
                     },
-                }
+                })
             })
             .collect();
 
@@ -531,7 +614,12 @@ impl FairyState {
         for id in ids {
             self.pile.finish_leaving(*id);
             self.leave_started.remove(id);
+            if self.pile.card(*id).is_none() {
+                self.depth_moves.remove(id);
+                self.appearances.remove(id);
+            }
         }
+        self.sync_depths(at);
         // A restore while animating cancels the leave; only the hint is left to sort out.
         if self.pile.is_empty() {
             self.clear_hint(at);
@@ -603,6 +691,88 @@ impl FairyState {
 
     fn wobble_active(&self, now: f64) -> bool {
         !self.pile.is_empty() && self.last_reject_at.is_some_and(|at| now - at < WOBBLE)
+    }
+
+    fn appearing_active(&self, now: f64) -> bool {
+        self.pile.cards().iter().any(|card| {
+            self.appearances
+                .get(&card.id)
+                .is_some_and(|appear| appear.from < 1.0 && now - appear.at < STACK_ANIMATION)
+        })
+    }
+
+    fn depth_active(&self, now: f64) -> bool {
+        self.pile.cards().iter().any(|card| {
+            self.depth_moves
+                .get(&card.id)
+                .is_some_and(|move_| move_.from != move_.to && now - move_.at < STACK_ANIMATION)
+        })
+    }
+
+    fn appear_at(&self, id: CardId, now: f64) -> f64 {
+        self.appearances
+            .get(&id)
+            .map_or(1.0, |appear| appear.value_at(now))
+    }
+
+    fn depth_at(&self, id: CardId, target: f64, now: f64) -> f64 {
+        self.depth_moves
+            .get(&id)
+            .map_or(target, |move_| move_.value_at(now))
+    }
+
+    /// Reconcile each card's depth with its position in the pile, starting a 0.22 s move
+    /// wherever the target changed. Several changes at one instant collapse into the final
+    /// depth: no time passed, so there is nothing to animate.
+    fn sync_depths(&mut self, now: f64) {
+        let count = self.pile.cards().len();
+        let ids: Vec<CardId> = self.pile.cards().iter().map(|card| card.id).collect();
+        for (index, id) in ids.iter().enumerate() {
+            let target = (count - 1 - index) as f64;
+            match self.depth_moves.get_mut(id) {
+                Some(move_) if move_.to != target => {
+                    if now <= move_.at {
+                        *move_ = DepthMove {
+                            from: target,
+                            to: target,
+                            at: now,
+                        };
+                    } else {
+                        let from = move_.value_at(now);
+                        *move_ = DepthMove {
+                            from,
+                            to: target,
+                            at: now,
+                        };
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.depth_moves.insert(
+                        *id,
+                        DepthMove {
+                            from: target,
+                            to: target,
+                            at: now,
+                        },
+                    );
+                }
+            }
+        }
+        self.depth_moves.retain(|id, _| ids.contains(id));
+    }
+
+    /// The opacity a leaving card currently has, or `None` when it is not in the pile.
+    fn leave_opacity_now(&self, id: CardId, now: f64) -> Option<f64> {
+        let style = self.pile.style(id)?;
+        let at = self.leave_started.get(&id).copied().unwrap_or(now);
+        let progress = match style {
+            // Still fully drawn, waiting for its turn.
+            LeaveStyle::Queued => return Some(1.0),
+            LeaveStyle::Dissolve => ((now - at) / DISSOLVE_ANIMATION).clamp(0.0, 1.0),
+            LeaveStyle::Drop => ((now - at) / DROP_ANIMATION).clamp(0.0, 1.0),
+        };
+        Some(1.0 - progress.powi(2))
     }
 
     fn leaving_active(&self, now: f64) -> bool {
