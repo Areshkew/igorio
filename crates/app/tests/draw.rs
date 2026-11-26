@@ -177,3 +177,197 @@ fn movie_labels_round_to_mm_ss() {
     assert_eq!(movie_label(75.4), "1:15");
     assert_eq!(movie_label(3599.6), "60:00");
 }
+
+fn max_alpha(pixmap: &Pixmap, x0: u32, x1: u32, y0: u32, y1: u32) -> u8 {
+    let mut peak = 0;
+    for y in y0..y1.min(pixmap.height()) {
+        for x in x0..x1.min(pixmap.width()) {
+            peak = peak.max(pixmap.pixel(x, y).expect("pixel").alpha());
+        }
+    }
+    peak
+}
+
+fn first_row_above(pixmap: &Pixmap, x0: u32, x1: u32, y0: u32, threshold: u8) -> Option<u32> {
+    (y0..pixmap.height()).find(|&y| max_alpha(pixmap, x0, x1, y, y + 1) > threshold)
+}
+
+#[test]
+fn leaving_cards_fade_the_image() {
+    for dissolve in [true, false] {
+        let mut alphas = Vec::new();
+        for progress in [0.5, 0.9] {
+            let leaving = if dissolve {
+                Leaving::Dissolve(progress)
+            } else {
+                Leaving::Drop(progress)
+            };
+            let mut top = card(solid(160, 100, [210, 120, 70, 255]), 0.0, 0);
+            top.leaving = Some(leaving);
+            let pixmap = render(&scene(vec![top], None, 1.0));
+            let (x, y) = if dissolve {
+                (74, 53)
+            } else {
+                let scale = 1.0 - 0.65 * progress * progress;
+                (
+                    (18.0 + 56.0 * scale).round() as u32,
+                    (18.0 + 35.0 * scale).round() as u32,
+                )
+            };
+            let alpha = pixmap.pixel(x, y).expect("card centre").alpha();
+            assert!(
+                alpha < 255,
+                "{} at {progress} still has opaque image pixels",
+                if dissolve { "Dissolve" } else { "Drop" }
+            );
+            alphas.push(alpha);
+        }
+        assert!(
+            alphas[1] < alphas[0],
+            "alpha must fall as the leave progresses: {alphas:?}"
+        );
+        assert!(alphas[1] < 100, "a 90% gone card must be nearly invisible");
+    }
+}
+
+#[test]
+fn hint_opacity_fades_the_text() {
+    let build = |opacity: f64| {
+        let mut scene = scene(
+            vec![card(solid(160, 100, [230, 230, 230, 255]), 0.0, 0)],
+            Some("3 held · shake to discard"),
+            1.0,
+        );
+        scene.hint_opacity = opacity;
+        render(&scene)
+    };
+    let full = build(1.0);
+    let faint = build(0.2);
+    let shadow = build(0.0);
+
+    // Remove the card's shadow from the alpha so only the hint (glow + text) is measured.
+    let mut peak_full = 0.0f64;
+    let mut peak_faint = 0.0f64;
+    for y in 90..150 {
+        for x in 15..190 {
+            let s = shadow.pixel(x, y).expect("pixel").alpha() as f64 / 255.0;
+            if s >= 0.99 {
+                continue;
+            }
+            let a1 = full.pixel(x, y).expect("pixel").alpha() as f64 / 255.0;
+            let a2 = faint.pixel(x, y).expect("pixel").alpha() as f64 / 255.0;
+            peak_full = peak_full.max((a1 - s) / (1.0 - s));
+            peak_faint = peak_faint.max((a2 - s) / (1.0 - s));
+        }
+    }
+    assert!(
+        peak_full > 0.4,
+        "the hint should be clearly visible at opacity 1"
+    );
+    let ratio = peak_faint / peak_full;
+    assert!(
+        (0.17..0.23).contains(&ratio),
+        "hint alpha should scale with hint_opacity, ratio {ratio}"
+    );
+}
+
+#[test]
+fn discarded_images_are_freed() {
+    let image = solid(640, 480, [80, 140, 210, 255]);
+    let painted = scene(vec![card(image.clone(), 0.0, 0)], Some("held"), 1.0);
+    let (width, height) = Renderer::pixmap_size(1.0);
+    let mut pixmap = Pixmap::new(width, height).expect("pixmap");
+    let mut renderer = Renderer::new();
+    renderer.render(&painted, &mut pixmap);
+    drop(painted);
+    assert_eq!(
+        Arc::strong_count(&image),
+        1,
+        "the image cache must not keep screenshot pixels alive"
+    );
+    renderer.render(&scene(Vec::new(), None, 1.0), &mut pixmap);
+    assert_eq!(Arc::strong_count(&image), 1);
+}
+
+#[test]
+fn hint_sits_below_the_tallest_card_box() {
+    let wide = solid(1600, 1000, [200, 160, 100, 255]);
+    let tall = solid(900, 1400, [100, 190, 150, 255]);
+    let hint = Some("3 held · shake to discard");
+
+    let one = render(&scene(vec![card(wide.clone(), 0.0, 0)], hint, 1.0));
+    let two = render(&scene(
+        vec![card(tall, 10.0, 1), card(wide, -9.0, 0)],
+        hint,
+        1.0,
+    ));
+
+    let one_top = first_row_above(&one, 80, 190, 90, 80).expect("hint in one-card scene");
+    let two_top = first_row_above(&two, 80, 190, 90, 80).expect("hint in two-card scene");
+    assert!(
+        two_top >= one_top + 6,
+        "the taller lower card should push the hint down: {one_top} vs {two_top}"
+    );
+}
+
+#[test]
+fn non_finite_tilt_is_drawn_as_zero() {
+    let image = solid(1600, 1000, [210, 140, 90, 255]);
+    let normal = render(&scene(vec![card(image.clone(), 0.0, 0)], Some("hi"), 1.0));
+    let nan = render(&scene(vec![card(image, f64::NAN, 0)], Some("hi"), 1.0));
+    assert_eq!(normal.data(), nan.data());
+}
+
+#[test]
+fn invalid_scale_or_size_leaves_a_clear_pixmap() {
+    let image = solid(160, 100, [200, 90, 60, 255]);
+    let mut scene = scene(vec![card(image, 0.0, 0)], None, 1.0);
+    let mut pixmap = Pixmap::new(200, 170).expect("pixmap");
+
+    for scale in [f64::NAN, 0.0, -1.0, 40.0] {
+        scene.scale = scale;
+        pixmap.fill(tiny_skia::Color::from_rgba8(9, 9, 9, 255));
+        Renderer::new().render(&scene, &mut pixmap);
+        assert!(
+            pixmap.data().as_chunks::<4>().0.iter().all(|p| p[3] == 0),
+            "scale {scale} must leave the pixmap transparent"
+        );
+    }
+
+    scene.scale = 1.0;
+    let mut wrong = Pixmap::new(100, 100).expect("wrong size");
+    wrong.fill(tiny_skia::Color::from_rgba8(9, 9, 9, 255));
+    Renderer::new().render(&scene, &mut wrong);
+    assert!(
+        wrong.data().as_chunks::<4>().0.iter().all(|p| p[3] == 0),
+        "a mismatched pixmap size must be cleared, not painted"
+    );
+}
+
+#[test]
+fn leave_progress_is_clamped_and_nan_is_zero() {
+    for dissolve in [true, false] {
+        let leaving = |p| {
+            if dissolve {
+                Some(Leaving::Dissolve(p))
+            } else {
+                Some(Leaving::Drop(p))
+            }
+        };
+        let mut nan_card = card(solid(160, 100, [200, 90, 60, 255]), 0.0, 0);
+        nan_card.leaving = leaving(f64::NAN);
+        let mut zero_card = card(solid(160, 100, [200, 90, 60, 255]), 0.0, 0);
+        zero_card.leaving = leaving(0.0);
+        let nan = render(&scene(vec![nan_card], None, 1.0));
+        let zero = render(&scene(vec![zero_card], None, 1.0));
+        assert_eq!(nan.data(), zero.data(), "NaN progress must act as zero");
+
+        let mut done_card = card(solid(160, 100, [200, 90, 60, 255]), 0.0, 0);
+        done_card.leaving = leaving(5.0);
+        let done = render(&scene(vec![done_card], None, 1.0));
+        assert!(
+            done.data().as_chunks::<4>().0.iter().all(|p| p[3] == 0),
+            "progress above 1 must be clamped to 1"
+        );
+    }
+}

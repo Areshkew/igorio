@@ -97,6 +97,8 @@ fn main() {
     let four_b = four.with_scale(2.0);
     measure(&four_a);
     measure(&four_b);
+
+    timing_table(&four);
 }
 
 fn scene(cards: Vec<SceneCard>, hint: Option<&str>, scale: f64) -> Scene {
@@ -136,8 +138,20 @@ fn save(dir: &Path, name: &str, scene: &Scene) {
     let (width, height) = Renderer::pixmap_size(scene.scale);
     let mut pixmap = Pixmap::new(width, height).expect("pixmap");
     Renderer::new().render(scene, &mut pixmap);
+    assert_premultiplied(&pixmap);
     save_preview(&pixmap, &dir.join(name));
     println!("wrote {}", dir.join(name).display());
+}
+
+fn assert_premultiplied(pixmap: &Pixmap) {
+    for pixel in pixmap.pixels() {
+        assert!(
+            pixel.red() <= pixel.alpha()
+                && pixel.green() <= pixel.alpha()
+                && pixel.blue() <= pixel.alpha(),
+            "non-premultiplied pixel in {pixel:?}"
+        );
+    }
 }
 
 /// Composites over a light/dark checkerboard and enlarges 3x with nearest neighbour.
@@ -205,6 +219,102 @@ fn measure(scene: &Scene) {
         "render four cards @ scale {:.1}: {millis:.3} ms",
         scene.scale
     );
+}
+
+fn timing_table(base: &Scene) {
+    for scale in [1.0, 1.25, 2.0] {
+        time_scene("rest", base.with_scale(scale), |_, _| {});
+        time_scene("wobble", base.with_scale(scale), |i, scene| {
+            if let Some(top) = scene.cards.last_mut() {
+                top.wobble = (i % 200) as f64 / 199.0;
+            }
+        });
+        time_scene("dissolve", base.with_scale(scale), |i, scene| {
+            if let Some(top) = scene.cards.last_mut() {
+                top.leaving = Some(Leaving::Dissolve((i % 200) as f64 / 199.0));
+            }
+        });
+    }
+    first_frame_timing();
+}
+
+fn time_scene(label: &str, mut scene: Scene, mut step: impl FnMut(usize, &mut Scene)) {
+    let (width, height) = Renderer::pixmap_size(scene.scale);
+    let mut pixmap = Pixmap::new(width, height).expect("pixmap");
+    let mut renderer = Renderer::new();
+    for i in 0..10 {
+        step(i, &mut scene);
+        renderer.render(&scene, &mut pixmap);
+    }
+    let start = Instant::now();
+    for i in 0..200 {
+        step(i + 10, &mut scene);
+        renderer.render(&scene, &mut pixmap);
+    }
+    let millis = start.elapsed().as_secs_f64() * 1000.0 / 200.0;
+    println!(
+        "four cards + hint, scale {:.2}, {label}: {millis:.3} ms",
+        scene.scale
+    );
+}
+
+fn first_frame_timing() {
+    let colours = [
+        [180, 70, 55, 255],
+        [60, 130, 200, 255],
+        [70, 170, 110, 255],
+        [200, 160, 60, 255],
+    ];
+    let large: Vec<_> = colours
+        .into_iter()
+        .map(|colour| solid_image(3840, 2160, colour))
+        .collect();
+    let three = scene(
+        vec![
+            card(&large[0], 10.0, 2),
+            card(&large[1], -12.0, 1),
+            card(&large[2], 9.0, 0),
+        ],
+        None,
+        2.0,
+    );
+    let four = scene(
+        vec![
+            card(&large[0], 10.0, 3),
+            card(&large[1], -12.0, 2),
+            card(&large[2], 9.0, 1),
+            card(&large[3], -9.0, 0),
+        ],
+        None,
+        2.0,
+    );
+
+    let (width, height) = Renderer::pixmap_size(2.0);
+    let mut pixmap = Pixmap::new(width, height).expect("pixmap");
+    let mut renderer = Renderer::new();
+    for _ in 0..5 {
+        renderer.render(&three, &mut pixmap);
+    }
+
+    let mut first_total = 0.0;
+    for _ in 0..200 {
+        renderer.render(&three, &mut pixmap);
+        let start = Instant::now();
+        renderer.render(&four, &mut pixmap);
+        first_total += start.elapsed().as_secs_f64() * 1000.0;
+    }
+    println!(
+        "first frame after adding a 3840x2160 card @ scale 2.0: {:.3} ms",
+        first_total / 200.0
+    );
+}
+
+fn solid_image(width: u32, height: u32, colour: [u8; 4]) -> Arc<Image> {
+    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        pixel.copy_from_slice(&colour);
+    }
+    Arc::new(Image::new(width, height, rgba).expect("solid image"))
 }
 
 /// A deterministic screenshot stand-in: gradient, coloured blocks and thin lines.
