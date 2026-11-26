@@ -341,9 +341,7 @@ pub const TRANSIENT_MARKER_TYPES: &[&str] = &[
 
 /// Shell-safe path followed by a space, so the command line can continue.
 pub fn shell_quoted(path: &str) -> String {
-    let needs_quotes = path
-        .chars()
-        .any(|c| " '\"\\$`!&;|<>()*?[]{}#~".contains(c));
+    let needs_quotes = path.chars().any(|c| " '\"\\$`!&;|<>()*?[]{}#~".contains(c));
     if !needs_quotes {
         return format!("{path} ");
     }

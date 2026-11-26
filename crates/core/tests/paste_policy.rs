@@ -37,10 +37,7 @@ fn test_waits_for_release() {
 
 #[test]
 fn test_does_not_wait_forever_on_a_held_button() {
-    assert_eq!(
-        mouse_up_step(MOUSE_UP_TIMEOUT, true),
-        MouseUpStep::Proceed
-    );
+    assert_eq!(mouse_up_step(MOUSE_UP_TIMEOUT, true), MouseUpStep::Proceed);
 }
 
 // MARK: Outcome
@@ -175,10 +172,7 @@ fn test_shell_quoting() {
 #[test]
 fn test_waits_while_a_third_click_is_held() {
     let settle = TerminalSettle::default();
-    assert_eq!(
-        settle.step(0.3, true, 0.3, None),
-        MouseUpStep::Wait
-    );
+    assert_eq!(settle.step(0.3, true, 0.3, None), MouseUpStep::Wait);
 }
 
 #[test]
@@ -198,10 +192,7 @@ fn test_a_third_click_restarts_the_wait() {
 #[test]
 fn test_waits_while_the_clipboard_is_still_changing() {
     let settle = TerminalSettle::default();
-    assert_eq!(
-        settle.step(0.3, false, 0.3, Some(0.02)),
-        MouseUpStep::Wait
-    );
+    assert_eq!(settle.step(0.3, false, 0.3, Some(0.02)), MouseUpStep::Wait);
     assert_eq!(
         settle.step(0.4, false, 0.4, Some(0.12)),
         MouseUpStep::Proceed
