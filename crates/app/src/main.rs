@@ -4,18 +4,21 @@
 //! drop router. `igorio --demo N` starts with N generated screenshots on the pile.
 //! `FAIRY_DEBUG=1` logs every drop decision (see `drop_router::DebugLog`).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use igorio_app::draw::Renderer;
 use igorio_app::drop_router::{DebugLog, Drops};
 use igorio_app::follower::Follower;
 use igorio_app::hook::{self, MouseEvent, MouseHook};
+use igorio_app::layout::CardSize;
 use igorio_app::overlay::{self, Overlay};
 use igorio_app::saver;
 use igorio_app::settings::{self, DefaultFolders, Settings};
+use igorio_app::settings_window::{LiveSettings, SettingsWindow};
 use igorio_app::snip::{Snip, SnipEvent};
 use igorio_app::state::FairyState;
 use igorio_app::tray::{MenuItem, Tray};
@@ -35,6 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const MENU_RESTORE: u32 = 1;
 const MENU_ADD_DEMO: u32 = 2;
 const MENU_QUIT: u32 = 3;
+const MENU_SETTINGS: u32 = 4;
 
 /// Frame interval while something moves, in seconds.
 const FRAME: f64 = 0.008;
@@ -60,6 +64,12 @@ struct App {
 }
 
 impl App {
+    fn apply_card_size(&mut self, size: CardSize, now: f64) {
+        self.state.set_card_size(size, now);
+        self.follower.card_size = size;
+        self.dirty = true;
+    }
+
     fn add_demo(&mut self) {
         let image = Arc::new(demo_image(self.demo_count));
         self.demo_count += 1;
@@ -351,8 +361,62 @@ fn demo_count_from_args() -> usize {
     }
 }
 
+/// Serializes detector startup and shutdown off the overlay's frame loop.
+#[derive(Default)]
+struct Detector {
+    active: Option<Snip>,
+    transition: Option<JoinHandle<Option<Snip>>>,
+    retry_at: f64,
+}
+
+impl Detector {
+    fn stop(&mut self) {
+        if let Some(snip) = self.active.take() {
+            self.transition = Some(thread::spawn(move || {
+                if !snip.shutdown() {
+                    eprintln!("screenshot workers did not stop within their shutdown budget");
+                }
+                None
+            }));
+        }
+        self.retry_at = 0.0;
+    }
+
+    fn update(&mut self, enabled: bool, drops: Option<&Drops>, now: f64) {
+        if self.transition.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(transition) = self.transition.take()
+        {
+            self.active = transition.join().ok().flatten();
+        }
+        if !enabled {
+            self.stop();
+        } else if self.active.is_none() && self.transition.is_none() && now >= self.retry_at
+            && let Some(clipboard) = drops.and_then(Drops::clipboard)
+        {
+            self.retry_at = now + HEALTH_CHECK;
+            let start = Snip::starter(clipboard);
+            self.transition = Some(thread::spawn(move || match start() {
+                Ok(snip) => Some(snip),
+                Err(error) => {
+                    eprintln!("screenshot detection is off: {error}");
+                    None
+                }
+            }));
+        }
+    }
+}
+
+impl Drop for Detector {
+    fn drop(&mut self) {
+        // Both Snip startup and shutdown have bounded waits and need the clipboard alive.
+        drop(self.transition.take().and_then(|thread| thread.join().ok().flatten()));
+    }
+}
+
 fn main() -> windows::core::Result<()> {
     overlay::ensure_dpi_awareness();
+    let settings_path = settings::default_settings_path();
+    let mut settings = LiveSettings::from(Settings::load(&settings_path).unwrap_or_default());
 
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -375,6 +439,7 @@ fn main() -> windows::core::Result<()> {
         was_animating: false,
         demo_count: 0,
     }));
+    app.borrow_mut().apply_card_size(settings.card_size, hook::now());
     for _ in 0..demo_count_from_args() {
         app.borrow_mut().add_demo();
     }
@@ -382,6 +447,8 @@ fn main() -> windows::core::Result<()> {
     // The tray calls these from inside `DispatchMessageW`, when `app` is not borrowed.
     let menu_app = Rc::clone(&app);
     let action_app = Rc::clone(&app);
+    let open_settings = Rc::new(Cell::new(false));
+    let action_settings = Rc::clone(&open_settings);
     let _tray = Tray::new(
         "Igorio",
         Box::new(move || {
@@ -395,12 +462,14 @@ fn main() -> windows::core::Result<()> {
                 },
                 MenuItem::action(MENU_ADD_DEMO, "Add Demo Screenshot"),
                 MenuItem::Separator,
+                MenuItem::action(MENU_SETTINGS, "Settings…"),
                 MenuItem::action(MENU_QUIT, "Quit"),
             ]
         }),
         Box::new(move |id| match id {
             MENU_RESTORE => action_app.borrow_mut().restore_last(),
             MENU_ADD_DEMO => action_app.borrow_mut().add_demo(),
+            MENU_SETTINGS => action_settings.set(true),
             // SAFETY: posts WM_QUIT to this thread's own queue.
             MENU_QUIT => unsafe { PostQuitMessage(0) },
             _ => {}
@@ -414,8 +483,7 @@ fn main() -> windows::core::Result<()> {
     // The drop router and its workers (UI Automation, clipboard). Without them the app
     // still carries, shakes and restores. Dropping `drops` (on every way out of `main`,
     // errors and panics included) puts the user's clipboard back if a paste left ours there.
-    let settings = Settings::load(&settings::default_settings_path()).unwrap_or_default();
-    let mut drops = match Drops::start(settings.clone(), DebugLog::from_env()) {
+    let mut drops = match Drops::start(settings.snapshot.clone(), DebugLog::from_env()) {
         Ok(drops) => Some(drops),
         Err(why) => {
             eprintln!("double-click drops are off: {why}");
@@ -424,42 +492,50 @@ fn main() -> windows::core::Result<()> {
     };
     // This local is declared after `drops`, so it stops before clipboard restore and
     // shutdown on normal quit, error returns and unwinding.
-    let mut snip =
-        drops
-            .as_ref()
-            .and_then(Drops::clipboard)
-            .and_then(|clipboard| match Snip::start(clipboard) {
-                Ok(snip) => Some(snip),
-                Err(error) => {
-                    eprintln!("screenshot detection is off: {error}");
-                    None
-                }
-            });
+    let mut detector = Detector::default();
+    // This owner is dropped first on quit, error, and unwind.
+    let mut settings_window = SettingsWindow::new(settings_path)?;
     let mut snip_events = Vec::new();
-    let mut wakes = vec![mouse_hook.wake_handle()];
+    let mut wakes = vec![mouse_hook.wake_handle(), settings_window.wake_handle()];
     if let Some(drops) = &drops {
         wakes.extend(drops.wake_handles());
     }
-    if let Some(snip) = &snip {
-        wakes.push(snip.wake_handle());
-    }
+    let permanent_wakes = wakes.len();
     // When the next frame runs; `None` waits for a mouse move or a menu action.
     let mut due = Some(hook::now());
     let mut next_health_check = hook::now() + HEALTH_CHECK;
 
     while pump_messages() {
+        let now = hook::now();
+        if open_settings.replace(false) && let Err(error) = settings_window.open() {
+            eprintln!("could not queue Settings: {error}");
+        }
+        for saved in settings_window.saved() {
+            settings = saved.into();
+            if let Some(drops) = &mut drops {
+                drops.set_settings(&settings.snapshot);
+            }
+            let mut app = app.borrow_mut();
+            app.apply_card_size(settings.card_size, now);
+            if !settings.screenshot_detector {
+                detector.stop();
+                if app.state.hidden_for_capture() {
+                    app.capture_ui(false, now);
+                }
+            }
+        }
+        detector.update(settings.screenshot_detector, drops.as_ref(), now);
         mouse_hook.drain(&mut events);
-        if let Some(snip) = &snip {
+        if let Some(snip) = &detector.active {
             snip.drain(&mut snip_events);
         }
-        let now = hook::now();
         let mut router_due = None;
         {
             let mut app = app.borrow_mut();
             let app = &mut *app;
             // Treat the whole batch as capture input if visibility changed during
             // it. A shown/gone pair can arrive together with the selection clicks.
-            if app.screenshots(&mut snip_events, &settings) || app.state.hidden_for_capture() {
+            if app.screenshots(&mut snip_events, &settings.snapshot) || app.state.hidden_for_capture() {
                 events.clear();
             }
             let moved = app.mouse(&events);
@@ -486,7 +562,7 @@ fn main() -> windows::core::Result<()> {
                 // On failure the next check tries again.
                 let _ = mouse_hook.restart();
             }
-            if let Some(snip) = &mut snip
+            if let Some(snip) = &mut detector.active
                 && (!snip.is_alive() || snip.seems_stalled())
             {
                 let mut app = app.borrow_mut();
@@ -494,16 +570,22 @@ fn main() -> windows::core::Result<()> {
                     app.capture_ui(false, now);
                     due = Some(now);
                 }
-                let _ = snip.restart();
+                detector.stop();
             }
         }
-        let until = earlier(earlier(due, router_due), Some(next_health_check))
+        wakes.truncate(permanent_wakes);
+        if let Some(snip) = &detector.active {
+            wakes.push(snip.wake_handle());
+        }
+        let transition_due = detector.transition.is_some().then_some(now + FRAME);
+        let until = earlier(earlier(due, router_due), earlier(transition_due, Some(next_health_check)))
             .unwrap_or(next_health_check);
         let wait = Duration::from_secs_f64((until - hook::now()).max(0.0));
         sleeper.wait(wait, &wakes)?;
     }
     // Put the user's clipboard back if a paste left ours there, then stop the workers.
-    drop(snip);
+    drop(settings_window);
+    drop(detector);
     drop(drops);
     Ok(())
 }
