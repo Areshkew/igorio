@@ -1,4 +1,5 @@
 //! Exercises only our settings window and scratch files. No foreground activation or synthetic input.
+use std::cell::{Cell, RefCell};
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -7,12 +8,15 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use igorio_app::input::Held;
 use igorio_app::layout::CardSize;
 use igorio_app::overlay::ensure_dpi_awareness;
 use igorio_app::settings::Settings;
 use igorio_app::settings_window::{
-    Control::*, SettingsWindow, TestMode, TestScene, test_client_size,
+    Control, Control::*, SettingsWindow, ShortcutPart, ShortcutService, TestMode, TestScene,
+    test_client_size, test_window_size,
 };
+use igorio_app::shortcuts::{Action, Chord, Registration, RegistrationReport, Shortcuts};
 use windows::Win32::Foundation::{
     CloseHandle, FILETIME, HANDLE, HWND, LPARAM, RECT, WAIT_OBJECT_0, WPARAM,
 };
@@ -97,9 +101,9 @@ fn close(controller: &mut SettingsWindow, hwnd: HWND) -> bool {
     closed && at.elapsed() < Duration::from_secs(1) && !unsafe { IsWindow(Some(hwnd)) }.as_bool()
 }
 
-fn disk(controller: &SettingsWindow, path: &Path, expected: &Settings) -> bool {
+fn disk(controller: &mut SettingsWindow, path: &Path, expected: &Settings) -> bool {
     Settings::load(path).is_ok_and(|settings| &settings == expected)
-        && controller.saved().collect::<Vec<_>>() == [expected.clone()]
+        && controller.saved(None, &expected.shortcuts) == [expected.clone()]
 }
 
 fn tab_order(hwnd: HWND) -> bool {
@@ -107,6 +111,7 @@ fn tab_order(hwnd: HWND) -> bool {
     unsafe {
         let mut current = None;
         for id in [
+            GeneralTab,
             Screenshots,
             Keep,
             ChooseNotes,
@@ -124,7 +129,7 @@ fn tab_order(hwnd: HWND) -> bool {
             }
             current = Some(child);
         }
-        GetNextDlgTabItem(hwnd, current, false).ok() == Some(child(hwnd, Screenshots))
+        GetNextDlgTabItem(hwnd, current, false).ok() == Some(child(hwnd, GeneralTab))
             && GetNextDlgGroupItem(hwnd, Some(child(hwnd, Small)), false).ok()
                 == Some(child(hwnd, Medium))
             && GetNextDlgGroupItem(hwnd, Some(child(hwnd, Medium)), false).ok()
@@ -206,7 +211,7 @@ fn verify_controls(
             && text(child(hwnd, CardDimensions)) == "96 × 72 px",
     );
     checks.check(
-        "Tab wraps once through all tab stops and the radio group contains three choices",
+        "General page: Tab visits each enabled control once and the size group has three choices",
         tab_order(hwnd),
     );
     controller.open()?;
@@ -232,7 +237,7 @@ fn verify_controls(
     }
     checks.check(
         "disabled capability notifications leave the file alone",
-        Settings::load(path)? == expected && controller.saved().next().is_none(),
+        Settings::load(path)? == expected && controller.saved(None, &expected.shortcuts).is_empty(),
     );
 
     for (id, size, dimensions) in [
@@ -338,7 +343,7 @@ fn verify_controls(
         checked(child(hwnd, Keep))
             && text(child(hwnd, Status)).contains("could not be saved")
             && enabled(child(hwnd, Retry))
-            && controller.saved().next().is_none(),
+            && controller.saved(None, &expected.shortcuts).is_empty(),
     );
     drop(locked);
     expected.keep_every_screenshot = true;
@@ -348,6 +353,459 @@ fn verify_controls(
         disk(controller, path, &expected) && text(child(hwnd, Status)).is_empty(),
     );
     Ok(())
+}
+
+/// One call the window made, through `saved`, to the stand-in for the hotkey service.
+#[derive(Clone, Debug, PartialEq)]
+enum Call {
+    Paused(bool),
+    Apply(Shortcuts),
+    Report(usize),
+}
+
+/// Records what the window asks of the hotkey service and answers like it, without
+/// registering anything. `taken` is a chord "another program" holds; `hold` keeps reports back.
+struct FakeService {
+    calls: RefCell<Vec<Call>>,
+    applied: RefCell<Shortcuts>,
+    paused: Cell<bool>,
+    taken: Cell<Option<Chord>>,
+    hold: Cell<bool>,
+    queue: RefCell<Vec<RegistrationReport>>,
+}
+
+impl FakeService {
+    fn new(applied: Shortcuts) -> Self {
+        Self {
+            calls: RefCell::new(Vec::new()),
+            applied: RefCell::new(applied),
+            paused: Cell::new(false),
+            taken: Cell::new(None),
+            hold: Cell::new(false),
+            queue: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn tags(&self) -> Vec<usize> {
+        let calls = self.calls.borrow();
+        calls.iter().filter_map(|call| if let Call::Report(tag) = call { Some(*tag) } else { None }).filter(|tag| *tag != 0).collect()
+    }
+}
+
+impl ShortcutService for FakeService {
+    fn set_paused(&self, paused: bool) {
+        self.paused.set(paused);
+        self.calls.borrow_mut().push(Call::Paused(paused));
+    }
+
+    fn apply(&self, shortcuts: &Shortcuts) {
+        *self.applied.borrow_mut() = shortcuts.clone();
+        self.calls.borrow_mut().push(Call::Apply(shortcuts.clone()));
+    }
+
+    fn report_after_commands(&self, tag: usize) -> bool {
+        self.calls.borrow_mut().push(Call::Report(tag));
+        let applied = self.applied.borrow();
+        let entries = Action::ALL
+            .iter()
+            .map(|&action| {
+                let status = match applied.get(action) {
+                    _ if !action.available() => Registration::Unavailable,
+                    None => Registration::NotSet,
+                    Some(chord) if Some(chord) == self.taken.get() => Registration::Taken,
+                    Some(_) => Registration::Active,
+                };
+                (action, status)
+            })
+            .collect();
+        self.queue.borrow_mut().push(RegistrationReport { tag, entries });
+        true
+    }
+
+    fn reports(&self) -> Vec<RegistrationReport> {
+        if self.hold.get() { Vec::new() } else { std::mem::take(&mut *self.queue.borrow_mut()) }
+    }
+}
+
+/// Plays the UI loop: runs `saved` until `done` holds, for at most two seconds.
+struct Loop<'a> {
+    service: &'a FakeService,
+    current: Shortcuts,
+    saved: Vec<Settings>,
+}
+
+impl Loop<'_> {
+    fn turn(&mut self, controller: &mut SettingsWindow) {
+        for settings in controller.saved(Some(self.service), &self.current) {
+            self.current = settings.shortcuts.clone();
+            self.saved.push(settings);
+        }
+    }
+
+    fn until(&mut self, controller: &mut SettingsWindow, done: impl Fn(&Self) -> bool) -> bool {
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            self.turn(controller);
+            if done(self) {
+                return true;
+            }
+            if Instant::now() > until {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Lets queued requests and reports settle for a moment.
+    fn idle(&mut self, controller: &mut SettingsWindow) {
+        for _ in 0..20 {
+            self.turn(controller);
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+fn row(hwnd: HWND, action: Action, part: ShortcutPart) -> HWND {
+    child(hwnd, Control::shortcut(action, part))
+}
+
+fn visible(hwnd: HWND) -> bool {
+    // SAFETY: query a live test HWND.
+    unsafe { IsWindowVisible(hwnd).as_bool() }
+}
+
+const VK_SHIFT: u16 = 0x10;
+const VK_CONTROL: u16 = 0x11;
+const VK_MENU: u16 = 0x12;
+const VK_LWIN: u16 = 0x5B;
+const VK_BACK: u16 = 0x08;
+const VK_ESCAPE: u16 = 0x1B;
+const VK_TAB: u16 = 0x09;
+const VK_RETURN: u16 = 0x0D;
+
+/// Sends one key message to a recorder, as Windows would post it, with the modifiers the
+/// recorder reads through its test seam.
+fn key(controller: &SettingsWindow, target: HWND, vk: u16, held: Held, down: bool, repeat: bool) {
+    controller.test_modifiers(held);
+    let message = match (down, held.alt) {
+        (true, true) => WM_SYSKEYDOWN,
+        (true, false) => WM_KEYDOWN,
+        (false, true) => WM_SYSKEYUP,
+        (false, false) => WM_KEYUP,
+    };
+    let mut flags = 1isize | if held.alt { 1 << 29 } else { 0 };
+    if repeat || !down {
+        flags |= 1 << 30;
+    }
+    if !down {
+        flags |= 1 << 31;
+    }
+    // SAFETY: a key message to a control of our own test window, not synthetic input.
+    unsafe { SendMessageW(target, message, Some(WPARAM(vk as usize)), Some(LPARAM(flags))) };
+}
+
+/// Presses a chord on a recorder: the modifiers one by one, the key, then all released.
+fn press(controller: &SettingsWindow, target: HWND, text: &str) {
+    let chord = Chord::parse(text).expect("test chord");
+    let mut held = Held::default();
+    for (on, vk) in [(chord.ctrl, VK_CONTROL), (chord.alt, VK_MENU), (chord.shift, VK_SHIFT), (chord.win, VK_LWIN)] {
+        if on {
+            match vk {
+                VK_CONTROL => held.ctrl = true,
+                VK_MENU => held.alt = true,
+                VK_SHIFT => held.shift = true,
+                _ => held.win = true,
+            }
+            key(controller, target, vk, held, true, false);
+        }
+    }
+    key(controller, target, chord.key.vk(), held, true, false);
+    key(controller, target, chord.key.vk(), held, false, false);
+    key(controller, target, VK_CONTROL, Held::default(), false, false);
+}
+
+fn shown(chord: Option<&str>) -> String {
+    chord.map_or_else(|| "none".to_owned(), |text| Chord::parse(text).unwrap().display())
+}
+
+fn recorder_name(action: Action, chord: Option<&str>) -> String {
+    format!("{}, shortcut {}, press to change", action.label(), shown(chord))
+}
+
+fn refusal(text: &str, shortcuts: &Shortcuts, action: Action) -> String {
+    shortcuts.clone().set(action, Some(Chord::parse(text).unwrap())).unwrap_err().to_string()
+}
+
+/// The tab stops of the current page, in order, each once.
+fn tab_cycle(hwnd: HWND) -> Vec<HWND> {
+    let mut stops = Vec::new();
+    let mut current = None;
+    // SAFETY: walks the test window's own children.
+    while let Ok(next) = unsafe { GetNextDlgTabItem(hwnd, current, false) } {
+        if stops.contains(&next) || stops.len() > 100 {
+            break;
+        }
+        stops.push(next);
+        current = Some(next);
+    }
+    stops
+}
+
+const PROMPT: &str = "Press the keys · Esc cancels · Backspace clears";
+
+fn verify_pages(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: HWND) {
+    let general = [Capabilities, Screenshots, Keep, ChooseNotes, Small, Medium, Launch, WindowsShortcutNote];
+    let shortcut_parts = Action::ALL.iter().flat_map(|&action| {
+        [ShortcutPart::Label, ShortcutPart::Recorder, ShortcutPart::Status].map(|part| Control::shortcut(action, part))
+    });
+    checks.check(
+        "General page: its controls show, the Shortcuts page's are hidden and disabled",
+        checked(child(hwnd, GeneralTab))
+            && general.iter().all(|&id| visible(child(hwnd, id)))
+            && shortcut_parts.clone().all(|id| !visible(child(hwnd, id)) && !enabled(child(hwnd, id))),
+    );
+    click(hwnd, ShortcutsTab);
+    checks.check(
+        "Shortcuts page: General's controls are hidden and disabled, the rows show",
+        checked(child(hwnd, ShortcutsTab))
+            && !checked(child(hwnd, GeneralTab))
+            && general.iter().all(|&id| !visible(child(hwnd, id)) && !enabled(child(hwnd, id)))
+            && shortcut_parts.clone().all(|id| visible(child(hwnd, id))),
+    );
+    let expected: Vec<HWND> = [ShortcutsTab]
+        .into_iter()
+        .chain(Action::ALL.iter().filter(|action| action.available()).map(|&action| Control::shortcut(action, ShortcutPart::Recorder)))
+        .map(|id| child(hwnd, id))
+        .collect();
+    checks.check("Shortcuts page: Tab visits each enabled control once, in row order", tab_cycle(hwnd) == expected);
+    checks.check(
+        "unavailable rows: recorder disabled, Reset absent, default chips named, Not available yet",
+        Action::ALL.iter().filter(|action| !action.available()).all(|&action| {
+            let default = action.default_chord().map(|chord| chord.display());
+            !enabled(row(hwnd, action, ShortcutPart::Recorder))
+                && !visible(row(hwnd, action, ShortcutPart::Reset))
+                && text(row(hwnd, action, ShortcutPart::Recorder)) == recorder_name(action, default.as_deref())
+                && text(row(hwnd, action, ShortcutPart::Status)) == "Not available yet"
+        }),
+    );
+    // Ctrl+Tab goes through the window's own message loop: post it, with Ctrl held per the seam.
+    controller.test_modifiers(Held { ctrl: true, ..Held::default() });
+    // SAFETY: a key message posted to our own test window, not synthetic input.
+    unsafe {
+        let _ = PostMessageW(Some(row(hwnd, Action::RestoreLast, ShortcutPart::Recorder)), WM_KEYDOWN, WPARAM(VK_TAB as usize), LPARAM(1));
+    }
+    thread::sleep(Duration::from_millis(100));
+    let general_again = checked(child(hwnd, GeneralTab)) && visible(child(hwnd, Screenshots));
+    // SAFETY: as above.
+    unsafe {
+        let _ = PostMessageW(Some(child(hwnd, Screenshots)), WM_KEYDOWN, WPARAM(VK_TAB as usize), LPARAM(1));
+    }
+    thread::sleep(Duration::from_millis(100));
+    controller.test_modifiers(Held::default());
+    checks.check(
+        "Ctrl+Tab switches to General and back to Shortcuts",
+        general_again && checked(child(hwnd, ShortcutsTab)) && visible(row(hwnd, Action::RestoreLast, ShortcutPart::Label)),
+    );
+}
+
+fn verify_shortcuts(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: HWND, path: &Path) -> Result<()> {
+    let start = Settings::load(path)?;
+    let service = FakeService::new(start.shortcuts.clone());
+    let mut ui = Loop { service: &service, current: start.shortcuts.clone(), saved: Vec::new() };
+    ui.idle(controller);
+    verify_pages(checks, controller, hwnd);
+    let recorder = |action| row(hwnd, action, ShortcutPart::Recorder);
+    let status = |action| text(row(hwnd, action, ShortcutPart::Status));
+
+    // Each available action: set, saved, shown. The service pauses at the start and
+    // resumes at the end.
+    let chords = [
+        (Action::RestoreLast, "Ctrl+Alt+F9"),
+        (Action::DiscardTop, "Ctrl+Shift+F10"),
+        (Action::DiscardAll, "Alt+Shift+F11"),
+        (Action::OpenSettings, "Ctrl+Alt+Shift+F7"),
+    ];
+    for (action, chord) in chords {
+        service.calls.borrow_mut().clear();
+        click(hwnd, Control::shortcut(action, ShortcutPart::Recorder));
+        let paused = ui.until(controller, |ui| ui.service.paused.get());
+        let prompt = status(action) == PROMPT;
+        let saved_before = ui.saved.len();
+        press(controller, recorder(action), chord);
+        let done = ui.until(controller, |ui| ui.saved.len() > saved_before && !ui.service.paused.get());
+        ui.idle(controller);
+        let on_disk = Settings::load(path)?.shortcuts.get(action) == Chord::parse(chord).ok();
+        let calls = service.calls.borrow().clone();
+        let order = calls.first() == Some(&Call::Paused(true))
+            && calls.iter().rposition(|call| *call == Call::Paused(false)) > calls.iter().position(|call| *call == Call::Paused(true));
+        checks.check(
+            &format!("{} records {chord}: paused, saved, shown, resumed", action.label()),
+            paused && prompt && done && on_disk && order && !service.paused.get()
+                && text(recorder(action)) == recorder_name(action, Some(chord))
+                && status(action).is_empty()
+                && visible(row(hwnd, action, ShortcutPart::Reset)),
+        );
+    }
+
+    // Esc cancels; the repeat of Esc that follows does not reach the dialog (it would close it).
+    click(hwnd, Control::shortcut(Action::RestoreLast, ShortcutPart::Recorder));
+    let paused = ui.until(controller, |ui| ui.service.paused.get());
+    // The Enter that opened a recorder can still repeat: a repeat is not a new press.
+    key(controller, recorder(Action::RestoreLast), VK_RETURN, Held::default(), true, true);
+    let repeat_ignored = status(Action::RestoreLast) == PROMPT;
+    thread::sleep(Duration::from_millis(100));
+    let pulsing = !controller.test_idle();
+    let saved_before = ui.saved.len();
+    key(controller, recorder(Action::RestoreLast), VK_ESCAPE, Held::default(), true, false);
+    // SAFETY: key messages posted to our own test window, not synthetic input.
+    unsafe {
+        let target = Some(recorder(Action::RestoreLast));
+        let _ = PostMessageW(target, WM_KEYDOWN, WPARAM(VK_ESCAPE as usize), LPARAM(1 | 1 << 30));
+        let _ = PostMessageW(target, WM_KEYUP, WPARAM(VK_ESCAPE as usize), LPARAM(1 | 3 << 30));
+    }
+    let resumed = ui.until(controller, |ui| !ui.service.paused.get());
+    ui.idle(controller);
+    thread::sleep(Duration::from_millis(300));
+    println!("INFO the recorder's pulse ran the animation clock while recording: {pulsing}");
+    checks.check(
+        "an Enter repeat while recording is ignored; the pulse and timer stop after recording",
+        repeat_ignored && controller.test_idle(),
+    );
+    checks.check(
+        "Esc cancels and keeps the old shortcut; its repeat does not close the window",
+        paused && resumed && ui.saved.len() == saved_before
+            && text(recorder(Action::RestoreLast)) == recorder_name(Action::RestoreLast, Some("Ctrl+Alt+F9"))
+            && status(Action::RestoreLast).is_empty()
+            // SAFETY: same-process HWND query.
+            && unsafe { IsWindow(Some(hwnd)) }.as_bool()
+            && controller.test_hwnd() == Some(hwnd),
+    );
+
+    // Refused chords keep recording and say why. A chord another row holds names it.
+    click(hwnd, Control::shortcut(Action::DiscardTop, ShortcutPart::Recorder));
+    ui.until(controller, |ui| ui.service.paused.get());
+    let current = Settings::load(path)?.shortcuts;
+    for chord in ["Win+L", "PrtScn", "Ctrl+V", "Ctrl+Alt+Shift+F7"] {
+        press(controller, recorder(Action::DiscardTop), chord);
+        ui.idle(controller);
+        let expected = refusal(chord, &current, Action::DiscardTop);
+        checks.check(
+            &format!("{chord} is refused with \"{expected}\" and recording goes on"),
+            status(Action::DiscardTop) == expected && service.paused.get() && ui.saved.len() == saved_before,
+        );
+    }
+    checks.check(
+        "a chord another action holds names that action",
+        status(Action::DiscardTop) == "Already used by \"Open settings\".",
+    );
+
+    // Backspace clears.
+    key(controller, recorder(Action::DiscardTop), VK_BACK, Held::default(), true, false);
+    let cleared = ui.until(controller, |ui| ui.saved.last().is_some_and(|s| s.shortcuts.get(Action::DiscardTop).is_none()) && !ui.service.paused.get());
+    ui.idle(controller);
+    checks.check(
+        "Backspace clears the shortcut, saves and resumes; Reset leaves with it",
+        cleared && Settings::load(path)?.shortcuts.get(Action::DiscardTop).is_none()
+            && text(recorder(Action::DiscardTop)) == recorder_name(Action::DiscardTop, None)
+            && !visible(row(hwnd, Action::DiscardTop, ShortcutPart::Reset)),
+    );
+
+    // Reset is there only when the row differs from its default, and restores it.
+    let resets = Action::ALL.iter().all(|&action| {
+        let differs = action.available() && ui.current.get(action) != action.default_chord();
+        visible(row(hwnd, action, ShortcutPart::Reset)) == differs
+    });
+    click(hwnd, Control::shortcut(Action::DiscardAll, ShortcutPart::Reset));
+    let reset = ui.until(controller, |ui| ui.saved.last().is_some_and(|s| s.shortcuts.get(Action::DiscardAll) == Action::DiscardAll.default_chord()));
+    ui.idle(controller);
+    checks.check(
+        "Reset shows only on changed rows and restores the default",
+        resets && reset && !service.paused.get()
+            && !visible(row(hwnd, Action::DiscardAll, ShortcutPart::Reset))
+            && text(recorder(Action::DiscardAll)) == recorder_name(Action::DiscardAll, None),
+    );
+
+    // Unavailable rows cannot be edited.
+    service.calls.borrow_mut().clear();
+    click(hwnd, Control::shortcut(Action::Pen, ShortcutPart::Recorder));
+    press(controller, recorder(Action::Pen), "Ctrl+Alt+F6");
+    ui.idle(controller);
+    checks.check(
+        "an unavailable row ignores clicks and keys",
+        service.calls.borrow().is_empty() && Settings::load(path)?.shortcuts.get(Action::Pen) == Action::Pen.default_chord(),
+    );
+
+    // Another program holds the chord: the old one stays, unsaved, and the row says so.
+    let taken = "Ctrl+Alt+F8";
+    service.taken.set(Chord::parse(taken).ok());
+    let saved_before = ui.saved.len();
+    click(hwnd, Control::shortcut(Action::RestoreLast, ShortcutPart::Recorder));
+    ui.until(controller, |ui| ui.service.paused.get());
+    press(controller, recorder(Action::RestoreLast), taken);
+    let message = format!("Another program already uses {taken}");
+    let reverted = ui.until(controller, |_| status(Action::RestoreLast) == message);
+    ui.idle(controller);
+    checks.check(
+        "a Taken answer keeps the old shortcut, saves nothing, resumes and says so",
+        reverted && ui.saved.len() == saved_before && !service.paused.get()
+            && service.applied.borrow().get(Action::RestoreLast) == Chord::parse("Ctrl+Alt+F9").ok()
+            && Settings::load(path)?.shortcuts.get(Action::RestoreLast) == Chord::parse("Ctrl+Alt+F9").ok()
+            && text(recorder(Action::RestoreLast)) == recorder_name(Action::RestoreLast, Some("Ctrl+Alt+F9")),
+    );
+    service.taken.set(None);
+
+    // A report with an old tag is ignored; the current one completes the change.
+    let old_tag = *service.tags().last().expect("an earlier check");
+    service.hold.set(true);
+    click(hwnd, Control::shortcut(Action::RestoreLast, ShortcutPart::Recorder));
+    ui.until(controller, |ui| ui.service.paused.get());
+    press(controller, recorder(Action::RestoreLast), "Ctrl+Alt+Q");
+    ui.until(controller, |ui| ui.service.tags().last() != Some(&old_tag));
+    let taken_entries = Action::ALL.iter().map(|&action| (action, Registration::Taken)).collect();
+    controller.publish_registration(RegistrationReport { tag: old_tag, entries: taken_entries });
+    thread::sleep(Duration::from_millis(100));
+    let ignored = status(Action::RestoreLast) == PROMPT && ui.saved.len() == saved_before;
+    service.hold.set(false);
+    let done = ui.until(controller, |ui| ui.saved.len() > saved_before && !ui.service.paused.get());
+    ui.idle(controller);
+    checks.check("a report with an old tag is ignored", ignored);
+    checks.check(
+        "the current report saves Ctrl+Alt+Q and shows the layout hint",
+        done && text(recorder(Action::RestoreLast)) == recorder_name(Action::RestoreLast, Some("Ctrl+Alt+Q"))
+            && status(Action::RestoreLast) == "On some keyboard layouts this combination types a character.",
+    );
+
+    // The shortcuts survive a reload.
+    let reloaded = Settings::load(path)?.shortcuts;
+    checks.check(
+        "settings.json holds every recorded shortcut",
+        reloaded.get(Action::RestoreLast) == Chord::parse("Ctrl+Alt+Q").ok()
+            && reloaded.get(Action::DiscardTop).is_none()
+            && reloaded.get(Action::DiscardAll).is_none()
+            && reloaded.get(Action::OpenSettings) == Chord::parse("Ctrl+Alt+Shift+F7").ok(),
+    );
+    click(hwnd, GeneralTab);
+    ui.idle(controller);
+    Ok(())
+}
+
+/// Starts recording on Restore last screenshot and waits for the pause.
+fn start_recording(controller: &mut SettingsWindow, hwnd: HWND, ui: &mut Loop<'_>) -> bool {
+    click(hwnd, ShortcutsTab);
+    click(hwnd, Control::shortcut(Action::RestoreLast, ShortcutPart::Recorder));
+    ui.until(controller, |ui| ui.service.paused.get())
+}
+
+fn verify_window_fits(checks: &mut Checks) {
+    for (width, height, dpi) in [(1366, 768, 96), (1920, 1080, 144)] {
+        let work = height - (48 * dpi as i32 + 95) / 96;
+        let (w, h) = test_window_size(dpi);
+        let (cw, ch) = test_client_size(dpi);
+        checks.check(
+            &format!("{width}x{height} at {}%: window {w} x {h} (client {cw} x {ch}) fits the {width} x {work} work area", dpi * 100 / 96),
+            w <= width && h <= work,
+        );
+    }
 }
 
 fn memory() -> Result<(usize, usize)> {
@@ -383,7 +841,7 @@ fn process_cpu() -> Result<u64> {
     Ok(ticks(kernel) + ticks(user))
 }
 
-fn check_idle(checks: &mut Checks, window: &SettingsWindow) -> Result<()> {
+fn check_idle(checks: &mut Checks, window: &SettingsWindow, page: &str) -> Result<()> {
     thread::sleep(Duration::from_millis(250));
     let timer_stopped = window.test_idle();
     let before = process_cpu()?;
@@ -392,11 +850,11 @@ fn check_idle(checks: &mut Checks, window: &SettingsWindow) -> Result<()> {
     let cpu = process_cpu()? - before;
     let seconds = at.elapsed().as_secs_f64();
     checks.check(
-        "animation timer is stopped before and after two idle seconds",
+        &format!("{page} page: animation timer is stopped before and after two idle seconds"),
         timer_stopped && window.test_idle(),
     );
     checks.check(
-        &format!("idle process CPU {:.3} ms over {seconds:.3} s", cpu as f64 / 10_000.0),
+        &format!("{page} page: idle process CPU {:.3} ms over {seconds:.3} s", cpu as f64 / 10_000.0),
         cpu == 0,
     );
     Ok(())
@@ -503,24 +961,67 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
             thread::sleep(Duration::from_millis(200));
             report_memory("while open")?;
             verify_controls(&mut checks, &mut controller, hwnd, &path, &defaults)?;
+            verify_shortcuts(&mut checks, &mut controller, hwnd, &path)?;
         } else {
             checks.check(
-                &format!("cycle {cycle} reloads the saved check states"),
+                &format!("cycle {cycle} reloads the saved check states and shortcuts"),
                 checked(child(hwnd, Screenshots))
                     && checked(child(hwnd, Medium))
                     && checked(child(hwnd, Keep))
-                    && !checked(child(hwnd, Launch)),
+                    && !checked(child(hwnd, Launch))
+                    && text(row(hwnd, Action::RestoreLast, ShortcutPart::Recorder))
+                        == recorder_name(Action::RestoreLast, Some("Ctrl+Alt+Q")),
             );
         }
-        checks.check(
-            &format!("cycle {cycle} closes HWND and joins the STA within one second"),
-            close(&mut controller, hwnd),
-        );
+        let service = FakeService::new(Settings::load(&path)?.shortcuts);
+        let mut ui = Loop { service: &service, current: service.applied.borrow().clone(), saved: Vec::new() };
+        match cycle {
+            2 => {
+                let paused = start_recording(&mut controller, hwnd, &mut ui);
+                let closed = close(&mut controller, hwnd);
+                let resumed = ui.until(&mut controller, |ui| !ui.service.paused.get());
+                checks.check(
+                    "cycle 2 closes mid-recording within one second and the service resumes",
+                    paused && closed && resumed,
+                );
+            }
+            3 => {
+                let paused = start_recording(&mut controller, hwnd, &mut ui);
+                controller.test_die();
+                let resumed = ui.until(&mut controller, |ui| !ui.service.paused.get());
+                checks.check(
+                    "cycle 3: the settings thread ends mid-recording without a word, the service resumes",
+                    paused && resumed && ui.service.calls.borrow().last() == Some(&Call::Report(0)),
+                );
+                checks.check("cycle 3 joins the ended STA within one second", close(&mut controller, hwnd));
+            }
+            _ => checks.check(
+                &format!("cycle {cycle} closes HWND and joins the STA within one second"),
+                close(&mut controller, hwnd),
+            ),
+        }
         thread::sleep(Duration::from_millis(100));
     }
     cycles_done.store(true, Relaxed);
     thread::sleep(Duration::from_millis(250));
     report_memory("after third close")?;
+
+    {
+        let mut window = SettingsWindow::for_test(path.clone(), defaults.clone())?;
+        let hwnd = open(&mut window)?;
+        let service = FakeService::new(Settings::load(&path)?.shortcuts);
+        let mut ui = Loop { service: &service, current: service.applied.borrow().clone(), saved: Vec::new() };
+        let paused = start_recording(&mut window, hwnd, &mut ui);
+        let current = ui.current.clone();
+        window.shutdown(Some(&service), &current);
+        checks.check(
+            "the app quits mid-recording: the window closes and the service resumes",
+            paused && !service.paused.get()
+                // SAFETY: same-process HWND query.
+                && !unsafe { IsWindow(Some(hwnd)) }.as_bool(),
+        );
+    }
+    verify_window_fits(&mut checks);
 
     let locked = lock(&path)?;
     let hwnd = open(&mut controller)?;
@@ -552,27 +1053,37 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
     checks.check(
         "locked-file window cannot overwrite after the file unlocks",
         Settings::load(&path)?.is_enabled("fairy.screenshots")
-            && controller.saved().next().is_none(),
+            && controller.saved(None, &Shortcuts::default()).is_empty(),
     );
     checks.check("locked-file window closes within one second", close(&mut controller, hwnd));
 
-    Settings::default().save(&path)?;
-    for (name, dark, dpi) in [
-        ("settings-light-100.png", false, 96),
-        ("settings-dark-100.png", true, 96),
-        ("settings-dark-125.png", true, 120),
-    ] {
+    let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    // A mix of set and unset rows, one with a punctuation key.
+    let mut seeded = Settings::default();
+    for (action, chord) in [(Action::RestoreLast, "Ctrl+Alt+F9"), (Action::OpenSettings, "Ctrl+Shift+[")] {
+        seeded.shortcuts.set(action, Chord::parse(chord).ok()).map_err(|error| error.to_string())?;
+    }
+    for (dark, dpi, suffix) in [(false, 96, "light-100"), (true, 120, "dark-125")] {
+        seeded.save(&path)?;
         let mode = TestMode { dark, dpi, ..defaults.clone() };
         let mut window = SettingsWindow::for_test(path.clone(), mode)?;
         let hwnd = open(&mut window)?;
-        if dark && dpi == 120 {
-            check_idle(&mut checks, &window)?;
+        let service = FakeService::new(seeded.shortcuts.clone());
+        let mut ui = Loop { service: &service, current: seeded.shortcuts.clone(), saved: Vec::new() };
+        ui.idle(&mut window);
+        if dark {
+            check_idle(&mut checks, &window, "General")?;
+            click(hwnd, ShortcutsTab);
+            ui.idle(&mut window);
+            check_idle(&mut checks, &window, "Shortcuts")?;
+            click(hwnd, GeneralTab);
+            ui.idle(&mut window);
         }
-        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
         window.test_scene(TestScene::Settled);
-        let output = folder.join(name);
-        checks.check(name, capture(hwnd, &output, dpi)?);
-        if dark && dpi == 120 {
+        let name = format!("settings-pages-general-{suffix}.png");
+        let output = folder.join(&name);
+        checks.check(&name, capture(hwnd, &output, dpi)?);
+        if dark {
             let mut frames = std::collections::BTreeSet::from([fs::read(&output)?]);
             for (scene, name) in [
                 (TestScene::SwitchSlide, "settings-motion-switch.png"),
@@ -588,9 +1099,84 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
                     .check(name, capture(hwnd, &output, dpi)? && frames.insert(fs::read(&output)?));
             }
         }
+        click(hwnd, ShortcutsTab);
+        ui.idle(&mut window);
+        window.test_scene(TestScene::Settled);
+        let name = format!("settings-pages-shortcuts-{suffix}.png");
+        checks.check(&name, capture(hwnd, &folder.join(&name), dpi)?);
+        if dark {
+            window.test_scene(TestScene::PageSlide);
+            checks.check("settings-pages-slide.png", capture(hwnd, &folder.join("settings-pages-slide.png"), dpi)?);
+        } else {
+            capture_rows(&mut checks, &mut window, hwnd, &mut ui, &folder)?;
+        }
         checks.check("capture window closes within one second", close(&mut window, hwnd));
     }
     Ok(checks.ok)
+}
+
+/// The Shortcuts page in its states, at 100% light.
+fn capture_rows(
+    checks: &mut Checks,
+    window: &mut SettingsWindow,
+    hwnd: HWND,
+    ui: &mut Loop<'_>,
+    folder: &Path,
+) -> Result<()> {
+    let recorder = |action| row(hwnd, action, ShortcutPart::Recorder);
+    let shot = |checks: &mut Checks, window: &SettingsWindow, name: &str| -> Result<()> {
+        window.test_scene(TestScene::Settled);
+        checks.check(name, capture(hwnd, &folder.join(name), 96)?);
+        Ok(())
+    };
+    let cancel = |window: &SettingsWindow, action| {
+        key(window, recorder(action), VK_ESCAPE, Held::default(), true, false);
+        key(window, recorder(action), VK_ESCAPE, Held::default(), false, false);
+    };
+
+    // A mix of set and unset rows, with a long chord.
+    click(hwnd, Control::shortcut(Action::DiscardAll, ShortcutPart::Recorder));
+    ui.until(window, |ui| ui.service.paused.get());
+    press(window, recorder(Action::DiscardAll), "Ctrl+Alt+Shift+Win+F13");
+    ui.until(window, |ui| !ui.service.paused.get());
+    ui.idle(window);
+    shot(checks, window, "settings-shortcuts-mixed.png")?;
+
+    // Recording, Ctrl and Shift held.
+    click(hwnd, Control::shortcut(Action::DiscardTop, ShortcutPart::Recorder));
+    ui.until(window, |ui| ui.service.paused.get());
+    let ctrl = Held { ctrl: true, ..Held::default() };
+    key(window, recorder(Action::DiscardTop), VK_CONTROL, ctrl, true, false);
+    key(window, recorder(Action::DiscardTop), VK_SHIFT, Held { shift: true, ..ctrl }, true, false);
+    shot(checks, window, "settings-shortcuts-recording.png")?;
+
+    // A refused chord.
+    press(window, recorder(Action::DiscardTop), "Win+L");
+    shot(checks, window, "settings-shortcuts-error.png")?;
+    cancel(window, Action::DiscardTop);
+    ui.until(window, |ui| !ui.service.paused.get());
+
+    // Another program holds it.
+    ui.service.taken.set(Chord::parse("Ctrl+Alt+F8").ok());
+    click(hwnd, Control::shortcut(Action::DiscardTop, ShortcutPart::Recorder));
+    ui.until(window, |ui| ui.service.paused.get());
+    press(window, recorder(Action::DiscardTop), "Ctrl+Alt+F8");
+    ui.until(window, |ui| !ui.service.paused.get());
+    ui.idle(window);
+    shot(checks, window, "settings-shortcuts-taken.png")?;
+    ui.service.taken.set(None);
+    click(hwnd, Control::shortcut(Action::DiscardTop, ShortcutPart::Recorder));
+    cancel(window, Action::DiscardTop);
+    ui.until(window, |ui| !ui.service.paused.get());
+
+    // A hint after a successful set.
+    click(hwnd, Control::shortcut(Action::DiscardTop, ShortcutPart::Recorder));
+    ui.until(window, |ui| ui.service.paused.get());
+    press(window, recorder(Action::DiscardTop), "Alt+K");
+    ui.until(window, |ui| !ui.service.paused.get());
+    ui.idle(window);
+    shot(checks, window, "settings-shortcuts-warning.png")?;
+    Ok(())
 }
 
 struct Timer(HANDLE);

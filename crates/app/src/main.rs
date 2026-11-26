@@ -18,7 +18,7 @@ use igorio_app::layout::CardSize;
 use igorio_app::overlay::{self, Overlay};
 use igorio_app::saver;
 use igorio_app::settings::{self, DefaultFolders, Settings};
-use igorio_app::settings_window::{LiveSettings, SettingsWindow};
+use igorio_app::settings_window::{LiveSettings, SettingsWindow, ShortcutService};
 use igorio_app::shortcuts::{Action, Hotkeys};
 use igorio_app::snip::{Snip, SnipEvent};
 use igorio_app::state::FairyState;
@@ -551,13 +551,12 @@ fn main() -> windows::core::Result<()> {
         if open_settings.replace(false) && let Err(error) = settings_window.open() {
             eprintln!("could not queue Settings: {error}");
         }
-        for saved in settings_window.saved() {
+        // Also carries the shortcut recorder's pause, resume and registration checks.
+        let service = hotkeys.as_ref().map(|hotkeys| hotkeys as &dyn ShortcutService);
+        for saved in settings_window.saved(service, &settings.snapshot.shortcuts) {
             settings = saved.into();
             if let Some(drops) = &mut drops {
                 drops.set_settings(&settings.snapshot);
-            }
-            if let Some(hotkeys) = &hotkeys {
-                hotkeys.apply(&settings.snapshot.shortcuts);
             }
             let mut app = app.borrow_mut();
             app.apply_card_size(settings.card_size, now);
@@ -628,12 +627,14 @@ fn main() -> windows::core::Result<()> {
         sleeper.wait(wait, &wakes)?;
     }
     // Put the user's clipboard back if a paste left ours there, then stop the workers.
+    // The settings window goes first: a recording open in it resumes the hotkeys.
+    let service = hotkeys.as_ref().map(|hotkeys| hotkeys as &dyn ShortcutService);
+    settings_window.shutdown(service, &settings.snapshot.shortcuts);
     if let Some(hotkeys) = hotkeys.take()
         && !hotkeys.shutdown()
     {
         eprintln!("the shortcut thread did not stop within its shutdown budget");
     }
-    drop(settings_window);
     drop(detector);
     drop(drops);
     Ok(())

@@ -6,7 +6,7 @@ use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -31,7 +31,7 @@ use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, IsWindowEnabled, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VK_MENU, VK_RETURN,
+    VK_MENU, VK_RETURN, VK_TAB,
 };
 use windows::Win32::UI::Shell::{
     DefSubclassProc, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog,
@@ -41,14 +41,23 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Error, HRESULT, PCWSTR, Result, w};
 
+use crate::input::Held;
 use crate::layout::CardSize;
 use crate::overlay::{cursor_pos, monitor_at};
 use crate::settings::{DefaultFolders, Settings};
+use crate::shortcuts::{
+    Action, Chord, Hotkeys, RecorderInput, Registration, RegistrationReport, Shortcuts,
+    chord_from_key_event, display_for_layout, held_for_message,
+};
 
 const SCREENSHOTS: &str = "fairy.screenshots";
 const CLASS: PCWSTR = w!("IgorioSettings");
 const OPEN: u32 = WM_APP + 1;
 const PICK: u32 = WM_APP + 2;
+const SHORTCUT_STATUS: u32 = WM_APP + 6;
+const TEST_DIE: u32 = WM_APP + 7;
+/// Tags the window's registration checks. Tag 0 is the untagged status after a save or resume.
+static NEXT_TAG: AtomicUsize = AtomicUsize::new(1);
 const WORKER_EXITED: isize = -1;
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
 const EX_STYLE: WINDOW_EX_STYLE = WS_EX_APPWINDOW;
@@ -92,11 +101,21 @@ struct Lifetime {
     hwnd: AtomicIsize,
     stop: AtomicBool,
     wake: Arc<Wake>,
-    saved: Sender<Settings>,
+    requests: Sender<Request>,
+    reports: Mutex<Vec<RegistrationReport>>,
+    /// Test only: the window stops sending requests, as if its thread had died.
+    muted: AtomicBool,
+    test_modifiers: Mutex<Held>,
     test_choice: Mutex<Option<(Folder, PathBuf)>>,
 }
 
 impl Lifetime {
+    fn emit(&self, request: Request) {
+        if !self.muted.load(SeqCst) && self.requests.send(request).is_ok() {
+            self.signal();
+        }
+    }
+
     fn post(&self, message: u32) {
         let hwnd = self.hwnd.load(SeqCst);
         if hwnd != 0 && hwnd != WORKER_EXITED {
@@ -110,6 +129,51 @@ impl Lifetime {
     fn signal(&self) {
         // SAFETY: the Arc keeps the auto-reset event live during this call.
         let _ = unsafe { SetEvent(self.wake.0) };
+    }
+
+    fn exited(&self) -> bool {
+        self.hwnd.load(SeqCst) == WORKER_EXITED
+    }
+}
+
+/// What the settings thread asks of the UI loop.
+enum Request {
+    Saved(Settings),
+    /// A recorder opened: stop every hotkey, so the keys reach the window.
+    Pause,
+    /// Register `proposed` (not saved yet), resume, and report back with `tag`.
+    Check { tag: usize, proposed: Shortcuts },
+    /// The recorder closed: register the saved shortcuts again and resume.
+    Resume,
+    /// The window opened: report the registrations.
+    Status,
+}
+
+/// The hotkey service as the settings window uses it. The UI loop owns the service and
+/// passes it to [`SettingsWindow::saved`]; the self-test passes a stand-in.
+pub trait ShortcutService {
+    fn set_paused(&self, paused: bool);
+    fn apply(&self, shortcuts: &Shortcuts);
+    /// Queues a status report with this tag behind the earlier commands. False if it cannot.
+    fn report_after_commands(&self, tag: usize) -> bool;
+    fn reports(&self) -> Vec<RegistrationReport>;
+}
+
+impl ShortcutService for Hotkeys {
+    fn set_paused(&self, paused: bool) {
+        Hotkeys::set_paused(self, paused);
+    }
+
+    fn apply(&self, shortcuts: &Shortcuts) {
+        Hotkeys::apply(self, shortcuts);
+    }
+
+    fn report_after_commands(&self, tag: usize) -> bool {
+        Hotkeys::report_after_commands(self, tag)
+    }
+
+    fn reports(&self) -> Vec<RegistrationReport> {
+        Hotkeys::reports(self)
     }
 }
 
@@ -146,12 +210,19 @@ impl TestMode {
 }
 
 /// Overlay-owned endpoint. Open only spawns or posts. Settings writes stay on the STA.
+///
+/// It also holds the guarantee that a shortcut recorder never leaves the hotkey service
+/// paused: from the first `Pause` or `Check` until the matching `Resume`, `session` names the
+/// window that asked, and [`saved`](Self::saved) resumes the service itself as soon as that
+/// window's thread has ended (closed, failed or unwound) without asking. [`shutdown`](Self::shutdown)
+/// does the same when the app quits.
 pub struct SettingsWindow {
     options: Options,
     wake: Arc<Wake>,
-    saved: Sender<Settings>,
-    snapshots: Receiver<Settings>,
+    requests_tx: Sender<Request>,
+    requests_rx: Receiver<Request>,
     worker: Option<(Arc<Lifetime>, JoinHandle<()>)>,
+    session: Option<Arc<Lifetime>>,
 }
 
 impl SettingsWindow {
@@ -167,22 +238,141 @@ impl SettingsWindow {
     fn with_options(options: Options) -> Result<Self> {
         // SAFETY: unnamed auto-reset event; the result is owned by Wake.
         let wake = Arc::new(Wake(unsafe { CreateEventW(None, false, false, None)? }));
-        let (saved, snapshots) = mpsc::channel();
-        Ok(Self { options, wake, saved, snapshots, worker: None })
+        let (requests_tx, requests_rx) = mpsc::channel();
+        Ok(Self { options, wake, requests_tx, requests_rx, worker: None, session: None })
     }
 
     pub fn wake_handle(&self) -> HANDLE {
         self.wake.0
     }
 
-    pub fn saved(&self) -> impl Iterator<Item = Settings> + '_ {
-        self.snapshots.try_iter()
+    /// Runs on the UI loop: carries out the window's requests to the hotkey service, sends
+    /// its reports back to the window, and returns the saved snapshots, oldest first.
+    /// `current` is what the service has registered: the last saved shortcuts.
+    pub fn saved(
+        &mut self,
+        service: Option<&dyn ShortcutService>,
+        current: &Shortcuts,
+    ) -> Vec<Settings> {
+        let mut current = current.clone();
+        let mut saved = Vec::new();
+        while let Ok(request) = self.requests_rx.try_recv() {
+            match request {
+                Request::Saved(settings) => {
+                    if settings.shortcuts != current {
+                        current = settings.shortcuts.clone();
+                        if let Some(service) = service {
+                            service.apply(&current);
+                        }
+                        self.report(service, 0);
+                    }
+                    saved.push(settings);
+                }
+                Request::Pause => {
+                    self.open_session();
+                    if let Some(service) = service {
+                        service.set_paused(true);
+                    }
+                }
+                Request::Check { tag, proposed } => {
+                    self.open_session();
+                    if let Some(service) = service {
+                        service.apply(&proposed);
+                        service.set_paused(false);
+                    }
+                    self.report(service, tag);
+                }
+                Request::Resume => self.resume(service, &current),
+                Request::Status => self.report(service, 0),
+            }
+        }
+        if self.session.as_ref().is_some_and(|life| life.exited()) {
+            self.resume(service, &current);
+        }
+        if let Some(service) = service {
+            for report in service.reports() {
+                self.publish_registration(report);
+            }
+        }
+        saved
+    }
+
+    fn open_session(&mut self) {
+        if self.session.is_none() {
+            self.session = self.worker.as_ref().map(|(life, _)| Arc::clone(life));
+        }
+    }
+
+    fn resume(&mut self, service: Option<&dyn ShortcutService>, current: &Shortcuts) {
+        self.session = None;
+        if let Some(service) = service {
+            service.apply(current);
+            service.set_paused(false);
+        }
+        self.report(service, 0);
+    }
+
+    fn report(&self, service: Option<&dyn ShortcutService>, tag: usize) {
+        if service.is_some_and(|service| service.report_after_commands(tag)) {
+            return;
+        }
+        let entries = Action::ALL
+            .iter()
+            .map(|&action| {
+                let status = if action.available() {
+                    Registration::Failed("Keyboard shortcuts are off.".into())
+                } else {
+                    Registration::Unavailable
+                };
+                (action, status)
+            })
+            .collect();
+        self.publish_registration(RegistrationReport { tag, entries });
+    }
+
+    /// Closes the window on quit and leaves the hotkey service running, never paused.
+    pub fn shutdown(mut self, service: Option<&dyn ShortcutService>, current: &Shortcuts) {
+        if !self.close() {
+            eprintln!("settings thread did not exit within the quit budget");
+        }
+        let _ = self.saved(service, current);
+        if self.session.is_some() {
+            self.resume(service, current);
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn publish_registration(&self, report: RegistrationReport) {
+        if let Some((worker, _)) = &self.worker {
+            worker.reports.lock().unwrap_or_else(|e| e.into_inner()).push(report);
+            worker.post(SHORTCUT_STATUS);
+        }
+    }
+
+    /// Test only: the modifiers the recorder reads instead of `GetKeyState`, which a sent
+    /// key message does not change.
+    #[doc(hidden)]
+    pub fn test_modifiers(&self, held: Held) {
+        if self.options.test.is_some()
+            && let Some((worker, _)) = &self.worker
+        {
+            *worker.test_modifiers.lock().unwrap_or_else(|e| e.into_inner()) = held;
+        }
+    }
+
+    /// Test only: the window thread ends without a word to the UI loop, as if it had died.
+    #[doc(hidden)]
+    pub fn test_die(&self) {
+        if let Some(hwnd) = self.test_hwnd() {
+            // SAFETY: scalar test command to our own settings window.
+            unsafe { SendMessageW(hwnd, TEST_DIE, None, None) };
+        }
     }
 
     pub fn open(&mut self) -> io::Result<()> {
         if let Some((life, thread)) = &self.worker
             && !thread.is_finished()
-            && life.hwnd.load(SeqCst) != WORKER_EXITED
+            && !life.exited()
         {
             life.post(OPEN);
             return Ok(());
@@ -191,17 +381,28 @@ impl SettingsWindow {
             hwnd: AtomicIsize::new(0),
             stop: AtomicBool::new(false),
             wake: Arc::clone(&self.wake),
-            saved: self.saved.clone(),
+            requests: self.requests_tx.clone(),
+            reports: Mutex::new(Vec::new()),
+            muted: AtomicBool::new(false),
+            test_modifiers: Mutex::new(Held::default()),
             test_choice: Mutex::new(None),
         });
         let options = self.options.clone();
         let worker_life = Arc::clone(&life);
         let thread = thread::Builder::new().name("settings".into()).spawn(move || {
-            if let Err(error) = run_window(&options, &worker_life) {
+            /// Marks the worker gone and wakes the UI loop on every way out, unwinding included.
+            struct Exit(Arc<Lifetime>);
+            impl Drop for Exit {
+                fn drop(&mut self) {
+                    // run_window has destroyed the HWND and released the STA.
+                    self.0.hwnd.store(WORKER_EXITED, SeqCst);
+                    self.0.signal();
+                }
+            }
+            let exit = Exit(worker_life);
+            if let Err(error) = run_window(&options, &exit.0) {
                 eprintln!("could not open settings: {error}");
             }
-            // run_window has destroyed the HWND and released the STA.
-            worker_life.hwnd.store(WORKER_EXITED, SeqCst);
         })?;
         self.worker = Some((life, thread));
         Ok(())
@@ -264,6 +465,8 @@ pub enum TestScene {
     ButtonPress,
     SwitchFocus,
     CardFocus,
+    /// The page switch an eighth of the way through its time: about half of its distance.
+    PageSlide,
 }
 
 const TEST_SCENE: u32 = WM_APP + 4;
@@ -311,6 +514,9 @@ impl Window<'_> {
             button.press = Transition::default();
         }
         let from = 1000.0;
+        if motion.pulse_since.is_some() {
+            motion.pulse_since = Some(from);
+        }
         let sample = match scene {
             n if n == TestScene::SwitchSlide as usize => {
                 let track = &mut motion.buttons[Screenshots.index()].checked;
@@ -339,6 +545,14 @@ impl Window<'_> {
                 motion.select_card(0, from, 0.0);
                 motion.buttons[Small.index()].focus.retarget(1.0, from, FOCUS_MS);
                 from + FOCUS_MS
+            }
+            n if n == TestScene::PageSlide as usize => {
+                let to = if self.page.get() == Page::Shortcuts { 1.0 } else { 0.0 };
+                motion.page.retarget(1.0 - to, from, 0.0);
+                motion.page.retarget(to, from, PAGE_MS);
+                motion.content.retarget(0.0, from, 0.0);
+                motion.content.retarget(1.0, from, PAGE_MS);
+                from + PAGE_MS / 8.0
             }
             _ => from,
         };
@@ -568,6 +782,41 @@ pub enum Control {
     Launch,
     Status,
     Retry,
+    WindowsShortcutNote,
+    GeneralTab,
+    ShortcutsTab,
+    RestoreLastLabel,
+    RestoreLastRecorder,
+    RestoreLastReset,
+    RestoreLastStatus,
+    DiscardTopLabel,
+    DiscardTopRecorder,
+    DiscardTopReset,
+    DiscardTopStatus,
+    DiscardAllLabel,
+    DiscardAllRecorder,
+    DiscardAllReset,
+    DiscardAllStatus,
+    OpenSettingsLabel,
+    OpenSettingsRecorder,
+    OpenSettingsReset,
+    OpenSettingsStatus,
+    NewNoteLabel,
+    NewNoteRecorder,
+    NewNoteReset,
+    NewNoteStatus,
+    ToggleRecordingLabel,
+    ToggleRecordingRecorder,
+    ToggleRecordingReset,
+    ToggleRecordingStatus,
+    PenLabel,
+    PenRecorder,
+    PenReset,
+    PenStatus,
+    HighlighterLabel,
+    HighlighterRecorder,
+    HighlighterReset,
+    HighlighterStatus,
 }
 
 use Control::*;
@@ -584,8 +833,10 @@ enum Kind {
     Radio,
     Preview,
     Status,
+    Recorder,
 }
 
+#[derive(Clone, Copy)]
 struct Item {
     id: Control,
     kind: Kind,
@@ -597,58 +848,262 @@ const fn item(id: Control, kind: Kind, text: &'static str, rect: [i32; 4]) -> It
     Item { id, kind, text, rect }
 }
 
-const WIDTH: i32 = 512;
-const HEIGHT: i32 = 560;
-const STATUS_HEIGHT: i32 = 53;
-const KEEP_PATCH: [i32; 4] = [24, 116, 464, 36];
+const WIDTH: i32 = 544;
+/// One client height for both pages. It holds the General page with both folder notes and
+/// the status row showing, and fits the work area of 1366x768 at 100% and 1920x1080 at 150%.
+const HEIGHT: i32 = 630;
+const STATUS_HEIGHT: i32 = 34;
+const PAGE_SWITCH: [i32; 4] = [24, 12, 214, 32];
+/// Everything below the page switch, which moves when the page changes.
+const CONTENT: [i32; 4] = [0, 48, WIDTH, HEIGHT - 48];
+const KEEP_PATCH: [i32; 4] = [24, 150, 496, 36];
+const CARD_PATCH: [i32; 4] = [24, 437, 496, 72];
 
 const ITEMS: &[Item] = &[
-    item(Capabilities, Kind::Heading, "Capabilities", [24, 19, 464, 22]),
-    item(ScreenshotsTitle, Kind::Title, "Screenshots", [24, 48, 408, 22]),
-    item(Screenshots, Kind::Switch, "Screenshots", [438, 46, 50, 28]),
-    item(ScreenshotKeys, Kind::Keys, "Win+Shift+S|or|PrtScn", [24, 73, 408, 20]),
+    item(GeneralTab, Kind::Radio, "General", [24, 12, 107, 32]),
+    item(ShortcutsTab, Kind::Radio, "Shortcuts", [131, 12, 107, 32]),
+    item(Capabilities, Kind::Heading, "Capabilities", [24, 54, 496, 22]),
+    item(ScreenshotsTitle, Kind::Title, "Screenshots", [24, 83, 92, 22]),
+    item(Screenshots, Kind::Switch, "Screenshots", [470, 81, 50, 28]),
+    item(ScreenshotKeys, Kind::Keys, "Win+Shift+S|or|PrtScn", [122, 84, 342, 20]),
     item(
         ScreenshotDetail,
         Kind::Detail,
         "Use Win+Shift+S or PrtScn and your cursor carries the shot.",
-        [24, 93, 464, 17],
+        [24, 110, 496, 17],
     ),
-    item(KeepTitle, Kind::Title, "Keep every screenshot", [36, 122, 380, 24]),
-    item(Keep, Kind::Switch, "Keep every screenshot", [426, 120, 50, 28]),
-    item(NotesTitle, Kind::Title, "Notes", [24, 161, 45, 22]),
-    item(NotesKeys, Kind::Keys, "Alt+Click", [75, 162, 335, 20]),
-    item(Notes, Kind::Switch, "Notes, not available yet", [438, 158, 50, 28]),
-    item(NotesDetail, Kind::Detail, "Not available yet", [24, 185, 400, 18]),
-    item(RecordingTitle, Kind::Title, "Screen recording", [24, 214, 119, 22]),
-    item(RecordingKeys, Kind::Keys, "Ctrl+Shift+6|Ctrl+Shift+7|Ctrl+Shift+8", [149, 215, 283, 20]),
-    item(Recording, Kind::Switch, "Screen recording, not available yet", [438, 211, 50, 28]),
-    item(RecordingDetail, Kind::Detail, "Not available yet", [24, 238, 400, 18]),
-    item(General, Kind::Heading, "General", [24, 270, 464, 22]),
-    item(NotesFolder, Kind::Title, "Notes folder", [24, 299, 464, 20]),
-    item(ChooseNotes, Kind::Push("&Choose…"), "&Choose notes folder…", [24, 322, 77, 24]),
-    item(OpenNotes, Kind::Push("Open"), "Open notes folder", [107, 322, 55, 24]),
-    item(ResetNotes, Kind::Push("Reset"), "Reset notes folder", [168, 322, 58, 24]),
-    item(NotesPath, Kind::Path, "", [236, 322, 252, 24]),
-    item(NotesFallback, Kind::Detail, "", [24, 347, 464, 17]),
-    item(CapturesFolder, Kind::Title, "Captures folder", [24, 367, 464, 20]),
-    item(ChooseCaptures, Kind::Push("Ch&oose…"), "Ch&oose captures folder…", [24, 390, 77, 24]),
-    item(OpenCaptures, Kind::Push("Open"), "Open captures folder", [107, 390, 55, 24]),
-    item(ResetCaptures, Kind::Push("Reset"), "Reset captures folder", [168, 390, 58, 24]),
-    item(CapturesPath, Kind::Path, "", [236, 390, 252, 24]),
-    item(CapturesFallback, Kind::Detail, "", [24, 415, 464, 17]),
-    item(CardTitle, Kind::Title, "Card size", [36, 448, 331, 20]),
+    item(
+        WindowsShortcutNote,
+        Kind::Detail,
+        "Taking a screenshot uses the Windows shortcuts. Change them in Windows settings.",
+        [24, 128, 496, 17],
+    ),
+    item(KeepTitle, Kind::Title, "Keep every screenshot", [36, 156, 412, 24]),
+    item(Keep, Kind::Switch, "Keep every screenshot", [458, 154, 50, 28]),
+    item(NotesTitle, Kind::Title, "Notes", [24, 195, 45, 22]),
+    item(NotesKeys, Kind::Keys, "Alt+Click", [75, 196, 367, 20]),
+    item(Notes, Kind::Switch, "Notes, not available yet", [470, 192, 50, 28]),
+    item(NotesDetail, Kind::Detail, "Not available yet", [24, 219, 400, 18]),
+    item(RecordingTitle, Kind::Title, "Screen recording", [24, 248, 119, 22]),
+    item(RecordingKeys, Kind::Keys, "Ctrl+Shift+6|Ctrl+Shift+7|Ctrl+Shift+8", [149, 249, 315, 20]),
+    item(Recording, Kind::Switch, "Screen recording, not available yet", [470, 245, 50, 28]),
+    item(RecordingDetail, Kind::Detail, "Not available yet", [24, 272, 400, 18]),
+    item(General, Kind::Heading, "General", [24, 302, 496, 22]),
+    item(NotesFolder, Kind::Title, "Notes folder", [24, 329, 496, 20]),
+    item(ChooseNotes, Kind::Push("&Choose…"), "&Choose notes folder…", [24, 352, 77, 24]),
+    item(OpenNotes, Kind::Push("Open"), "Open notes folder", [107, 352, 55, 24]),
+    item(ResetNotes, Kind::Push("Reset"), "Reset notes folder", [168, 352, 58, 24]),
+    item(NotesPath, Kind::Path, "", [236, 352, 284, 24]),
+    item(NotesFallback, Kind::Detail, "", [24, 377, 496, 17]),
+    item(CapturesFolder, Kind::Title, "Captures folder", [24, 382, 496, 20]),
+    item(ChooseCaptures, Kind::Push("Ch&oose…"), "Ch&oose captures folder…", [24, 405, 77, 24]),
+    item(OpenCaptures, Kind::Push("Open"), "Open captures folder", [107, 405, 55, 24]),
+    item(ResetCaptures, Kind::Push("Reset"), "Reset captures folder", [168, 405, 58, 24]),
+    item(CapturesPath, Kind::Path, "", [236, 405, 284, 24]),
+    item(CapturesFallback, Kind::Detail, "", [24, 430, 496, 17]),
+    item(CardTitle, Kind::Title, "Card size", [36, 446, 220, 20]),
     item(Small, Kind::Radio, "Small", [36, 471, 66, 26]),
     item(Medium, Kind::Radio, "Medium", [108, 471, 75, 26]),
     item(Large, Kind::Radio, "Large", [189, 471, 65, 26]),
-    item(Preview, Kind::Preview, "Card size preview", [380, 448, 96, 68]),
-    item(CardDimensions, Kind::Detail, "", [36, 500, 328, 20]),
-    item(LaunchTitle, Kind::Title, "Launch at login", [24, 542, 404, 24]),
-    item(Launch, Kind::Switch, "Launch at login", [438, 540, 50, 28]),
-    item(Status, Kind::Status, "", [24, 583, 382, 44]),
-    item(Retry, Kind::Push("&Retry"), "&Retry saving settings", [418, 588, 70, 29]),
+    item(Preview, Kind::Preview, "Card size preview", [412, 443, 96, 60]),
+    item(CardDimensions, Kind::Detail, "", [264, 474, 108, 20]),
+    item(LaunchTitle, Kind::Title, "Launch at login", [24, 521, 436, 24]),
+    item(Launch, Kind::Switch, "Launch at login", [470, 519, 50, 28]),
+    item(Status, Kind::Status, "", [24, 559, 414, STATUS_HEIGHT]),
+    item(Retry, Kind::Push("&Retry"), "&Retry saving settings", [450, 561, 70, 29]),
 ];
 
-const CARD_PATCH: [i32; 4] = [24, 437, 464, 91];
+/// The parts of one shortcut row, in the order of their control ids.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortcutPart {
+    Label,
+    Recorder,
+    Reset,
+    Status,
+}
+
+const PARTS: usize = 4;
+const ROWS: usize = Action::ALL.len();
+const ROW_TOP: i32 = 60;
+const ROW_PITCH: i32 = 64;
+
+const fn row_y(index: usize) -> i32 {
+    ROW_TOP + index as i32 * ROW_PITCH
+}
+
+/// A whole row, with room for the recorder's focus ring.
+const fn row_rect(index: usize) -> [i32; 4] {
+    [0, row_y(index) - 4, WIDTH, ROW_PITCH]
+}
+
+const SHORTCUT_IDS: [Control; ROWS * PARTS] = [
+    RestoreLastLabel, RestoreLastRecorder, RestoreLastReset, RestoreLastStatus,
+    DiscardTopLabel, DiscardTopRecorder, DiscardTopReset, DiscardTopStatus,
+    DiscardAllLabel, DiscardAllRecorder, DiscardAllReset, DiscardAllStatus,
+    OpenSettingsLabel, OpenSettingsRecorder, OpenSettingsReset, OpenSettingsStatus,
+    NewNoteLabel, NewNoteRecorder, NewNoteReset, NewNoteStatus,
+    ToggleRecordingLabel, ToggleRecordingRecorder, ToggleRecordingReset, ToggleRecordingStatus,
+    PenLabel, PenRecorder, PenReset, PenStatus,
+    HighlighterLabel, HighlighterRecorder, HighlighterReset, HighlighterStatus,
+];
+
+const SHORTCUT_ITEMS: [Item; ROWS * PARTS] = {
+    let mut list = [item(RestoreLastLabel, Kind::Title, "", [0; 4]); ROWS * PARTS];
+    let mut index = 0;
+    while index < ROWS * PARTS {
+        let y = row_y(index / PARTS);
+        let id = SHORTCUT_IDS[index];
+        list[index] = match index % PARTS {
+            0 => item(id, Kind::Title, "", [24, y + 4, 200, 22]),
+            1 => item(id, Kind::Recorder, "", [234, y - 2, 224, 34]),
+            2 => item(id, Kind::Push("Reset"), "", [464, y, 56, 30]),
+            _ => item(id, Kind::Status, "", [24, y + 34, 496, 18]),
+        };
+        index += 1;
+    }
+    list
+};
+
+fn items() -> impl Iterator<Item = &'static Item> {
+    ITEMS.iter().chain(&SHORTCUT_ITEMS)
+}
+
+impl Control {
+    /// The control of one part of an action's row.
+    #[doc(hidden)]
+    pub fn shortcut(action: Action, part: ShortcutPart) -> Self {
+        SHORTCUT_ITEMS[action as usize * PARTS + part as usize].id
+    }
+
+    fn shortcut_row(self) -> Option<(Action, ShortcutPart)> {
+        let index = (self as usize).checked_sub(RestoreLastLabel as usize)?;
+        let action = *Action::ALL.get(index / PARTS)?;
+        let part = [ShortcutPart::Label, ShortcutPart::Recorder, ShortcutPart::Reset, ShortcutPart::Status]
+            [index % PARTS];
+        Some((action, part))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    General,
+    Shortcuts,
+}
+
+impl Page {
+    fn contains(self, id: Control) -> bool {
+        matches!(id, GeneralTab | ShortcutsTab)
+            || (id.shortcut_row().is_some() == (self == Self::Shortcuts))
+    }
+}
+
+const RECORDING_PROMPT: &str = "Press the keys · Esc cancels · Backspace clears";
+
+/// The note shown under a row after its shortcut was set, if any. Muted: these are hints,
+/// not errors.
+fn shortcut_warning(chord: &Chord) -> Option<&'static str> {
+    let key = chord.key.vk();
+    let letter = (u16::from(b'A')..=u16::from(b'Z')).contains(&key);
+    let digit = (u16::from(b'0')..=u16::from(b'9')).contains(&key);
+    if chord.win {
+        return None;
+    }
+    match (chord.ctrl, chord.alt, chord.shift) {
+        // AltGr is Ctrl+Alt: on many layouts it, with or without Shift, types a character.
+        (true, true, _) if letter || digit => {
+            Some("On some keyboard layouts this combination types a character.")
+        }
+        (false, true, false) if letter => Some("This may override menu shortcuts in other apps."),
+        (true, false, false) if b"CXZYASFPNOWT".iter().any(|&byte| u16::from(byte) == key) => {
+            Some("Other apps will no longer receive this shortcut.")
+        }
+        _ => None,
+    }
+}
+
+/// Key chips for the row: the modifiers, then the key as the active layout labels it.
+fn chord_chips(chord: &Chord) -> Vec<String> {
+    let mut chips = chord.chips();
+    let modifiers = chips[..chips.len() - 1].iter().map(|chip| chip.len() + 1).sum::<usize>();
+    if let Some(key) = chips.last_mut() {
+        *key = display_for_layout(chord)[modifiers..].to_owned();
+    }
+    chips
+}
+
+fn modifier_chips(held: Held) -> Vec<String> {
+    [(held.ctrl, "Ctrl"), (held.alt, "Alt"), (held.shift, "Shift"), (held.win, "Win")]
+        .into_iter()
+        .filter(|(down, _)| *down)
+        .map(|(_, key)| key.to_owned())
+        .collect()
+}
+
+fn taken_message(chord: &Chord) -> String {
+    format!("Another program already uses {}", display_for_layout(chord))
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Tone {
+    #[default]
+    Muted,
+    Error,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Note {
+    text: String,
+    tone: Tone,
+}
+
+impl Note {
+    fn new(text: impl Into<String>, tone: Tone) -> Self {
+        Self { text: text.into(), tone }
+    }
+}
+
+/// A recorder waiting for keys. The hotkey service is paused.
+struct Capture {
+    action: Action,
+    held: Held,
+    /// Why the last chord was refused. Recording goes on.
+    error: Option<String>,
+}
+
+/// A chord the UI loop is registering. Saved only once its tagged report is not `Taken`.
+struct Proposal {
+    action: Action,
+    tag: usize,
+    value: Shortcuts,
+}
+
+/// What a row draws: kept apart from the model so fading text can outlive its cause.
+#[derive(Clone, Default)]
+struct RowView {
+    chips: Vec<String>,
+    /// How many leading chips were already shown; the others animate in.
+    kept: usize,
+    note: Note,
+}
+
+#[derive(Default)]
+struct Recorder {
+    capture: Option<Capture>,
+    proposal: Option<Proposal>,
+    /// The note under each row after a set: a refusal by Windows, a failure or a hint.
+    notes: [Option<Note>; ROWS],
+    /// The latest untagged registration status.
+    registration: Vec<(Action, Registration)>,
+    rows: [RowView; ROWS],
+    /// The key that ended a recording. Its auto-repeat and release are eaten, so it does
+    /// not click the recorder again or reach the dialog keys (Esc closes the window).
+    swallow: Option<u16>,
+}
+
+const CHIPS: usize = 0;
+const RESET: usize = 1;
+const NOTE: usize = 2;
 
 const TIMER: usize = 1;
 const FOCUS_MS: f64 = 80.0;
@@ -657,6 +1112,8 @@ const CARD_MS: f64 = 180.0;
 const ROW_MS: f64 = 150.0;
 const OPEN_MS: f64 = 120.0;
 const THEME_MS: f64 = 200.0;
+const PAGE_MS: f64 = 180.0;
+const PULSE_MS: f64 = 1200.0;
 
 fn ease(progress: f64) -> f64 {
     // For cubic-bezier(0, 0, 0, 1), x = t³ and y = 3t² - 2t³.
@@ -709,7 +1166,7 @@ impl ButtonMotion {
     }
 }
 
-const CONTROLS: usize = Retry as usize - Capabilities as usize + 1;
+const CONTROLS: usize = HighlighterStatus as usize - Capabilities as usize + 1;
 
 impl Control {
     fn index(self) -> usize {
@@ -727,10 +1184,19 @@ struct Motion {
     status: Transition,
     retry: Transition,
     buttons: [ButtonMotion; CONTROLS],
+    /// The page switch highlight: 0 on General, 1 on Shortcuts.
+    page: Transition,
+    /// The shown page's content fading and sliding in.
+    content: Transition,
+    /// Per shortcut row: the new chips, the Reset button and the note under the row.
+    rows: [[Transition; 3]; ROWS],
+    /// The recorder's outline pulses from this time while it waits for keys.
+    pulse_since: Option<f64>,
 }
 
 impl Motion {
     fn new(enabled: bool) -> Self {
+        let shown = Transition { from: 1.0, to: 1.0, ..Transition::default() };
         Self {
             enabled,
             intro: Transition::default(),
@@ -741,6 +1207,11 @@ impl Motion {
             status: Transition::default(),
             retry: Transition::default(),
             buttons: [ButtonMotion::default(); CONTROLS],
+            page: Transition::default(),
+            content: shown,
+            // Chips start shown; they fade in only when they change.
+            rows: [[shown, Transition::default(), Transition::default()]; ROWS],
+            pulse_since: None,
         }
     }
 
@@ -756,7 +1227,7 @@ impl Motion {
     }
 
     fn active(&self, now: f64) -> bool {
-        self.enabled && self.tracks().any(|track| track.active(now))
+        self.enabled && (self.pulse_since.is_some() || self.tracks().any(|track| track.active(now)))
     }
 
     fn tracks(&self) -> impl Iterator<Item = Transition> + '_ {
@@ -768,9 +1239,12 @@ impl Motion {
             self.folders[1],
             self.status,
             self.retry,
+            self.page,
+            self.content,
         ]
         .into_iter()
         .chain(self.selection)
+        .chain(self.rows.iter().flatten().copied())
         .chain(self.buttons.iter().flat_map(ButtonMotion::tracks))
     }
 
@@ -783,11 +1257,14 @@ impl Motion {
             &mut self.folders[0],
             &mut self.status,
             &mut self.retry,
+            &mut self.page,
+            &mut self.content,
         ] {
             snap(track);
         }
         snap(&mut self.folders[1]);
         self.selection.iter_mut().for_each(snap);
+        self.rows.iter_mut().flatten().for_each(snap);
         for button in &mut self.buttons {
             for track in
                 [&mut button.checked, &mut button.hover, &mut button.press, &mut button.focus]
@@ -813,11 +1290,11 @@ fn animation_effects() -> bool {
         && enabled.as_bool()
 }
 
+/// How far the General page's lower rows are pushed down by the folder notes (0 to 15).
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct Layout {
     notes: i32,
     captures: i32,
-    status: i32,
 }
 
 impl Layout {
@@ -828,19 +1305,10 @@ impl Layout {
     }
 
     fn offset(self, id: Control) -> i32 {
-        let id = id as usize;
-        15 * if id >= CardTitle as usize {
-            -2
-        } else if id >= CapturesFolder as usize {
-            -1
-        } else {
-            0
-        } + if id >= CapturesFolder as usize { self.notes } else { 0 }
-            + if id >= CardTitle as usize { self.captures } else { 0 }
-    }
-
-    fn height(self) -> i32 {
-        HEIGHT + self.notes + self.captures + self.status
+        let id = id as i32;
+        let below = |first: Control| id >= first as i32 && id <= Retry as i32;
+        let notes = if below(CapturesFolder) { self.notes } else { 0 };
+        notes + if below(CardTitle) { self.captures } else { 0 }
     }
 }
 
@@ -882,6 +1350,15 @@ pub fn test_client_size(dpi: u32) -> (i32, i32) {
     (scale(WIDTH, dpi), scale(HEIGHT, dpi))
 }
 
+/// The outer size of the settings window at `dpi`, frame and caption included.
+#[doc(hidden)]
+pub fn test_window_size(dpi: u32) -> (i32, i32) {
+    let mut bounds = scaled([0, 0, WIDTH, HEIGHT], dpi);
+    // SAFETY: a writable RECT; the style values are constants.
+    let _ = unsafe { AdjustWindowRectExForDpi(&mut bounds, STYLE, false, EX_STYLE, dpi) };
+    (bounds.right - bounds.left, bounds.bottom - bounds.top)
+}
+
 fn scaled([x, y, w, h]: [i32; 4], dpi: u32) -> RECT {
     RECT {
         left: scale(x, dpi),
@@ -893,10 +1370,18 @@ fn scaled([x, y, w, h]: [i32; 4], dpi: u32) -> RECT {
 
 impl Item {
     fn button(&self) -> bool {
-        matches!(self.kind, Kind::Switch | Kind::Push(_) | Kind::Radio)
+        matches!(self.kind, Kind::Switch | Kind::Push(_) | Kind::Radio | Kind::Recorder)
+    }
+
+    /// Hover and press feedback: everything but the radio segments.
+    fn pointer_effects(&self) -> bool {
+        matches!(self.kind, Kind::Switch | Kind::Push(_) | Kind::Recorder)
     }
 
     fn caption(&self) -> &'static str {
+        if let Some((action, ShortcutPart::Label)) = self.id.shortcut_row() {
+            return action.label();
+        }
         match self.id {
             ScreenshotKeys => "Windows plus Shift plus S, or Print Screen",
             NotesKeys => "Alt plus click",
@@ -908,20 +1393,24 @@ impl Item {
     fn style(&self) -> WINDOW_STYLE {
         let style = match self.kind {
             Kind::Switch => BS_CHECKBOX as u32 | WS_TABSTOP.0,
-            Kind::Radio if self.id == Small => {
+            Kind::Radio if matches!(self.id, Small | GeneralTab) => {
                 BS_AUTORADIOBUTTON as u32 | WS_TABSTOP.0 | WS_GROUP.0
             }
             Kind::Radio => BS_AUTORADIOBUTTON as u32,
-            Kind::Push(_) => BS_OWNERDRAW as u32 | WS_TABSTOP.0 | WS_GROUP.0,
+            Kind::Push(_) | Kind::Recorder => BS_OWNERDRAW as u32 | WS_TABSTOP.0 | WS_GROUP.0,
             Kind::Path => SS_OWNERDRAW.0 | SS_NOTIFY.0 | WS_GROUP.0,
             _ => SS_OWNERDRAW.0 | WS_GROUP.0,
         };
-        let visible = if matches!(self.id, Status | Retry) { 0 } else { WS_VISIBLE.0 };
+        let visible = if matches!(self.id, Status | Retry) || self.id.shortcut_row().is_some() {
+            0
+        } else {
+            WS_VISIBLE.0
+        };
         WINDOW_STYLE(style | WS_CHILD.0 | visible)
     }
 
     fn lookup(id: i32) -> Option<&'static Self> {
-        ITEMS.iter().find(|item| item.id as i32 == id)
+        items().find(|item| item.id as i32 == id)
     }
 }
 
@@ -1052,6 +1541,8 @@ struct Window<'a> {
     frozen: Cell<Option<f64>>,
     surface: RefCell<Option<Surface>>,
     error_label: RefCell<String>,
+    page: Cell<Page>,
+    recorder: RefCell<Recorder>,
     fonts: RefCell<Fonts>,
     tooltip: Cell<HWND>,
     tips: RefCell<[Vec<u16>; 2]>,
@@ -1076,6 +1567,11 @@ struct Frame {
     status: f64,
     retry: f64,
     buttons: [ButtonFrame; CONTROLS],
+    page: f64,
+    content: f64,
+    rows: [[f64; 3]; ROWS],
+    /// The recorder outline, 1 at its strongest. Steady at 1 with reduced motion.
+    pulse: f64,
 }
 
 impl Frame {
@@ -1083,7 +1579,6 @@ impl Frame {
         Layout {
             notes: (self.folders[0] * 15.0).round() as i32,
             captures: (self.folders[1] * 15.0).round() as i32,
-            status: (self.status * f64::from(STATUS_HEIGHT)).round() as i32,
         }
     }
 }
@@ -1104,6 +1599,17 @@ impl Motion {
                 press: button.press.value(now),
                 focus: button.focus.value(now),
             }),
+            page: self.page.value(now),
+            content: self.content.value(now),
+            rows: self.rows.map(|row| row.map(|track| track.value(now))),
+            pulse: match self.pulse_since {
+                Some(start) if self.enabled => {
+                    0.5 + 0.5 * ((now - start) * std::f64::consts::TAU / PULSE_MS).cos()
+                }
+                // Reduced motion: a steady outline at full strength.
+                Some(_) => 1.0,
+                None => 0.0,
+            },
         }
     }
 }
@@ -1136,36 +1642,48 @@ impl Window<'_> {
         let dpi = self.dpi.get();
         if prior != layout {
             self.position_children(layout, Some(prior));
-            if prior.height() != layout.height() {
-                self.adjust_size(None);
-            }
         }
 
         if frame.intro != previous.intro || frame.theme != previous.theme {
             self.invalidate(None);
         } else {
+            if frame.page != previous.page {
+                self.invalidate(Some(scaled(PAGE_SWITCH, dpi)));
+            }
+            if frame.content != previous.content {
+                self.invalidate(Some(scaled(CONTENT, dpi)));
+            }
             // Moving a row exposes the space it occupied and shifts the controls below it.
             let first_moved = if frame.folders[0] != previous.folders[0] {
-                Some(342)
+                Some(NotesFallback)
             } else if frame.folders[1] != previous.folders[1] {
-                Some(410 + layout.offset(CapturesFallback))
+                Some(CapturesFallback)
             } else if frame.status != previous.status || frame.retry != previous.retry {
-                Some(575 + layout.offset(Status))
+                Some(Status)
             } else {
                 None
             };
-            if let Some(top) = first_moved {
-                self.invalidate(Some(scaled(
-                    [0, top, WIDTH, layout.height().max(prior.height()) - top],
-                    dpi,
-                )));
+            if let Some(id) = first_moved {
+                let top = Item::lookup(id as i32).expect("moving row").rect[1] - 4
+                    + prior.offset(id).min(layout.offset(id));
+                self.invalidate(Some(scaled([0, top, WIDTH, HEIGHT - top], dpi)));
             }
             if frame.card != previous.card || frame.selection != previous.selection {
                 let mut rect = CARD_PATCH;
                 rect[1] += layout.offset(CardTitle);
                 self.invalidate(Some(scaled(rect, dpi)));
             }
-            for item in ITEMS.iter().filter(|item| item.button()) {
+            if self.page.get() == Page::Shortcuts {
+                let recording = self.recorder.borrow().capture.as_ref().map(|c| c.action as usize);
+                for index in 0..ROWS {
+                    if frame.rows[index] != previous.rows[index]
+                        || (frame.pulse != previous.pulse && recording == Some(index))
+                    {
+                        self.invalidate(Some(scaled(row_rect(index), dpi)));
+                    }
+                }
+            }
+            for item in items().filter(|item| item.button() && self.page.get().contains(item.id)) {
                 let index = item.id.index();
                 if previous.buttons[index] != frame.buttons[index] {
                     self.invalidate_item(item);
@@ -1190,7 +1708,7 @@ impl Window<'_> {
 
     fn position_children(&self, layout: Layout, prior: Option<Layout>) {
         let dpi = self.dpi.get();
-        for item in ITEMS {
+        for item in items() {
             let rect = layout.rect(item, dpi);
             if prior.is_some_and(|old| old.rect(item, dpi) == rect) {
                 continue;
@@ -1248,7 +1766,7 @@ impl Window<'_> {
         let leave = motion.duration(120.0);
         let focus_in = motion.duration(FOCUS_MS);
         let button = &mut motion.buttons[item.id.index()];
-        let pointer_effects = matches!(item.kind, Kind::Push(_) | Kind::Switch);
+        let pointer_effects = item.pointer_effects();
         let hover = pointer_effects && enabled && self.hover.get() == Some(item.id);
         let pressed = pointer_effects && enabled && pressed;
         button.hover.retarget(
@@ -1270,7 +1788,7 @@ impl Window<'_> {
     }
 
     fn sync_buttons(&self) {
-        for item in ITEMS.iter().filter(|item| item.button()) {
+        for item in items().filter(|item| item.button() && self.page.get().contains(item.id)) {
             self.button_state(item, self.child(item.id));
         }
         self.update_animation();
@@ -1372,8 +1890,13 @@ impl Window<'_> {
     }
 
     fn init_children(&self, instance: HINSTANCE) -> Result<()> {
-        for item in ITEMS {
-            let caption = wide(item.caption());
+        for item in items() {
+            let caption = match item.id.shortcut_row() {
+                Some((action, ShortcutPart::Reset)) => {
+                    wide(format!("Reset shortcut for {}", action.label()))
+                }
+                _ => wide(item.caption()),
+            };
             let class = if item.button() { w!("BUTTON") } else { w!("STATIC") };
             let rect = scaled(item.rect, self.dpi.get());
             // SAFETY: captions are copied, IDs are unique, and this thread owns the parent.
@@ -1429,7 +1952,7 @@ impl Window<'_> {
         self.dpi.set(dpi);
         let previous_fonts = self.fonts.replace(Fonts::new(dpi));
         self.position_children(self.frame.get().layout(), None);
-        for item in ITEMS {
+        for item in items() {
             let child = self.child(item.id);
             let font = self.fonts.borrow().0
                 [usize::from(!matches!(item.kind, Kind::Title | Kind::Heading))];
@@ -1450,9 +1973,7 @@ impl Window<'_> {
     }
 
     fn adjust_size(&self, at: Option<(i32, i32)>) {
-        let dpi = self.dpi.get();
-        let height = self.frame.get().layout().height();
-        let mut bounds = scaled([0, 0, WIDTH, height], dpi);
+        let mut bounds = scaled([0, 0, WIDTH, HEIGHT], self.dpi.get());
         // SAFETY: a writable RECT for the real window style and target DPI.
         let _ = unsafe {
             AdjustWindowRectExForDpi(
@@ -1490,7 +2011,370 @@ impl Window<'_> {
         // SAFETY: same-thread child; Win32 copies the terminated UTF-16 string.
         let _ = unsafe { SetWindowTextW(self.child(id), PCWSTR(text.as_ptr())) };
     }
+}
 
+impl Window<'_> {
+    fn set_page(&self, page: Page) {
+        if self.page.replace(page) == page {
+            return;
+        }
+        self.cancel_capture();
+        // Focus must not stay on a control that is about to hide.
+        let tab = self.child(if page == Page::Shortcuts { ShortcutsTab } else { GeneralTab });
+        // SAFETY: focus queries and moves stay within this STA's own children.
+        unsafe {
+            let focused = GetFocus();
+            if !focused.is_invalid()
+                && focused != tab
+                && GetParent(focused).ok() == Some(self.hwnd)
+            {
+                let _ = SetFocus(Some(tab));
+            }
+        }
+        let now = self.now();
+        {
+            let mut motion = self.motion.borrow_mut();
+            let duration = motion.duration(PAGE_MS);
+            motion.page.retarget(if page == Page::Shortcuts { 1.0 } else { 0.0 }, now, duration);
+            motion.content.retarget(0.0, now, 0.0);
+            motion.content.retarget(1.0, now, duration);
+        }
+        self.refresh();
+    }
+
+    fn show(&self, id: Control, visible: bool, enabled: bool) {
+        let child = self.child(id);
+        // SAFETY: the settings STA owns this child. Showing it never activates another window.
+        unsafe {
+            let _ = EnableWindow(child, enabled);
+            let _ = ShowWindow(child, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        }
+    }
+
+    /// The modifiers held for the key message being handled. The self-test replaces them,
+    /// because a sent message does not change the keyboard state.
+    fn held(&self) -> Held {
+        if self.options.test.is_some() {
+            *self.lifetime.test_modifiers.lock().unwrap_or_else(|e| e.into_inner())
+        } else {
+            held_for_message()
+        }
+    }
+
+    /// The chord a row shows: unavailable actions show their default.
+    fn row_chord(&self, action: Action) -> Option<Chord> {
+        if action.available() {
+            self.model.borrow().settings.shortcuts.get(action)
+        } else {
+            action.default_chord()
+        }
+    }
+
+    fn row_note(&self, action: Action, chord: Option<Chord>) -> Note {
+        let recorder = self.recorder.borrow();
+        let capture = recorder.capture.as_ref().filter(|capture| capture.action == action);
+        let checking = recorder.proposal.as_ref().is_some_and(|proposal| proposal.action == action);
+        if !action.available() {
+            Note::new("Not available yet", Tone::Muted)
+        } else if let Some(error) = capture.and_then(|capture| capture.error.as_ref()) {
+            Note::new(error.clone(), Tone::Error)
+        } else if capture.is_some() || checking {
+            // The check takes a moment; the prompt stays until its answer.
+            Note::new(RECORDING_PROMPT, Tone::Muted)
+        } else if let Some(note) = &recorder.notes[action as usize] {
+            note.clone()
+        } else {
+            let status = recorder.registration.iter().find(|(row, _)| *row == action);
+            match (chord, status.map(|(_, status)| status)) {
+                (Some(chord), Some(Registration::Taken)) => {
+                    Note::new(taken_message(&chord), Tone::Error)
+                }
+                (Some(_), Some(Registration::Failed(message))) => {
+                    Note::new(message.clone(), Tone::Error)
+                }
+                _ => Note::default(),
+            }
+        }
+    }
+
+    fn refresh_shortcuts(&self) {
+        let now = self.now();
+        let on_page = self.page.get() == Page::Shortcuts;
+        let loaded = self.model.borrow().load_error.is_none();
+        for &action in Action::ALL {
+            let index = action as usize;
+            let chord = self.row_chord(action);
+            let note = self.row_note(action, chord);
+            let chips = {
+                let recorder = self.recorder.borrow();
+                let capture = recorder.capture.as_ref().filter(|capture| capture.action == action);
+                let proposal = recorder.proposal.as_ref().filter(|proposal| proposal.action == action);
+                match (capture, proposal) {
+                    (Some(capture), _) => modifier_chips(capture.held),
+                    (None, Some(proposal)) => {
+                        proposal.value.get(action).as_ref().map(chord_chips).unwrap_or_default()
+                    }
+                    (None, None) => chord.as_ref().map(chord_chips).unwrap_or_default(),
+                }
+            };
+            let differs = action.available() && chord != action.default_chord();
+            let recorder = Control::shortcut(action, ShortcutPart::Recorder);
+            let reset = Control::shortcut(action, ShortcutPart::Reset);
+            let shown = chord.map_or_else(|| "none".to_owned(), |chord| display_for_layout(&chord));
+            self.text(recorder, &format!("{}, shortcut {shown}, press to change", action.label()));
+            self.text(Control::shortcut(action, ShortcutPart::Status), &note.text);
+            {
+                let mut state = self.recorder.borrow_mut();
+                let view = &mut state.rows[index];
+                let mut motion = self.motion.borrow_mut();
+                let duration =
+                    if on_page && self.started.get() { motion.duration(ROW_MS) } else { 0.0 };
+                let tracks = &mut motion.rows[index];
+                if chips != view.chips {
+                    view.kept = view.chips.iter().zip(&chips).take_while(|(a, b)| a == b).count();
+                    view.chips = chips;
+                    tracks[CHIPS].retarget(0.0, now, 0.0);
+                    tracks[CHIPS].retarget(1.0, now, duration);
+                }
+                tracks[RESET].retarget(if differs { 1.0 } else { 0.0 }, now, duration);
+                if note.text.is_empty() {
+                    // The old text stays while it fades out.
+                    tracks[NOTE].retarget(0.0, now, duration);
+                } else {
+                    if note != view.note {
+                        view.note = note;
+                        tracks[NOTE].retarget(0.0, now, 0.0);
+                    }
+                    tracks[NOTE].retarget(1.0, now, duration);
+                }
+            }
+            // SAFETY: focus query and move within this STA's own children.
+            unsafe {
+                if !differs && GetFocus() == self.child(reset) {
+                    let _ = SetFocus(Some(self.child(recorder)));
+                }
+            }
+            for part in [ShortcutPart::Label, ShortcutPart::Status] {
+                self.show(Control::shortcut(action, part), on_page, on_page);
+            }
+            self.show(recorder, on_page, on_page && loaded && action.available());
+            self.show(reset, on_page && differs, on_page && loaded && differs);
+        }
+        self.update_animation();
+        if on_page {
+            self.invalidate(Some(scaled(CONTENT, self.dpi.get())));
+        }
+    }
+
+    fn records(&self, action: Action) -> bool {
+        self.recorder.borrow().capture.as_ref().is_some_and(|capture| capture.action == action)
+    }
+
+    /// Click, Space or Enter on a recorder: wait for keys, with the hotkeys paused.
+    fn begin_capture(&self, action: Action) {
+        if !action.available() || self.model.borrow().load_error.is_some() {
+            return;
+        }
+        let switching = {
+            let mut recorder = self.recorder.borrow_mut();
+            if recorder.proposal.is_some() {
+                return;
+            }
+            recorder.notes[action as usize] = None;
+            recorder.swallow = None;
+            recorder
+                .capture
+                .replace(Capture { action, held: Held::default(), error: None })
+                .is_some()
+        };
+        // Another row was recording: the service is already paused.
+        if !switching {
+            self.lifetime.emit(Request::Pause);
+        }
+        self.motion.borrow_mut().pulse_since = Some(self.now());
+        self.refresh_shortcuts();
+    }
+
+    /// Esc, focus loss, a page change: keep the old shortcut and resume the hotkeys.
+    fn cancel_capture(&self) {
+        let ended = self.recorder.borrow_mut().capture.take();
+        if ended.is_some() {
+            self.motion.borrow_mut().pulse_since = None;
+            self.lifetime.emit(Request::Resume);
+            self.refresh_shortcuts();
+        }
+    }
+
+    /// The window is closing: drop any recording or check, and resume the hotkeys.
+    fn end_recorder(&self) {
+        let open = {
+            let mut recorder = self.recorder.borrow_mut();
+            let capture = recorder.capture.take();
+            let proposal = recorder.proposal.take();
+            capture.is_some() || proposal.is_some()
+        };
+        if open {
+            self.motion.borrow_mut().pulse_since = None;
+            self.lifetime.emit(Request::Resume);
+        }
+    }
+
+    /// One key message to the recording recorder. `down` is a new press (WM_KEYDOWN or
+    /// WM_SYSKEYDOWN, not a repeat); anything else only updates the held modifiers.
+    fn recorder_key(&self, vk: u16, down: bool) {
+        let held = self.held();
+        let action = {
+            let mut recorder = self.recorder.borrow_mut();
+            let Some(capture) = recorder.capture.as_mut() else { return };
+            capture.held = held;
+            capture.action
+        };
+        let input = if down { chord_from_key_event(vk, held) } else { RecorderInput::Pending };
+        let chord = match input {
+            RecorderInput::Pending => return self.refresh_shortcuts(),
+            RecorderInput::Cancel => {
+                self.recorder.borrow_mut().swallow = Some(vk);
+                return self.cancel_capture();
+            }
+            RecorderInput::Clear => None,
+            RecorderInput::Chord(chord) => Some(chord),
+        };
+        let mut proposed = self.model.borrow().settings.shortcuts.clone();
+        if let Err(error) = proposed.set(action, chord) {
+            if let Some(capture) = self.recorder.borrow_mut().capture.as_mut() {
+                capture.error = Some(error.to_string());
+            }
+            return self.refresh_shortcuts();
+        }
+        {
+            let mut recorder = self.recorder.borrow_mut();
+            recorder.capture = None;
+            recorder.swallow = Some(vk);
+        }
+        self.motion.borrow_mut().pulse_since = None;
+        self.check(action, proposed);
+    }
+
+    fn reset_shortcut(&self, action: Action) {
+        if !action.available() || self.recorder.borrow().proposal.is_some() {
+            return;
+        }
+        self.cancel_capture();
+        let current = self.model.borrow().settings.shortcuts.clone();
+        let mut proposed = current.clone();
+        proposed.reset(action);
+        if proposed != current {
+            self.check(action, proposed);
+        }
+    }
+
+    /// Asks the UI loop to register `proposed`; it is saved when the tagged answer comes.
+    fn check(&self, action: Action, proposed: Shortcuts) {
+        let tag = NEXT_TAG.fetch_add(1, SeqCst);
+        {
+            let mut recorder = self.recorder.borrow_mut();
+            recorder.notes[action as usize] = None;
+            recorder.proposal = Some(Proposal { action, tag, value: proposed.clone() });
+        }
+        self.lifetime.emit(Request::Check { tag, proposed });
+        self.refresh_shortcuts();
+    }
+
+    fn receive_registration(&self) {
+        let reports =
+            std::mem::take(&mut *self.lifetime.reports.lock().unwrap_or_else(|e| e.into_inner()));
+        for report in reports {
+            if report.tag == 0 {
+                self.recorder.borrow_mut().registration = report.entries;
+                continue;
+            }
+            // A report for an older check, or for none, is ignored.
+            let proposal = {
+                let mut recorder = self.recorder.borrow_mut();
+                let current = recorder.proposal.as_ref().is_some_and(|p| p.tag == report.tag);
+                if current { recorder.proposal.take() } else { None }
+            };
+            if let Some(proposal) = proposal {
+                self.finish(proposal, &report.entries);
+            }
+        }
+        self.refresh_shortcuts();
+    }
+
+    /// The UI loop registered a proposal. Another program holds it: the old shortcut stays
+    /// (it was never saved) and the row says so. Otherwise save it.
+    fn finish(&self, proposal: Proposal, entries: &[(Action, Registration)]) {
+        let action = proposal.action;
+        let chord = proposal.value.get(action);
+        let status = entries.iter().find(|(row, _)| *row == action).map(|(_, status)| status);
+        let note = match (status, chord) {
+            (Some(Registration::Taken), Some(chord)) => {
+                Some(Note::new(taken_message(&chord), Tone::Error))
+            }
+            _ => {
+                let old =
+                    std::mem::replace(&mut self.model.borrow_mut().settings.shortcuts, proposal.value);
+                if self.save() {
+                    match (status, chord) {
+                        (Some(Registration::Failed(message)), Some(_)) => {
+                            Some(Note::new(message.clone(), Tone::Error))
+                        }
+                        (_, Some(chord)) => {
+                            shortcut_warning(&chord).map(|hint| Note::new(hint, Tone::Muted))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    let mut model = self.model.borrow_mut();
+                    model.settings.shortcuts = old;
+                    model.save_error.clone().map(|error| Note::new(error, Tone::Error))
+                }
+            }
+        };
+        self.recorder.borrow_mut().notes[action as usize] = note;
+        self.lifetime.emit(Request::Resume);
+    }
+
+    /// Whether a queued key message belongs to a recorder rather than to dialog navigation:
+    /// the recorder is recording, or it is the repeat or release of the key that ended it.
+    fn recorder_owns(&self, message: &MSG) -> bool {
+        // SAFETY: scalar queries for a window of this thread's queue.
+        let (parent, id) = unsafe { (GetParent(message.hwnd).ok(), GetDlgCtrlID(message.hwnd)) };
+        let row = Item::lookup(id).and_then(|item| item.id.shortcut_row());
+        let Some((action, ShortcutPart::Recorder)) = row else {
+            return false;
+        };
+        if parent != Some(self.hwnd) {
+            return false;
+        }
+        if self.records(action) {
+            return true;
+        }
+        let vk = message.wParam.0 as u16;
+        let release = matches!(message.message, WM_KEYUP | WM_SYSKEYUP);
+        let repeat = message.lParam.0 & (1 << 30) != 0;
+        self.recorder.borrow().swallow == Some(vk) && (release || repeat)
+    }
+
+    /// Eats the repeats and the release of the key that ended a recording.
+    fn swallows(&self, vk: u16, msg: u32, lp: LPARAM) -> bool {
+        let mut recorder = self.recorder.borrow_mut();
+        if recorder.swallow != Some(vk) {
+            return false;
+        }
+        if matches!(msg, WM_KEYUP | WM_SYSKEYUP) {
+            recorder.swallow = None;
+            true
+        } else if lp.0 & (1 << 30) != 0 {
+            true
+        } else {
+            recorder.swallow = None;
+            false
+        }
+    }
+}
+
+impl Window<'_> {
     fn refresh(&self) {
         let (
             checked,
@@ -1548,7 +2432,9 @@ impl Window<'_> {
             let duration = if self.started.get() { motion.duration(CARD_MS) } else { 0.0 };
             motion.select_card(card, now, duration);
         }
-        for (id, checked) in checked {
+        let page = self.page.get();
+        let tabs = [(GeneralTab, page == Page::General), (ShortcutsTab, page == Page::Shortcuts)];
+        for (id, checked) in checked.into_iter().chain(tabs) {
             // SAFETY: checkbox and radio BUTTONs accept scalar BM_SETCHECK parameters.
             unsafe {
                 SendMessageW(
@@ -1558,19 +2444,6 @@ impl Window<'_> {
                     None,
                 )
             };
-        }
-        for item in ITEMS.iter().filter(|item| item.button()) {
-            let enabled = loaded
-                && match item.id {
-                    Notes | Recording => false,
-                    Launch => launch_available,
-                    ResetNotes => reset_notes,
-                    ResetCaptures => reset_captures,
-                    Retry => retry,
-                    _ => true,
-                };
-            // SAFETY: only same-thread settings child windows are enabled or disabled here.
-            let _ = unsafe { EnableWindow(self.child(item.id), enabled) };
         }
         self.text(CardDimensions, &dimensions);
         self.text(Status, &status);
@@ -1584,14 +2457,31 @@ impl Window<'_> {
             motion.status.retarget(if show_status { 1.0 } else { 0.0 }, now, duration);
             motion.retry.retarget(if retry { 1.0 } else { 0.0 }, now, duration);
         }
-        // SAFETY: owned HWNDs, show or hide their status controls, then invalidate the content.
-        unsafe {
-            let _ = ShowWindow(
-                self.child(Status),
-                if show_status { SW_SHOWNOACTIVATE } else { SW_HIDE },
-            );
-            let _ = ShowWindow(self.child(Retry), if retry { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        // The hidden page's controls are hidden and disabled: Tab and assistive technology
+        // skip them.
+        for item in ITEMS {
+            let on_page = page.contains(item.id);
+            let visible = on_page
+                && match item.id {
+                    Status => show_status,
+                    Retry => retry,
+                    _ => true,
+                };
+            let enabled = on_page
+                && (matches!(item.id, GeneralTab | ShortcutsTab)
+                    || !item.button()
+                    || loaded
+                        && match item.id {
+                            Notes | Recording => false,
+                            Launch => launch_available,
+                            ResetNotes => reset_notes,
+                            ResetCaptures => reset_captures,
+                            Retry => retry,
+                            _ => true,
+                        });
+            self.show(item.id, visible, enabled);
         }
+        self.refresh_shortcuts();
         self.sync_buttons();
         self.invalidate(None);
     }
@@ -1655,15 +2545,16 @@ impl Window<'_> {
         self.update_animation();
     }
 
-    fn save(&self) {
+    fn save(&self) -> bool {
         let settings = self.model.borrow().settings.clone();
         let result = settings.save(&self.options.path);
         self.model.borrow_mut().save_error =
             result.as_ref().err().map(|err| format!("Settings could not be saved. {err}"));
-        if result.is_ok() && self.lifetime.saved.send(settings).is_ok() {
-            self.lifetime.signal();
+        if result.is_ok() {
+            self.lifetime.emit(Request::Saved(settings));
         }
         self.refresh();
+        result.is_ok()
     }
 
     fn set_folder(&self, folder: Folder, path: Option<PathBuf>) {
@@ -1677,6 +2568,14 @@ impl Window<'_> {
 
     fn command(&self, id: i32) {
         let Some(item) = Item::lookup(id) else { return };
+        if !self.page.get().contains(item.id) || self.picking.get() || self.close_pending.get() {
+            return;
+        }
+        match item.id {
+            GeneralTab => return self.set_page(Page::General),
+            ShortcutsTab => return self.set_page(Page::Shortcuts),
+            _ => {}
+        }
         if self.picking.get()
             || self.model.borrow().load_error.is_some()
             || self.close_pending.get()
@@ -1687,6 +2586,12 @@ impl Window<'_> {
         // SAFETY: only the state of a child of this window is queried.
         if !item.button() || !unsafe { IsWindowEnabled(child) }.as_bool() {
             return;
+        }
+        match item.id.shortcut_row() {
+            Some((action, ShortcutPart::Recorder)) => return self.begin_capture(action),
+            Some((action, ShortcutPart::Reset)) => return self.reset_shortcut(action),
+            Some(_) => return,
+            None => {}
         }
         self.model.borrow_mut().action_error = None;
         match item.id {
@@ -1836,6 +2741,7 @@ impl Window<'_> {
 
     fn request_close(&self) {
         let already_closing = self.close_pending.replace(true);
+        self.end_recorder();
         let dialog = self.dialog.borrow().clone();
         if let Some(dialog) = dialog {
             // SAFETY: Close is called on the STA that owns Show, without a borrowed model.
@@ -1864,6 +2770,12 @@ impl Window<'_> {
 
 impl Drop for Window<'_> {
     fn drop(&mut self) {
+        // Every other way out has ended the recorder already; this one covers a window
+        // destroyed without WM_CLOSE.
+        let recorder = self.recorder.get_mut();
+        if recorder.capture.is_some() || recorder.proposal.is_some() {
+            self.lifetime.emit(Request::Resume);
+        }
         // SAFETY: both handles were created here, and the window has been destroyed.
         for icon in self.icons.iter().copied().filter(|icon| !icon.is_invalid()) {
             let _ = unsafe { DestroyIcon(icon) };
@@ -1979,6 +2891,8 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
         frozen: Cell::new(None),
         surface: RefCell::new(None),
         error_label: RefCell::new(String::new()),
+        page: Cell::new(Page::General),
+        recorder: RefCell::new(Recorder::default()),
         fonts: RefCell::new(Fonts::new(dpi)),
         tooltip: Cell::new(HWND::default()),
         tips: RefCell::new(Default::default()),
@@ -1992,6 +2906,8 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&*window as *const Window<'_>) as isize) };
     let result = (|| {
         window.init_children(instance)?;
+        // SAFETY: select the General page in the native radio group before showing it.
+        unsafe { SendMessageW(window.child(GeneralTab), BM_SETCHECK, Some(WPARAM(1)), None) };
         window.set_theme();
         window.relayout(dpi);
         window.refresh_folders(true);
@@ -2008,6 +2924,7 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
             (at.y + ((at.height - height) / 2.0).max(0.0)) as i32,
         )));
         lifetime.hwnd.store(hwnd.0 as isize, SeqCst);
+        lifetime.emit(Request::Status);
         if !lifetime.stop.load(SeqCst) {
             let now = window.now();
             {
@@ -2049,6 +2966,14 @@ fn pump(window: &Window<'_>) -> Result<()> {
             -1 => return Err(Error::from_thread()),
             _ => {}
         }
+        if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP)
+            && window.recorder_owns(&message)
+        {
+            // Straight to the recorder: no dialog keys, menu cues or characters.
+            // SAFETY: dispatch a message from this same queue to our own child.
+            unsafe { DispatchMessageW(&message) };
+            continue;
+        }
         if message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN {
             window.change_ui_state(UIS_CLEAR, UISF_HIDEFOCUS);
             if message.wParam.0 == VK_MENU.0 as usize {
@@ -2058,6 +2983,20 @@ fn pump(window: &Window<'_>) -> Result<()> {
             && message.wParam.0 == VK_MENU.0 as usize
         {
             window.change_ui_state(UIS_SET, UISF_HIDEACCEL);
+        }
+        if message.message == WM_KEYDOWN && message.wParam.0 == VK_TAB.0 as usize {
+            let held = window.held();
+            // SAFETY: scalar parent query for a window of this thread's queue.
+            let ours = message.hwnd == window.hwnd
+                || unsafe { GetParent(message.hwnd) }.ok() == Some(window.hwnd);
+            if ours && held.ctrl && !held.alt && !held.win {
+                // Ctrl+Tab and Ctrl+Shift+Tab: with two pages, both go to the other one.
+                window.set_page(match window.page.get() {
+                    Page::General => Page::Shortcuts,
+                    Page::Shortcuts => Page::General,
+                });
+                continue;
+            }
         }
         // SAFETY: GetFocus is this STA's focused control. Only click our direct child.
         let enter = unsafe {
@@ -2134,6 +3073,7 @@ impl Surface {
             labels: Vec::new(),
             dc: self.dc,
             dirty,
+            dx: 0,
         }
     }
 }
@@ -2162,6 +3102,8 @@ struct Canvas<'a> {
     labels: Vec<Label>,
     dc: HDC,
     dirty: RECT,
+    /// Moves everything drawn sideways, for the page slide.
+    dx: i32,
 }
 
 fn intersects(a: RECT, b: RECT) -> bool {
@@ -2205,7 +3147,16 @@ fn rounded_path(rect: RECT, radius: f32) -> Option<tiny_skia::Path> {
 }
 
 impl Canvas<'_> {
+    fn moved(&self, rect: RECT) -> RECT {
+        RECT { left: rect.left + self.dx, right: rect.right + self.dx, ..rect }
+    }
+
+    fn visible(&self, rect: RECT) -> bool {
+        intersects(self.moved(rect), self.dirty)
+    }
+
     fn shape(&mut self, rect: RECT, radius: f32, color: COLORREF) {
+        let rect = self.moved(rect);
         if intersects(rect, self.dirty)
             && let Some(path) = rounded_path(rect, radius)
         {
@@ -2235,6 +3186,7 @@ impl Canvas<'_> {
         format: DRAW_TEXT_FORMAT,
         font: HFONT,
     ) {
+        let rect = self.moved(rect);
         if intersects(rect, self.dirty) {
             self.labels.push(Label { rect, text: text.into(), ink, format, font });
         }
@@ -2341,14 +3293,169 @@ impl Window<'_> {
         }
     }
 
+    /// The page switch: the card-size segment's look and its sliding highlight.
+    fn paint_pages(&self, canvas: &mut Canvas<'_>, frame: Frame, p: Palette) {
+        let dpi = self.dpi.get();
+        let px = |size| scale(size, dpi);
+        let fade = |ink| mix(p.paper, ink, frame.intro);
+        let rect = |id: Control| scaled(Item::lookup(id as i32).expect("page tab").rect, dpi);
+        let (general, shortcuts) = (rect(GeneralTab), rect(ShortcutsTab));
+        let fill = mix(p.patch, p.chip, 0.55);
+        canvas.shape(inset(RECT { right: shortcuts.right, ..general }, 1), px(6) as f32, fade(fill));
+        let along = |from: i32, to: i32| from + (f64::from(to - from) * frame.page).round() as i32;
+        let highlight = RECT {
+            left: along(general.left, shortcuts.left),
+            right: along(general.right, shortcuts.right),
+            ..general
+        };
+        canvas.shape(inset(highlight, px(3)), px(4) as f32, fade(p.selected));
+        let font = self.fonts.borrow().0[1];
+        for (index, id) in [GeneralTab, ShortcutsTab].into_iter().enumerate() {
+            let bounds = rect(id);
+            let shape = inset(bounds, px(3));
+            let focus = frame.buttons[id.index()].focus;
+            // The segment is drawn above, so only the ring and its gap are needed here.
+            paint_focus(canvas, shape, [px(4), px(1), px(2)], fade(fill), fade(p.accent), focus);
+            if focus > 0.0 {
+                let current = frame.page.round() as usize == index;
+                canvas.shape(shape, px(4) as f32, fade(if current { p.selected } else { fill }));
+            }
+            let text = Item::lookup(id as i32).expect("page tab").text;
+            canvas.text(bounds, text, fade(p.text), DT_CENTER | DT_VCENTER | DT_SINGLELINE, font);
+        }
+    }
+
+    fn paint_shortcuts(&self, canvas: &mut Canvas<'_>, frame: Frame, p: Palette) {
+        let dpi = self.dpi.get();
+        let px = |size| scale(size, dpi);
+        let fade = |ink| mix(p.paper, ink, frame.intro);
+        let fonts = self.fonts.borrow().0;
+        let center = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+        let line = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
+        let recorder = self.recorder.borrow();
+        for &action in Action::ALL {
+            let index = action as usize;
+            if !canvas.visible(scaled(row_rect(index), dpi)) {
+                continue;
+            }
+            let tracks = frame.rows[index];
+            let view = &recorder.rows[index];
+            let available = action.available();
+            let recording = recorder.capture.as_ref().is_some_and(|c| c.action == action);
+            let part = |part| {
+                let item = Item::lookup(Control::shortcut(action, part) as i32).expect("row part");
+                scaled(item.rect, dpi)
+            };
+            let title = if available { p.text } else { p.muted };
+            canvas.text(part(ShortcutPart::Label), action.label(), fade(title), line, fonts[0]);
+
+            // The recorder: a field of key chips. It waits with an accent outline that pulses.
+            let id = Control::shortcut(action, ShortcutPart::Recorder);
+            let state = frame.buttons[id.index()];
+            let shape = inset(part(ShortcutPart::Recorder), px(3));
+            paint_focus(canvas, shape, [px(5), px(1), px(2)], fade(p.paper), fade(p.accent), state.focus);
+            let face = if available {
+                mix(mix(p.paper, p.selected, state.hover * 0.6), p.outline, state.press * 0.27)
+            } else {
+                p.paper
+            };
+            let (edge, width) = if recording {
+                (mix(p.on, p.accent, 0.4 + 0.6 * frame.pulse), px(2))
+            } else if available {
+                (p.outline, 1)
+            } else {
+                (p.disabled, 1)
+            };
+            canvas.shape(shape, px(5) as f32, fade(edge));
+            canvas.shape(inset(shape, width), (px(5) - width) as f32, fade(face));
+            let inner = inset(shape, px(2));
+            let amount = tracks[CHIPS];
+            if view.chips.is_empty() {
+                let text = if recording { "Press keys" } else { "None" };
+                let ink = if available { p.muted } else { mix(p.patch, p.muted, 0.72) };
+                let bounds = RECT { left: inner.left + px(7), ..inner };
+                canvas.text(bounds, text, fade(mix(face, ink, amount)), line, fonts[1]);
+            } else {
+                let (chip, ink) = if available {
+                    (p.chip, p.text)
+                } else {
+                    (p.patch, mix(p.patch, p.muted, 0.72))
+                };
+                let top = inner.top + (inner.bottom - inner.top - px(20)) / 2;
+                let mut left = inner.left + px(4);
+                for (n, text) in view.chips.iter().enumerate() {
+                    let shown = if n < view.kept { 1.0 } else { amount };
+                    let width = (canvas.width(text, fonts[2]) + px(10)).max(px(20));
+                    if left + width > inner.right - px(3) {
+                        let rest = RECT { left, right: inner.right, ..inner };
+                        canvas.text(rest, "…", fade(p.muted), line, fonts[2]);
+                        break;
+                    }
+                    // New chips rise into place as they fade in.
+                    let rise = px((3.0 * (1.0 - shown)).round() as i32);
+                    let bounds = RECT {
+                        left,
+                        right: left + width,
+                        top: top + rise,
+                        bottom: top + px(20) + rise,
+                    };
+                    canvas.shape(bounds, px(4) as f32, fade(mix(face, chip, shown)));
+                    canvas.text(bounds, text.as_str(), fade(mix(face, ink, shown)), center, fonts[2]);
+                    left += width + px(4);
+                }
+            }
+
+            let opacity = tracks[RESET];
+            if opacity > 0.0 {
+                let id = Control::shortcut(action, ShortcutPart::Reset);
+                let state = frame.buttons[id.index()];
+                let bounds = part(ShortcutPart::Reset);
+                let shape = inset(bounds, px(3));
+                let color = |ink| fade(mix(p.paper, ink, opacity));
+                paint_focus(canvas, shape, [px(4), px(1), px(2)], fade(p.paper), fade(p.accent), state.focus * opacity);
+                let face =
+                    mix(mix(p.chip, p.selected, state.hover * 0.6), p.outline, state.press * 0.27);
+                canvas.outlined(shape, px(4) as f32, color(face), color(p.outline));
+                canvas.text(bounds, "Reset", color(p.text), center, fonts[1]);
+            }
+
+            let opacity = tracks[NOTE];
+            if opacity > 0.0 && !view.note.text.is_empty() {
+                let bounds = move_y(part(ShortcutPart::Status), px((3.0 * (1.0 - opacity)).round() as i32));
+                let ink = if view.note.tone == Tone::Error { p.error } else { p.muted };
+                canvas.text(bounds, view.note.text.as_str(), fade(mix(p.paper, ink, opacity)), line, fonts[1]);
+            }
+            if index + 1 < ROWS {
+                let rule = scaled([24, row_y(index) + 57, 496, 1], dpi);
+                canvas.shape(rule, 0.0, fade(mix(p.patch, p.chip, 0.5)));
+            }
+        }
+    }
+
     fn paint_content(&self, canvas: &mut Canvas<'_>, frame: Frame, p: Palette, hide_accel: bool) {
+        self.paint_pages(canvas, frame, p);
+        // The shown page fades in and slides in from the side of its tab.
+        let direction = if self.page.get() == Page::Shortcuts { 1.0 } else { -1.0 };
+        canvas.dx = scale(((1.0 - frame.content) * 16.0 * direction).round() as i32, self.dpi.get());
+        let page_frame = Frame { intro: frame.intro * frame.content, ..frame };
+        if self.page.get() == Page::Shortcuts {
+            self.paint_shortcuts(canvas, page_frame, p);
+        } else {
+            self.paint_general(canvas, page_frame, p, hide_accel);
+        }
+        canvas.dx = 0;
+    }
+
+    fn paint_general(&self, canvas: &mut Canvas<'_>, frame: Frame, p: Palette, hide_accel: bool) {
         let dpi = self.dpi.get();
         let px = |size| scale(size, dpi);
         let layout = frame.layout();
         let fade = |color| mix(p.paper, color, frame.intro);
         let mut card_patch = CARD_PATCH;
         card_patch[1] += layout.offset(CardTitle);
-        for rect in [KEEP_PATCH, card_patch] {
+        let mut keep_patch = KEEP_PATCH;
+        keep_patch[1] += layout.offset(KeepTitle);
+        for rect in [keep_patch, card_patch] {
             canvas.shape(scaled(rect, dpi), px(8) as f32, fade(p.patch));
         }
         let radio =
@@ -2364,7 +3471,7 @@ impl Window<'_> {
         canvas.shape(inset(highlight, px(3)), px(4) as f32, fade(p.selected));
 
         let fonts = self.fonts.borrow().0;
-        for item in ITEMS {
+        for item in ITEMS.iter().filter(|item| !matches!(item.id, GeneralTab | ShortcutsTab)) {
             let mut rect = layout.rect(item, dpi);
             let local = match item.id {
                 NotesFallback => frame.folders[0],
@@ -2634,11 +3741,41 @@ unsafe extern "system" fn control_proc(
     }
     // SAFETY: querying the ID of our native child uses only its HWND.
     let item = Item::lookup(unsafe { GetDlgCtrlID(hwnd) }).filter(|item| item.button());
+    if let Some((action, ShortcutPart::Recorder)) = item.and_then(|item| item.id.shortcut_row()) {
+        let recording = window.records(action);
+        let key = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP);
+        match msg {
+            WM_GETDLGCODE if recording => {
+                // SAFETY: keep the native dialog flags and ask for every key while recording,
+                // Tab, Enter and Esc included.
+                let native = unsafe { DefSubclassProc(hwnd, msg, wp, lp) };
+                return LRESULT(native.0 | DLGC_WANTALLKEYS as isize);
+            }
+            // Never DefWindowProc while recording: F10 and Alt would open the menu loop and
+            // Alt+F4 would close the window.
+            _ if key && recording => {
+                // An auto-repeat (bit 30) is not a new press: the key that opened the
+                // recorder (Enter) may still be held.
+                let press = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) && lp.0 & (1 << 30) == 0;
+                window.recorder_key(wp.0 as u16, press);
+                return LRESULT(0);
+            }
+            _ if key && window.swallows(wp.0 as u16, msg, lp) => return LRESULT(0),
+            WM_CHAR | WM_SYSCHAR if recording => return LRESULT(0),
+            WM_KILLFOCUS => {
+                window.recorder.borrow_mut().swallow = None;
+                if recording {
+                    window.cancel_capture();
+                }
+            }
+            _ => {}
+        }
+    }
     if let Some(item) = item {
         if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
             window.change_ui_state(UIS_SET, UISF_HIDEFOCUS);
         }
-        if matches!(item.kind, Kind::Push(_) | Kind::Switch)
+        if item.pointer_effects()
             && matches!(msg, WM_MOUSEMOVE | WM_MOUSELEAVE)
         {
             window.observe_hover(item, hwnd, msg, lp);
@@ -2710,6 +3847,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 window.test_scene(wp.0);
                 return LRESULT(0);
             }
+            TEST_DIE if window.options.test.is_some() => {
+                window.lifetime.muted.store(true, SeqCst);
+                // SAFETY: ends this STA's own message loop; run_window then destroys the window.
+                unsafe { PostQuitMessage(0) };
+                return LRESULT(0);
+            }
             TEST_IDLE if window.options.test.is_some() => {
                 let idle = !window.timer.get() && !window.motion.borrow().active(window.now());
                 return LRESULT(isize::from(idle));
@@ -2718,6 +3861,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 window.activate();
                 return LRESULT(0);
             }
+            SHORTCUT_STATUS => {
+                window.receive_registration();
+                return LRESULT(0);
+            }
+            WM_INPUTLANGCHANGE => window.refresh_shortcuts(),
             WM_CLOSE => {
                 window.request_close();
                 return LRESULT(0);
@@ -2823,28 +3971,29 @@ mod tests {
         for dpi in [96, 120, 144, 192] {
             for notes in [0, 15] {
                 for captures in [0, 15] {
-                    for status in [0, STATUS_HEIGHT] {
-                        let layout = Layout { notes, captures, status };
-                        let visible = ITEMS
-                            .iter()
-                            .filter(|item| match item.id {
-                                NotesFallback => notes != 0,
-                                CapturesFallback => captures != 0,
-                                Status | Retry => status != 0,
-                                _ => true,
-                            })
-                            .collect::<Vec<_>>();
-                        for (i, item) in visible.iter().enumerate() {
+                    let layout = Layout { notes, captures };
+                    let general = ITEMS
+                        .iter()
+                        .filter(|item| match item.id {
+                            NotesFallback => notes != 0,
+                            CapturesFallback => captures != 0,
+                            _ => true,
+                        })
+                        .collect::<Vec<_>>();
+                    let tabs = &ITEMS[..2];
+                    let shortcuts = tabs.iter().chain(&SHORTCUT_ITEMS).collect::<Vec<_>>();
+                    for page in [general, shortcuts] {
+                        for (i, item) in page.iter().enumerate() {
                             let a = layout.rect(item, dpi);
                             assert!(
                                 a.left >= 0
                                     && a.top >= 0
                                     && a.right <= scale(WIDTH, dpi)
-                                    && a.bottom <= scale(layout.height(), dpi),
+                                    && a.bottom <= scale(HEIGHT, dpi),
                                 "{dpi}: {:?}",
                                 item.id
                             );
-                            for other in &visible[..i] {
+                            for other in &page[..i] {
                                 assert!(
                                     !intersects(a, layout.rect(other, dpi)),
                                     "{dpi}: {:?} overlaps {:?}",
@@ -2856,6 +4005,57 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn the_fixed_window_fits_small_and_scaled_screens() {
+        // The work area is the screen less a 48 px (logical) taskbar.
+        for (width, height, dpi) in [(1366, 768, 96), (1920, 1080, 144)] {
+            let taskbar = scale(48, dpi);
+            let (w, h) = test_window_size(dpi);
+            println!("{width}x{height} at {dpi} dpi: window {w} x {h}, work area {width} x {}", height - taskbar);
+            assert!(w <= width && h <= height - taskbar, "{w} x {h} at {dpi} dpi");
+        }
+    }
+
+    #[test]
+    fn shortcut_ids_follow_their_rows() {
+        for &action in Action::ALL {
+            for part in [ShortcutPart::Label, ShortcutPart::Recorder, ShortcutPart::Reset, ShortcutPart::Status] {
+                assert_eq!(Control::shortcut(action, part).shortcut_row(), Some((action, part)));
+            }
+        }
+        assert_eq!(Retry.shortcut_row(), None);
+        assert_eq!(ShortcutsTab.shortcut_row(), None);
+    }
+
+    #[test]
+    fn warnings_name_layout_characters_menus_and_common_app_keys() {
+        let hint = |text: &str| shortcut_warning(&Chord::parse(text).unwrap());
+        let character = Some("On some keyboard layouts this combination types a character.");
+        let menu = Some("This may override menu shortcuts in other apps.");
+        let common = Some("Other apps will no longer receive this shortcut.");
+        for text in ["Ctrl+Alt+Q", "Ctrl+Alt+7", "Ctrl+Alt+Shift+E", "Ctrl+Alt+0"] {
+            assert_eq!(hint(text), character, "{text}");
+        }
+        for text in ["Alt+K", "Alt+A"] {
+            assert_eq!(hint(text), menu, "{text}");
+        }
+        for key in "CXZYASFPNOWT".chars() {
+            assert_eq!(hint(&format!("Ctrl+{key}")), common, "Ctrl+{key}");
+        }
+        for text in [
+            "Ctrl+Alt+F9",
+            "Ctrl+Shift+S",
+            "Alt+Shift+K",
+            "Alt+5",
+            "Ctrl+B",
+            "Ctrl+Alt+Win+K",
+            "Ctrl+Alt+[",
+            "F9",
+        ] {
+            assert_eq!(hint(text), None, "{text}");
         }
     }
 
