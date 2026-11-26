@@ -96,13 +96,33 @@ fn draw_line(ink: &mut Ink, y: f64) {
     ink.end_stroke();
 }
 
+/// Builds a finished stroke the way the overlay does. `Stroke::new` is crate-private, so the
+/// test takes a tool and feeds the points through `Ink`; the helper checks they all survived
+/// the one-point minimum step, so `Ink::shape` sees exactly the requested points.
+#[track_caller]
+fn stroke(tool: InkTool, points: &[Point]) -> Stroke {
+    let mut ink = Ink::new();
+    ink.press(match tool {
+        InkTool::Pen => InkKey::Pen,
+        InkTool::Highlighter => InkKey::Highlighter,
+    });
+    ink.begin_stroke(points[0]);
+    for point in &points[1..] {
+        ink.extend_stroke(*point);
+    }
+    ink.end_stroke();
+    let built = ink.strokes()[0].clone();
+    assert_eq!(built.points(), points, "the stroke did not keep every point");
+    built
+}
+
 #[test]
 fn test_shortcut_takes_tool_and_pressing_again_puts_it_down() {
     let mut ink = Ink::new();
     assert!(ink.press(InkKey::Pen));
-    assert_eq!(ink.tool, Some(InkTool::Pen));
+    assert_eq!(ink.tool(), Some(InkTool::Pen));
     assert!(ink.press(InkKey::Pen));
-    assert_eq!(ink.tool, None);
+    assert_eq!(ink.tool(), None);
 }
 
 #[test]
@@ -111,11 +131,11 @@ fn test_other_shortcut_switches_tool_and_keeps_the_ink() {
     ink.press(InkKey::Pen);
     draw_line(&mut ink, 10.0);
     ink.press(InkKey::Highlighter);
-    assert_eq!(ink.tool, Some(InkTool::Highlighter));
-    assert_eq!(ink.strokes.len(), 1);
-    assert_eq!(ink.strokes[0].tool, InkTool::Pen);
+    assert_eq!(ink.tool(), Some(InkTool::Highlighter));
+    assert_eq!(ink.strokes().len(), 1);
+    assert_eq!(ink.strokes()[0].tool(), InkTool::Pen);
     draw_line(&mut ink, 10.0);
-    let tools: Vec<InkTool> = ink.strokes.iter().map(|stroke| stroke.tool).collect();
+    let tools: Vec<InkTool> = ink.strokes().iter().map(|stroke| stroke.tool()).collect();
     assert_eq!(tools, vec![InkTool::Pen, InkTool::Highlighter]);
 }
 
@@ -125,8 +145,8 @@ fn test_done_puts_tool_down_and_wipes_the_ink() {
     ink.press(InkKey::Highlighter);
     draw_line(&mut ink, 10.0);
     assert!(ink.press(InkKey::Done));
-    assert_eq!(ink.tool, None);
-    assert!(ink.strokes.is_empty());
+    assert_eq!(ink.tool(), None);
+    assert!(ink.strokes().is_empty());
 }
 
 #[test]
@@ -145,9 +165,9 @@ fn test_undo_takes_back_the_last_stroke() {
     draw_line(&mut ink, 10.0);
     draw_line(&mut ink, 50.0);
     assert!(ink.press(InkKey::Undo));
-    assert_eq!(ink.strokes.len(), 1);
+    assert_eq!(ink.strokes().len(), 1);
     assert!(ink.press(InkKey::Undo));
-    assert!(ink.strokes.is_empty());
+    assert!(ink.strokes().is_empty());
     assert!(ink.press(InkKey::Undo), "still drawing: the key is ours even with nothing to undo");
 }
 
@@ -157,8 +177,8 @@ fn test_clear_wipes_but_keeps_the_tool() {
     ink.press(InkKey::Pen);
     draw_line(&mut ink, 10.0);
     ink.press(InkKey::Clear);
-    assert!(ink.strokes.is_empty());
-    assert_eq!(ink.tool, Some(InkTool::Pen));
+    assert!(ink.strokes().is_empty());
+    assert_eq!(ink.tool(), Some(InkTool::Pen));
 }
 
 #[test]
@@ -167,7 +187,7 @@ fn test_no_strokes_without_a_tool() {
     ink.begin_stroke(Point::ZERO);
     ink.extend_stroke(Point::new(10.0, 0.0));
     ink.end_stroke();
-    assert!(ink.strokes.is_empty());
+    assert!(ink.strokes().is_empty());
 }
 
 #[test]
@@ -177,12 +197,12 @@ fn test_tiny_moves_are_dropped() {
     ink.begin_stroke(Point::ZERO);
     ink.extend_stroke(Point::new(0.5, 0.5));
     ink.extend_stroke(Point::new(5.0, 0.0));
-    assert_eq!(ink.current.as_ref().map(|stroke| stroke.points.len()), Some(2));
+    assert_eq!(ink.current().map(|stroke| stroke.points().len()), Some(2));
 }
 
 #[test]
 fn test_a_click_makes_a_round_dot() {
-    let shape = Ink::shape(&Stroke::new(InkTool::Pen, vec![Point::new(100.0, 100.0)]), true);
+    let shape = Ink::shape(&stroke(InkTool::Pen, &[Point::new(100.0, 100.0)]), true);
     let bounds = bounding_box(&shape);
     assert!(!shape.is_empty());
     assert!(bounds.contains(Point::new(100.0, 100.0)));
@@ -194,7 +214,7 @@ fn test_completed_stroke_covers_its_ends() {
     let points: Vec<Point> = (0..=30)
         .map(|i| Point::new(i as f64 * 6.0, 50.0 + (i as f64 / 4.0).sin() * 20.0))
         .collect();
-    let shape = Ink::shape(&Stroke::new(InkTool::Pen, points.clone()), true);
+    let shape = Ink::shape(&stroke(InkTool::Pen, &points), true);
     assert!(path_contains(&shape, points[0]));
     assert!(path_contains(&shape, *points.last().unwrap()));
     assert!(path_contains(&shape, points[15]));
@@ -210,7 +230,7 @@ fn test_pen_thins_when_fast_and_highlighter_does_not() {
             points.push(Point::new(x, 100.0));
             x += step;
         }
-        bounding_box(&Ink::shape(&Stroke::new(tool, points), true)).height
+        bounding_box(&Ink::shape(&stroke(tool, &points), true)).height
     }
 
     assert!(width(InkTool::Pen, 2.0) > width(InkTool::Pen, 30.0) + 1.0);

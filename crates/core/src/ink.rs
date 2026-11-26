@@ -51,13 +51,21 @@ pub enum InkKey {
 /// One stroke drawn with a tool.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stroke {
-    pub tool: InkTool,
-    pub points: Vec<Point>,
+    tool: InkTool,
+    points: Vec<Point>,
 }
 
 impl Stroke {
-    pub fn new(tool: InkTool, points: Vec<Point>) -> Self {
+    pub(crate) fn new(tool: InkTool, points: Vec<Point>) -> Self {
         Self { tool, points }
+    }
+
+    pub fn tool(&self) -> InkTool {
+        self.tool
+    }
+
+    pub fn points(&self) -> &[Point] {
+        &self.points
     }
 }
 
@@ -66,10 +74,10 @@ impl Stroke {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Ink {
     /// `None`: the normal cursor (clicks go to the apps underneath).
-    pub tool: Option<InkTool>,
-    pub strokes: Vec<Stroke>,
+    tool: Option<InkTool>,
+    strokes: Vec<Stroke>,
     /// The stroke being drawn right now (mouse is down).
-    pub current: Option<Stroke>,
+    current: Option<Stroke>,
 }
 
 impl Ink {
@@ -78,6 +86,21 @@ impl Ink {
 
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The tool in hand; `None` is the normal cursor.
+    pub fn tool(&self) -> Option<InkTool> {
+        self.tool
+    }
+
+    /// The finished strokes, oldest first.
+    pub fn strokes(&self) -> &[Stroke] {
+        &self.strokes
+    }
+
+    /// The stroke being drawn right now, if the mouse is down.
+    pub fn current(&self) -> Option<&Stroke> {
+        self.current.as_ref()
     }
 
     pub fn is_drawing(&self) -> bool {

@@ -39,12 +39,12 @@ fn test_starts_showing_the_whole_display() {
 fn test_zoom_eases_toward_target() {
     let mut v = RecordingViewport::new(display());
     v.zoom_by(2.0_f64.ln());
-    assert_close(v.target_zoom, 2.0, 0.0001);
+    assert_close(v.target_zoom(), 2.0, 0.0001);
     v.step(Point::new(800.0, 500.0), false, 1.0 / 60.0);
-    assert!(v.zoom > 1.0);
-    assert!(v.zoom < 2.0, "one frame is not the whole way");
+    assert!(v.zoom() > 1.0);
+    assert!(v.zoom() < 2.0, "one frame is not the whole way");
     settle(&mut v, Point::new(800.0, 500.0), true);
-    assert_close(v.zoom, 2.0, 0.001);
+    assert_close(v.zoom(), 2.0, 0.001);
     assert_close(v.area().width, 800.0, 1.0);
     assert_close(v.area().height, 500.0, 1.0);
 }
@@ -53,9 +53,9 @@ fn test_zoom_eases_toward_target() {
 fn test_zoom_is_clamped() {
     let mut v = RecordingViewport::new(display());
     v.zoom_by(-5.0);
-    assert_eq!(v.target_zoom, 1.0);
+    assert_eq!(v.target_zoom(), 1.0);
     v.zoom_by(50.0);
-    assert_eq!(v.target_zoom, 4.0);
+    assert_eq!(v.target_zoom(), 4.0);
 }
 
 #[test]
@@ -111,7 +111,7 @@ fn test_zoom_still_eases_while_pinned() {
     let mut v = RecordingViewport::new(display());
     v.zoom_by(2.0_f64.ln());
     settle(&mut v, Point::new(400.0, 300.0), false);
-    assert_close(v.zoom, 2.0, 0.001);
+    assert_close(v.zoom(), 2.0, 0.001);
     assert_close(v.area().mid_x(), 800.0, 1.0);
 }
 
@@ -121,9 +121,9 @@ fn test_reset_eases_back_to_the_whole_display() {
     v.zoom_by(3.0_f64.ln());
     settle(&mut v, Point::new(1300.0, 800.0), true);
     v.reset();
-    assert_eq!(v.target_zoom, 1.0);
+    assert_eq!(v.target_zoom(), 1.0);
     v.step(Point::new(1300.0, 800.0), false, 1.0 / 60.0);
-    assert!(v.zoom > 1.0, "one frame is not the whole way");
+    assert!(v.zoom() > 1.0, "one frame is not the whole way");
     assert!(contains_rect(display(), v.area()), "stays on the display on the way out");
     settle(&mut v, Point::new(1300.0, 800.0), false);
     assert_eq!(v.area(), display());
