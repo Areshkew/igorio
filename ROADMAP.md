@@ -236,6 +236,29 @@ settings window. Stored as `shortcuts` in `settings.json`; a change applies at o
   loop. The keys used while drawing (undo, clear, put the pen down) are only active
   during a recording and are not global.
 
+## Notes editor: Notion-like writing
+
+The macOS app shows Markdown markers dimmed. This port goes further, as its owner asked:
+writing a note should feel like Notion, while the file on disk stays plain Markdown.
+
+- Live formatting: headings, bold, italic, code and links show formatted with their
+  markers hidden. The markers reappear while the caret is inside the element.
+- Markdown shortcuts convert as you type: `# `, `- `, `1. `, `[] `, `> `, three
+  backticks, `---`, `**bold**`, `*italic*`, `` `code` ``, `~~strike~~`. One undo gives
+  back the typed characters.
+- Blocks behave: Enter continues a list, Enter on an empty item leaves it, Backspace at
+  the start turns a block into text, Tab and Shift+Tab indent, numbered lists renumber.
+- Clickable to-do checkboxes, drawn bullets and dividers, Ctrl+click opens a link.
+- A slash menu (`/`) to pick a block type, with a filter.
+- Formatting keys such as Ctrl+B, Ctrl+I, Ctrl+E, Ctrl+K.
+- A dropped screenshot shows as an image block.
+- Motion in the style of the settings window: short, and never while typing.
+
+Out of scope: databases, pages in pages, drag handles, tables, columns, mentions.
+
+Risk: this is built on the RichEdit control. If RichEdit cannot carry a part of it well,
+that part is left out or done more simply; a custom text view is a separate, larger job.
+
 ## Milestones
 
 Each one ends with a check that must pass before the next starts.
