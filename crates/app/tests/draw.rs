@@ -86,9 +86,9 @@ fn one_card_has_content_and_a_clear_corner() {
         1.0,
     );
     let pixmap = render(&scene);
-    let centre = pixmap.pixel(74, 53).expect("centre pixel");
+    let centre = pixmap.pixel(150, 43).expect("centre pixel");
     assert_eq!(centre.alpha(), 255, "the card centre must be opaque");
-    let corner = pixmap.pixel(199, 169).expect("corner pixel");
+    let corner = pixmap.pixel(299, 169).expect("corner pixel");
     assert_eq!(corner.alpha(), 0, "the far corner must stay transparent");
     let behind = pixmap.pixel(4, 4).expect("top-left pixel");
     assert_eq!(behind.alpha(), 0, "the inset area must stay transparent");
@@ -143,8 +143,8 @@ fn scale_two_quadruples_the_card_area() {
     let one = render(&scene(vec![card(image.clone(), 0.0, 0)], None, 1.0));
     let two = render(&scene(vec![card(image, 0.0, 0)], None, 2.0));
 
-    assert_eq!(Renderer::pixmap_size(1.0), (200, 170));
-    assert_eq!((two.width(), two.height()), (400, 340));
+    assert_eq!(Renderer::pixmap_size(1.0), (300, 170));
+    assert_eq!((two.width(), two.height()), (600, 340));
 
     let small = opaque_pixels(&one) as f64;
     let large = opaque_pixels(&two) as f64;
@@ -206,12 +206,12 @@ fn leaving_cards_fade_the_image() {
             top.leaving = Some(leaving);
             let pixmap = render(&scene(vec![top], None, 1.0));
             let (x, y) = if dissolve {
-                (74, 53)
+                (150, 43)
             } else {
                 let scale = 1.0 - 0.65 * progress * progress;
                 (
-                    (18.0 + 56.0 * scale).round() as u32,
-                    (18.0 + 35.0 * scale).round() as u32,
+                    (110.0 + 40.0 * scale).round() as u32,
+                    (18.0 + 25.0 * scale).round() as u32,
                 )
             };
             let alpha = pixmap.pixel(x, y).expect("card centre").alpha();
@@ -302,8 +302,8 @@ fn hint_sits_below_the_tallest_card_box() {
         1.0,
     ));
 
-    let one_top = first_row_above(&one, 130, 190, 60, 80).expect("hint in one-card scene");
-    let two_top = first_row_above(&two, 130, 190, 60, 80).expect("hint in two-card scene");
+    let one_top = first_row_above(&one, 200, 228, 20, 80).expect("hint in one-card scene");
+    let two_top = first_row_above(&two, 200, 228, 20, 80).expect("hint in two-card scene");
     assert!(
         two_top >= one_top + 6,
         "the taller lower card should push the hint down: {one_top} vs {two_top}"

@@ -56,7 +56,6 @@ struct HintSprite {
     text: String,
     scale: u32,
     pixmap: Arc<Pixmap>,
-    origin_x: i32,
     origin_y: i32,
 }
 
@@ -586,9 +585,16 @@ impl Renderer {
         }
 
         let sprite = self.hint_sprite(hint, s);
-        let anchor_x = ((layout::INSET + 2.0) * scale) as f32;
+        // Centred under the top card. A hint wider than the panel starts at its left edge.
+        let top_width = scene
+            .cards
+            .iter()
+            .find(|card| card.depth == 0)
+            .and_then(|card| fitted_card_size(&card.image, 1.0, scale))
+            .map_or(layout::THUMB_MAX.width, |(width, _)| width);
+        let centre_x = ((layout::INSET_X + top_width / 2.0) * scale) as f32;
         let anchor_y = ((layout::INSET + tallest + 7.0) * scale) as f32;
-        let x = (anchor_x + sprite.origin_x as f32).round() as i32;
+        let x = ((centre_x - sprite.pixmap.width() as f32 / 2.0).round() as i32).max(0);
         let y = (anchor_y + sprite.origin_y as f32).round() as i32;
         blit_sprite(&sprite.pixmap, pixmap, x, y, opacity);
     }
@@ -616,7 +622,6 @@ impl Renderer {
                 text: text.to_string(),
                 scale: s.to_bits(),
                 pixmap: Arc::new(Pixmap::new(1, 1).expect("hint pixmap")),
-                origin_x: 0,
                 origin_y: 0,
             };
         };
@@ -669,7 +674,6 @@ impl Renderer {
             text: text.to_string(),
             scale: s.to_bits(),
             pixmap: Arc::new(pixmap),
-            origin_x: left,
             origin_y: top,
         }
     }
@@ -757,7 +761,7 @@ fn card_geometry(card: &SceneCard, scale: f64) -> Option<(f64, f64, f64, f64)> {
     } else {
         0.0
     };
-    let x = (layout::INSET + card.depth as f64 * 3.0 + wobble_x) * scale;
+    let x = (layout::INSET_X + card.depth as f64 * 3.0 + wobble_x) * scale;
     let y = (layout::INSET - card.depth as f64 * 4.0) * scale;
     Some((x, y, width, height))
 }
@@ -1051,7 +1055,10 @@ fn blit_scaled(
     let start_y = (pivot_y - origin_y as f64) * 65536.0;
     let num_x = 1.0 - 2.0 * (x as f64 + pivot_x);
     let num_y = 1.0 - 2.0 * (y as f64 + pivot_y);
-    let mut qy = start_y.round() as i64 + (num_y * inv as f64 / 2.0).round() as i64;
+    // The source position for destination pixel 0, then stepped to the first row and
+    // column that are drawn.
+    let mut qy =
+        start_y.round() as i64 + (num_y * inv as f64 / 2.0).round() as i64 + top as i64 * inv;
 
     let src_width = src.width() as usize;
     let src_height = src.height() as usize;
@@ -1061,7 +1068,8 @@ fn blit_scaled(
     let data = dst.data_mut();
 
     for py in top..bottom {
-        let mut qx = start_x.round() as i64 + (num_x * inv as f64 / 2.0).round() as i64;
+        let mut qx =
+            start_x.round() as i64 + (num_x * inv as f64 / 2.0).round() as i64 + left as i64 * inv;
         let dy = py as usize * dst_stride;
         for px in left..right {
             let sx = qx >> 16;

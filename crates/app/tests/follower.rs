@@ -1,5 +1,5 @@
 use igorio_app::follower::Follower;
-use igorio_app::layout::THUMB_MAX;
+use igorio_app::layout::{INSET_X, THUMB_MAX};
 use igorio_core::geom::{Point, Rect};
 
 const SCREEN: Rect = Rect { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 };
@@ -8,7 +8,7 @@ const MIDDLE: Point = Point { x: 960.0, y: 540.0 };
 const CONTENT_W: f64 = THUMB_MAX.width + 14.0;
 const CONTENT_H: f64 = THUMB_MAX.height + 40.0;
 /// Flipped window origin for a mouse at (1900, 1000) at scale 1.0.
-const FLIPPED_X: f64 = 1900.0 - 14.0 - CONTENT_W - 18.0;
+const FLIPPED_X: f64 = 1900.0 - 14.0 - CONTENT_W - INSET_X;
 const FLIPPED_Y: f64 = 1000.0 - 18.0 - CONTENT_H - 18.0;
 
 fn distance(a: Point, b: Point) -> f64 {
@@ -28,8 +28,8 @@ fn middle_of_the_screen_sits_below_right() {
     let follower = Follower::new();
     let origin = follower.target_origin(MIDDLE, SCREEN, 1.0);
     // mouse + (offset - inset) on both axes in top-left coordinates.
-    assert_eq!(origin, Point::new(956.0, 540.0));
-    assert_eq!(origin, Point::new(MIDDLE.x + 14.0 - 18.0, MIDDLE.y + 18.0 - 18.0));
+    assert_eq!(origin, Point::new(MIDDLE.x + 14.0 - INSET_X, 540.0));
+    assert_eq!(origin, Point::new(MIDDLE.x + 14.0 - INSET_X, MIDDLE.y + 18.0 - 18.0));
 }
 
 #[test]
@@ -42,7 +42,7 @@ fn near_the_right_edge_flips_to_the_left() {
     assert_eq!(origin.y, 540.0);
     assert!(origin.x < mouse.x);
     // The whole content box now fits inside the work area.
-    assert!(origin.x + 18.0 + CONTENT_W <= SCREEN.max_x());
+    assert!(origin.x + INSET_X + CONTENT_W <= SCREEN.max_x());
 }
 
 #[test]
@@ -51,7 +51,7 @@ fn near_the_bottom_edge_flips_above() {
     let mouse = Point::new(960.0, 1000.0);
     let origin = follower.target_origin(mouse, SCREEN, 1.0);
     // content top-left y = 1000 - 18 - content height, then minus the inset.
-    assert_eq!(origin.x, 956.0);
+    assert_eq!(origin.x, MIDDLE.x + 14.0 - INSET_X);
     assert_eq!(origin.y, FLIPPED_Y);
     assert!(origin.y < mouse.y);
     assert!(origin.y + 18.0 + CONTENT_H <= SCREEN.max_y());
@@ -70,12 +70,12 @@ fn scale_multiplies_offsets_and_sizes() {
     let follower = Follower::new();
     let origin = follower.target_origin(MIDDLE, SCREEN, 1.5);
     // (14, 18) * 1.5 = (21, 27); inset 18 * 1.5 = 27.
-    assert_eq!(origin, Point::new(960.0 - 6.0, 540.0));
+    assert_eq!(origin, Point::new(960.0 + 21.0 - INSET_X * 1.5, 540.0));
 
     let mouse = Point::new(1900.0, 1000.0);
     let origin = follower.target_origin(mouse, SCREEN, 1.5);
     // content is 1.5x in physical px; flipped top-left is mouse - offset - size.
-    assert_eq!(origin, Point::new(1900.0 - 21.0 - CONTENT_W * 1.5 - 27.0,
+    assert_eq!(origin, Point::new(1900.0 - 21.0 - CONTENT_W * 1.5 - INSET_X * 1.5,
             1000.0 - 27.0 - CONTENT_H * 1.5 - 27.0,));
 }
 
@@ -85,17 +85,17 @@ fn work_area_with_a_non_zero_origin() {
 
     let second_monitor = Rect { x: 1920.0, y: 0.0, width: 1920.0, height: 1080.0 };
     let mouse = Point::new(1920.0 + 960.0, 540.0);
-    assert_eq!(follower.target_origin(mouse, second_monitor, 1.0), Point::new(2876.0, 540.0));
+    assert_eq!(follower.target_origin(mouse, second_monitor, 1.0), Point::new(1920.0 + 960.0 + 14.0 - INSET_X, 540.0));
 
     let left_monitor = Rect { x: -1920.0, y: 0.0, width: 1920.0, height: 1080.0 };
     let mouse = Point::new(-960.0, 540.0);
-    assert_eq!(follower.target_origin(mouse, left_monitor, 1.0), Point::new(-964.0, 540.0));
+    assert_eq!(follower.target_origin(mouse, left_monitor, 1.0), Point::new(-960.0 + 14.0 - INSET_X, 540.0));
 
     // The right edge of the left monitor still flips the content.
     let mouse = Point::new(-20.0, 540.0);
     let origin = follower.target_origin(mouse, left_monitor, 1.0);
     assert!(origin.x < mouse.x);
-    assert!(origin.x + 18.0 + CONTENT_W <= left_monitor.max_x());
+    assert!(origin.x + INSET_X + CONTENT_W <= left_monitor.max_x());
 }
 
 #[test]
@@ -187,7 +187,7 @@ fn is_settled_tracks_the_target() {
 fn non_finite_scale_or_mouse_is_ignored() {
     let mut follower = Follower::new();
     let snapped = follower.step(MIDDLE, SCREEN, 1.0, 0.016).unwrap();
-    assert_eq!(snapped, Point::new(956.0, 540.0));
+    assert_eq!(snapped, Point::new(MIDDLE.x + 14.0 - INSET_X, 540.0));
 
     let moved = Point::new(1200.0, 700.0);
     // A bad scale changes nothing, so the follower is still settled at the old target.
@@ -212,7 +212,7 @@ fn non_finite_or_non_positive_scale_is_ignored() {
         assert!(!follower.is_settled(MIDDLE, SCREEN, scale), "scale {scale}");
     }
     // The ignored calls did not start the follower, so this one snaps.
-    assert_eq!(follower.step(MIDDLE, SCREEN, 1.0, 0.016), Some(Point::new(956.0, 540.0)));
+    assert_eq!(follower.step(MIDDLE, SCREEN, 1.0, 0.016), Some(Point::new(MIDDLE.x + 14.0 - INSET_X, 540.0)));
 }
 
 #[test]

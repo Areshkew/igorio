@@ -12,14 +12,14 @@
 //!   grows downward from its top edge.
 //! - Swift's panel origin is the bottom-left, so it adds the inset and subtracts the panel
 //!   height. The Windows window origin is the top-left, and the content top-left is inset
-//!   from it on both axes: `origin = contentTopLeft - (INSET, INSET)`.
+//!   from it on both axes: `origin = contentTopLeft - (INSET_X, INSET)`.
 //!
 //! All logical values (offset, `THUMB_MAX`, `INSET`) are multiplied by `scale`, the monitor's
 //! physical pixels per logical pixel, before they meet physical mouse/work-area coordinates.
 
 use igorio_core::geom::{Point, Rect, Vector};
 
-use crate::layout::{INSET, THUMB_MAX};
+use crate::layout::{INSET, INSET_X, THUMB_MAX};
 
 /// Default offset of the content's top-left from the cursor hotspot, logical px.
 const DEFAULT_OFFSET: Vector = Vector::new(14.0, 18.0);
@@ -76,8 +76,8 @@ impl Follower {
             y = mouse.y - offset_y - content_h;
         }
 
-        // The window's top-left is the content's top-left minus the inset on both axes.
-        Point::new(x - inset, y - inset)
+        // The window top-left is the content top-left minus the insets.
+        Point::new(x - INSET_X * scale, y - inset)
     }
 
     /// Advances by `dt` seconds (clamped to 0.0..=0.05; NaN counts as 0).
