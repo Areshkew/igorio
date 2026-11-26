@@ -78,7 +78,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fmt;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,6 +106,7 @@ use windows::Win32::System::Ole::{
     CF_BITMAP, CF_DIB, CF_DIBV5, CF_DIF, CF_HDROP, CF_LOCALE, CF_OEMTEXT, CF_PALETTE, CF_SYLK,
     CF_TEXT, CF_TIFF, CF_UNICODETEXT,
 };
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP as DropHandle};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowThreadProcessId, HWND_MESSAGE, MSG, MWMO_NONE, MsgWaitForMultipleObjectsEx,
@@ -615,6 +616,17 @@ pub(crate) struct ImageMetadata {
     pub owner_pid: u32,
 }
 
+impl ImageMetadata {
+    pub fn has_file_drop(&self) -> bool {
+        self.formats.iter().any(|(id, _)| *id == HDROP)
+    }
+}
+
+pub(crate) struct ImageRead {
+    pub bytes: Vec<u8>,
+    pub file: Option<PathBuf>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ImageFormat {
     Png,
@@ -663,11 +675,12 @@ impl ScreenshotClipboard {
         &self,
         change: ClipboardChange,
         format: ImageFormat,
+        with_file: bool,
         deadline: Instant,
-    ) -> Result<Receiver<Result<Vec<u8>, ClipError>>, ClipError> {
+    ) -> Result<Receiver<Result<ImageRead, ClipError>>, ClipError> {
         let (tx, rx) = mpsc::channel();
         self.0
-            .send(Request::ReadImage(change, format, deadline, tx))?;
+            .send(Request::ReadImage(change, format, with_file, deadline, tx))?;
         Ok(rx)
     }
 }
@@ -743,8 +756,9 @@ enum Request {
     ReadImage(
         ClipboardChange,
         ImageFormat,
+        bool,
         Instant,
-        Sender<Result<Vec<u8>, ClipError>>,
+        Sender<Result<ImageRead, ClipError>>,
     ),
 }
 
@@ -895,7 +909,7 @@ fn run(
             Request::InspectImage(_, _, reply) => {
                 let _ = reply.send(Err(ClipError::Stopped));
             }
-            Request::ReadImage(_, _, _, reply) => {
+            Request::ReadImage(_, _, _, _, reply) => {
                 let _ = reply.send(Err(ClipError::Stopped));
             }
             _ => {
@@ -927,8 +941,8 @@ fn execute(window: HWND, command: Command) -> Option<Reply> {
             let _ = reply.send(result);
             return None;
         }
-        Request::ReadImage(change, format, deadline, reply) => {
-            let result = read_image(window, change, format, deadline);
+        Request::ReadImage(change, format, with_file, deadline, reply) => {
+            let result = read_image(window, change, format, with_file, deadline);
             let _ = reply.send(result);
             return None;
         }
@@ -1201,25 +1215,58 @@ fn read_image(
     window: HWND,
     change: ClipboardChange,
     format: ImageFormat,
+    with_file: bool,
     deadline: Instant,
-) -> Result<Vec<u8>, ClipError> {
+) -> Result<ImageRead, ClipError> {
     let id = match format {
         ImageFormat::Png => ids().png,
         ImageFormat::DibV5 => DIBV5,
         ImageFormat::Dib => DIB,
     };
     let (open, _) = open_for_screenshot(window, change, deadline)?;
-    let data = read_format(id, SNAPSHOT_CAP);
+    let bytes = match read_format(id, SNAPSHOT_CAP) {
+        Read::Bytes(bytes) => bytes,
+        Read::TooBig => {
+            return Err(ClipError::Payload(
+                "clipboard image exceeds byte cap".into(),
+            ));
+        }
+        Read::Failed => return Err(ClipError::Payload("could not read clipboard image".into())),
+    };
+    // Read only CF_HDROP, never FileContents. Holding the same lock ties the path
+    // to the pixels even if delayed rendering advances the sequence.
+    let file = if with_file && Instant::now() < deadline {
+        // SAFETY: the clipboard is open on this thread. The HDROP stays owned by Windows.
+        unsafe { GetClipboardData(HDROP) }
+            .ok()
+            .and_then(|handle| single_drop_path(DropHandle(handle.0)))
+    } else {
+        None
+    };
     drop(open);
-    // Delayed rendering may advance the sequence, so the pre-read check is authoritative.
-    match data {
-        Read::Bytes(bytes) if Instant::now() < deadline => Ok(bytes),
-        Read::Bytes(_) => Err(ClipError::Stale),
-        Read::TooBig => Err(ClipError::Payload(
-            "clipboard image exceeds byte cap".into(),
-        )),
-        Read::Failed => Err(ClipError::Payload("could not read clipboard image".into())),
+    (Instant::now() < deadline)
+        .then_some(ImageRead { bytes, file })
+        .ok_or(ClipError::Stale)
+}
+
+fn single_drop_path(drop: DropHandle) -> Option<PathBuf> {
+    const MAX_PATH_UNITS: u32 = 32_767;
+    // SAFETY: the caller keeps a live CF_HDROP block through all queries.
+    if unsafe { DragQueryFileW(drop, u32::MAX, None) } != 1 {
+        return None;
     }
+    // SAFETY: query length only, with no output buffer.
+    let len = unsafe { DragQueryFileW(drop, 0, None) };
+    if len == 0 || len > MAX_PATH_UNITS {
+        return None;
+    }
+    let mut wide = vec![0; len as usize + 1];
+    // SAFETY: wide is writable and has room for len units and the terminator.
+    if unsafe { DragQueryFileW(drop, 0, Some(&mut wide)) } != len {
+        return None;
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_wide(&wide[..len as usize]));
+    path.is_absolute().then_some(path)
 }
 
 fn take_snapshot(window: HWND) -> Result<Snapshot, ClipError> {
@@ -2296,6 +2343,19 @@ mod tests {
                 String::from_utf16(&buffer[..len]).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn screenshot_hdrop_reads_exactly_one_absolute_unicode_path() {
+        let file = Path::new(r"C:\Imágenes\Screenshot 日本語.png");
+        for (paths, expected) in [
+            (vec![file], Some(file)),
+            (vec![file, Path::new(r"C:\second.png")], None),
+            (vec![Path::new("relative.png")], None),
+        ] {
+            let data = Global::new(&dropfiles(&paths)).unwrap();
+            assert_eq!(single_drop_path(DropHandle(data.0.0)).as_deref(), expected);
+        }
     }
 
     #[test]

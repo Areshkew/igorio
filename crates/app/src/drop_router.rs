@@ -3023,6 +3023,11 @@ impl Drops {
             .unwrap_or_default()
     }
 
+    /// Share the existing clipboard thread with screenshot detection.
+    pub fn clipboard(&self) -> Option<&Clipboard> {
+        self.env.as_ref()?.clip.as_ref()
+    }
+
     /// One pass of the UI loop: the hook events, then every answer and reply, then the
     /// deadline. Returns true when the state changed (redraw).
     pub fn run(&mut self, events: &[MouseEvent], state: &mut FairyState, now: f64) -> bool {

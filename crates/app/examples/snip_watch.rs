@@ -68,6 +68,7 @@ impl LogTail {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    igorio_app::overlay::ensure_dpi_awareness();
     let until = std::env::args()
         .nth(1)
         .map(|arg| arg.parse::<u32>())

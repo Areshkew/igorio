@@ -14,7 +14,9 @@ use igorio_app::drop_router::{DebugLog, Drops};
 use igorio_app::follower::Follower;
 use igorio_app::hook::{self, MouseEvent, MouseHook};
 use igorio_app::overlay::{self, Overlay};
-use igorio_app::settings::{self, Settings};
+use igorio_app::saver;
+use igorio_app::settings::{self, DefaultFolders, Settings};
+use igorio_app::snip::{Snip, SnipEvent};
 use igorio_app::state::FairyState;
 use igorio_app::tray::{MenuItem, Tray};
 use igorio_core::shake::{ShakeGate, ShakeResult};
@@ -69,6 +71,68 @@ impl App {
     fn restore_last(&mut self) {
         self.state.restore_last(hook::now());
         self.dirty = true;
+    }
+
+    fn capture_ui(&mut self, shown: bool, time: f64) {
+        self.state.set_hidden_for_capture(shown, time);
+        if shown {
+            self.shake.screenshot_ui_shown();
+        } else {
+            self.shake.screenshot_ui_gone();
+        }
+        self.dirty = true;
+    }
+
+    /// Returns true if a visibility transition may overlap this batch of mouse events.
+    fn screenshots(&mut self, events: &mut Vec<SnipEvent>, settings: &Settings) -> bool {
+        let mut transitioned = false;
+        for event in events.drain(..) {
+            match event {
+                SnipEvent::CaptureUiShown { time } => {
+                    self.capture_ui(true, time);
+                    transitioned = true;
+                }
+                SnipEvent::CaptureUiGone { time } => {
+                    self.capture_ui(false, time);
+                    transitioned = true;
+                }
+                SnipEvent::Captured {
+                    image,
+                    scale,
+                    captured_at,
+                    saved_file,
+                    ..
+                } => {
+                    let kept = saved_file.is_some();
+                    if !kept && settings.keep_every_screenshot {
+                        let image = Arc::clone(&image);
+                        let settings = settings.clone();
+                        // Folder selection can itself hit the filesystem and the Shell.
+                        std::thread::spawn(move || {
+                            let (folder, _) = settings.captures_dir(&DefaultFolders::from_system());
+                            saver::save_screenshot_in_background(
+                                image,
+                                scale,
+                                captured_at,
+                                folder,
+                                |result| {
+                                    if let Err(error) = result {
+                                        eprintln!("could not keep screenshot: {error}");
+                                    }
+                                },
+                            );
+                        });
+                    }
+                    self.shake.captured();
+                    self.state
+                        .hold(image, scale, captured_at, kept, None, None, hook::now());
+                    self.dirty = true;
+                }
+                // The detector already wrote the reason to its debug log.
+                SnipEvent::Ignored { .. } => {}
+            }
+        }
+        transitioned
     }
 
     /// Feeds mouse events to the shake gesture. Returns true when the cursor moved.
@@ -347,16 +411,33 @@ fn main() -> windows::core::Result<()> {
     // still carries, shakes and restores. Dropping `drops` (on every way out of `main`,
     // errors and panics included) puts the user's clipboard back if a paste left ours there.
     let settings = Settings::load(&settings::default_settings_path()).unwrap_or_default();
-    let mut drops = match Drops::start(settings, DebugLog::from_env()) {
+    let mut drops = match Drops::start(settings.clone(), DebugLog::from_env()) {
         Ok(drops) => Some(drops),
         Err(why) => {
             eprintln!("double-click drops are off: {why}");
             None
         }
     };
+    // This local is declared after `drops`, so it stops before clipboard restore and
+    // shutdown on normal quit, error returns and unwinding.
+    let mut snip =
+        drops
+            .as_ref()
+            .and_then(Drops::clipboard)
+            .and_then(|clipboard| match Snip::start(clipboard) {
+                Ok(snip) => Some(snip),
+                Err(error) => {
+                    eprintln!("screenshot detection is off: {error}");
+                    None
+                }
+            });
+    let mut snip_events = Vec::new();
     let mut wakes = vec![mouse_hook.wake_handle()];
     if let Some(drops) = &drops {
         wakes.extend(drops.wake_handles());
+    }
+    if let Some(snip) = &snip {
+        wakes.push(snip.wake_handle());
     }
     // When the next frame runs; `None` waits for a mouse move or a menu action.
     let mut due = Some(hook::now());
@@ -364,11 +445,19 @@ fn main() -> windows::core::Result<()> {
 
     while pump_messages() {
         mouse_hook.drain(&mut events);
+        if let Some(snip) = &snip {
+            snip.drain(&mut snip_events);
+        }
         let now = hook::now();
         let mut router_due = None;
         {
             let mut app = app.borrow_mut();
             let app = &mut *app;
+            // Treat the whole batch as capture input if visibility changed during
+            // it. A shown/gone pair can arrive together with the selection clicks.
+            if app.screenshots(&mut snip_events, &settings) || app.state.hidden_for_capture() {
+                events.clear();
+            }
             let moved = app.mouse(&events);
             if let Some(drops) = drops.as_mut() {
                 if drops.run(&events, &mut app.state, now) {
@@ -393,6 +482,16 @@ fn main() -> windows::core::Result<()> {
                 // On failure the next check tries again.
                 let _ = mouse_hook.restart();
             }
+            if let Some(snip) = &mut snip
+                && (!snip.is_alive() || snip.seems_stalled())
+            {
+                let mut app = app.borrow_mut();
+                if app.state.hidden_for_capture() {
+                    app.capture_ui(false, now);
+                    due = Some(now);
+                }
+                let _ = snip.restart();
+            }
         }
         let until = earlier(earlier(due, router_due), Some(next_health_check))
             .unwrap_or(next_health_check);
@@ -400,6 +499,7 @@ fn main() -> windows::core::Result<()> {
         sleeper.wait(wait, &wakes)?;
     }
     // Put the user's clipboard back if a paste left ours there, then stop the workers.
+    drop(snip);
     drop(drops);
     Ok(())
 }

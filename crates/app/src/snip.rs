@@ -64,7 +64,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{Error, PWSTR, Result};
 
 use crate::clipboard::{
-    self, Clipboard, ClipboardChange, ImageFormat, ImageMetadata, ScreenshotClipboard,
+    self, Clipboard, ClipboardChange, ImageFormat, ImageMetadata, ImageRead, ScreenshotClipboard,
 };
 use crate::hook::{HookStats, now};
 
@@ -72,6 +72,7 @@ const INSTANT_CAPTURE: f64 = 1.5;
 const OWNER_SHORTCUT: f64 = 15.0;
 const OVERLAY_GRACE: f64 = 3.0;
 const UNKNOWN_OWNER_GRACE: f64 = 0.25;
+const SNIP_FILE_WAIT: Duration = Duration::from_millis(400);
 const SIGNAL_SETTLE: Duration = Duration::from_millis(100);
 const PAIR_WINDOW: f64 = 4.0;
 const PAIR_RETENTION: f64 =
@@ -452,6 +453,7 @@ enum Signal {
         process: String,
     },
     File(Capture),
+    WatchingFolder(PathBuf),
     Folder(String),
 }
 
@@ -1085,9 +1087,7 @@ impl FolderWatch<'_> {
                 active: true,
             };
             if first {
-                let _ = self
-                    .tx
-                    .try_send(Signal::Folder(format!("watching {path:?}")));
+                let _ = self.tx.try_send(Signal::WatchingFolder(path.to_owned()));
                 first = false;
             }
             if rescan {
@@ -1347,7 +1347,9 @@ enum Verdict {
     Carry {
         source: Source,
         reason: &'static str,
+        overlay: bool,
     },
+    SnipFollowUp,
     Ignore(&'static str),
 }
 
@@ -1361,7 +1363,11 @@ fn classify(signals: &Signals) -> Verdict {
     } = *signals;
     let cancelled = |started| escape.is_some_and(|escape| escape >= started && escape <= time);
     let recent_key = key.filter(|key| time - key.time >= -SIGNAL_SETTLE.as_secs_f64());
-    let carry = |source, reason| Verdict::Carry { source, reason };
+    let carry = |source, reason| Verdict::Carry {
+        source,
+        reason,
+        overlay: false,
+    };
 
     let Input::Clipboard {
         own,
@@ -1385,17 +1391,17 @@ fn classify(signals: &Signals) -> Verdict {
     if own {
         return Verdict::Ignore("own clipboard update");
     }
-    if files {
-        return Verdict::Ignore("file-transfer format");
-    }
     if !image {
-        return Verdict::Ignore("no supported image format");
+        return Verdict::Ignore(if files {
+            "file-transfer format"
+        } else {
+            "no supported image format"
+        });
     }
     if rich {
         return Verdict::Ignore("image accompanied by HTML or text");
     }
     if let Some(overlay) = overlay
-        && !overlay.used
         && !cancelled(overlay.shown)
         && !recent_key.is_some_and(|key| {
             matches!(key.shortcut, Shortcut::Snip | Shortcut::Print)
@@ -1406,7 +1412,7 @@ fn classify(signals: &Signals) -> Verdict {
         && time - overlay.shown >= -SIGNAL_SETTLE.as_secs_f64()
         && overlay.gone.is_none_or(|gone| {
             time - gone
-                <= if capture_owner {
+                <= if capture_owner || overlay.used {
                     OVERLAY_GRACE
                 } else {
                     UNKNOWN_OWNER_GRACE
@@ -1417,7 +1423,15 @@ fn classify(signals: &Signals) -> Verdict {
                 && key.time >= overlay.shown
         })
     {
-        return carry(Source::Snip, "image during or just after snipping overlay");
+        return if overlay.used {
+            Verdict::SnipFollowUp
+        } else {
+            Verdict::Carry {
+                source: Source::Snip,
+                reason: "image during or just after snipping overlay",
+                overlay: true,
+            }
+        };
     }
     if let Some(key) = recent_key.filter(|key| {
         !key.clipboard_used
@@ -1454,7 +1468,11 @@ fn classify(signals: &Signals) -> Verdict {
             );
         }
     }
-    Verdict::Ignore("image without recent capture evidence")
+    Verdict::Ignore(if files {
+        "file-transfer format"
+    } else {
+        "image without recent capture evidence"
+    })
 }
 
 fn image_flags(formats: &[(u32, Option<String>)]) -> (bool, bool) {
@@ -1539,14 +1557,27 @@ enum ClipboardStage {
     Inspect(Receiver<std::result::Result<ImageMetadata, clipboard::ClipError>>),
     Settle(ImageMetadata),
     Read {
-        reply: Receiver<std::result::Result<Vec<u8>, clipboard::ClipError>>,
-        format: ImageFormat,
-        source: Source,
-        key: Option<f64>,
-        overlay: Option<f64>,
-        scale: f64,
-        wait_for_file: bool,
+        reply: Receiver<std::result::Result<ImageRead, clipboard::ClipError>>,
+        candidate: ClipboardCandidate,
     },
+}
+
+#[derive(Clone, Copy)]
+struct ClipboardCandidate {
+    format: ImageFormat,
+    source: Source,
+    key: Option<f64>,
+    overlay: Option<f64>,
+    scale: f64,
+    wait_for_file: bool,
+    follow_up: bool,
+}
+
+struct SnipReceipt {
+    overlay: f64,
+    time: f64,
+    dimensions: (u32, u32),
+    pending: Option<(Instant, Capture)>,
 }
 
 const KEY_HISTORY: usize = 16;
@@ -1559,6 +1590,8 @@ struct Controller {
     keys: VecDeque<KeyEvidence>,
     escape: Option<f64>,
     clipboard_job: Option<ClipboardJob>,
+    snip_receipt: Option<SnipReceipt>,
+    watched_folder: Option<PathBuf>,
     pairs: VecDeque<PairRecord>,
     own_pid: u32,
     test_folder: bool,
@@ -1573,6 +1606,8 @@ impl Controller {
             keys: VecDeque::new(),
             escape: None,
             clipboard_job: None,
+            snip_receipt: None,
+            watched_folder: None,
             pairs: VecDeque::new(),
             // SAFETY: no arguments.
             own_pid: unsafe { GetCurrentProcessId() },
@@ -1588,7 +1623,14 @@ impl Controller {
         mut last: Option<ClipboardChange>,
     ) {
         while !stop.wait(Duration::ZERO) {
-            match rx.recv_timeout(TICK) {
+            let wait = self
+                .snip_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.pending.as_ref())
+                .map_or(TICK, |(at, _)| {
+                    TICK.min(at.saturating_duration_since(Instant::now()))
+                });
+            match rx.recv_timeout(wait) {
                 Ok(signal) => {
                     self.signal(signal);
                     for signal in rx.try_iter().take(SIGNAL_CAP) {
@@ -1600,6 +1642,7 @@ impl Controller {
             }
             self.expire_pairs(false);
             self.poll_clipboard(clipboard);
+            self.flush_snip(false);
             if self.clipboard_job.is_none()
                 && let Some(change) = clipboard.latest().filter(|change| Some(*change) != last)
             {
@@ -1627,6 +1670,7 @@ impl Controller {
             self.output.push(SnipEvent::CaptureUiGone { time: now() });
         }
         self.expire_pairs(true);
+        self.flush_snip(true);
     }
 
     fn record(&mut self, time: f64, message: std::fmt::Arguments<'_>) {
@@ -1750,7 +1794,14 @@ impl Controller {
                         self.deliver(capture, false);
                     }
                     Verdict::Ignore(reason) => self.ignored(time, reason),
+                    Verdict::SnipFollowUp => {
+                        unreachable!("file observations cannot be snip follow-ups")
+                    }
                 }
+            }
+            Signal::WatchingFolder(path) => {
+                self.record(now(), format_args!("FOLDER watching {path:?}"));
+                self.watched_folder = Some(path);
             }
             Signal::Folder(status) => self.record(now(), format_args!("FOLDER {status}")),
         }
@@ -1781,8 +1832,8 @@ impl Controller {
             self.ignored(time, "clipboard request deadline");
             return;
         }
-        match job.stage {
-            ClipboardStage::Inspect(ref rx) => match rx.try_recv() {
+        if let ClipboardStage::Inspect(rx) = &job.stage {
+            match rx.try_recv() {
                 Ok(Ok(metadata)) => job.stage = ClipboardStage::Settle(metadata),
                 Ok(Err(err)) => {
                     self.ignored(time, err.to_string());
@@ -1792,10 +1843,21 @@ impl Controller {
                     self.ignored(time, "clipboard worker stopped");
                     return;
                 }
-                Err(TryRecvError::Empty) => {}
-            },
+                Err(TryRecvError::Empty) => {
+                    self.clipboard_job = Some(job);
+                    return;
+                }
+            }
+        }
+        match job.stage {
             ClipboardStage::Settle(ref metadata) => {
-                if now() - time >= SIGNAL_SETTLE.as_secs_f64() {
+                // Once the overlay is known, don't spend the reordering allowance
+                // waiting. The producer can replace this sequence at any moment.
+                let overlay_observed = self.overlay.is_some_and(|overlay| {
+                    overlay.shown <= time + SIGNAL_SETTLE.as_secs_f64()
+                        && overlay.gone.is_none_or(|gone| time - gone <= OVERLAY_GRACE)
+                });
+                if overlay_observed || now() - time >= SIGNAL_SETTLE.as_secs_f64() {
                     let Some(read) = self.classify_clipboard(clipboard, &job, metadata) else {
                         return;
                     };
@@ -1804,49 +1866,10 @@ impl Controller {
             }
             ClipboardStage::Read {
                 ref reply,
-                format,
-                source,
-                key,
-                overlay,
-                scale,
-                wait_for_file,
+                candidate,
             } => match reply.try_recv() {
-                Ok(Ok(bytes)) => {
-                    let image = match format {
-                        ImageFormat::Png => decode_png(&bytes),
-                        ImageFormat::DibV5 | ImageFormat::Dib => decode_dib(&bytes),
-                    };
-                    let image = match image {
-                        Ok(image) => image,
-                        Err(reason) => {
-                            self.ignored(time, reason);
-                            return;
-                        }
-                    };
-                    if let Some(key) = self.keys.iter_mut().find(|k| Some(k.time) == key) {
-                        key.clipboard_used = true;
-                    }
-                    if let Some(overlay) =
-                        self.overlay.as_mut().filter(|o| Some(o.shown) == overlay)
-                    {
-                        overlay.used = true;
-                    }
-                    self.deliver(
-                        Capture {
-                            time,
-                            captured_at: job.change.captured_at,
-                            image,
-                            source,
-                            scale,
-                            saved_file: None,
-                            session: key.or(overlay),
-                        },
-                        wait_for_file,
-                    );
-                    return;
-                }
-                Ok(Err(err)) => {
-                    self.ignored(time, err.to_string());
+                Ok(result) => {
+                    self.clipboard_read(job.change, candidate, result);
                     return;
                 }
                 Err(TryRecvError::Disconnected) => {
@@ -1855,6 +1878,7 @@ impl Controller {
                 }
                 Err(TryRecvError::Empty) => {}
             },
+            ClipboardStage::Inspect(_) => unreachable!("pending inspection returned above"),
         }
         self.clipboard_job = Some(job);
     }
@@ -1882,19 +1906,31 @@ impl Controller {
         let verdict = classify(&signals);
         self.record(time, format_args!("CLASSIFY seq={} owner={owner:?} pid={} formats={:?} {signals:?} verdict={verdict:?}",
             job.change.sequence, metadata.owner_pid, metadata.formats));
-        let source = match verdict {
-            Verdict::Carry { source, .. } => source,
+        let (source, use_overlay, follow_up) = match verdict {
+            Verdict::Carry {
+                source, overlay, ..
+            } => (source, overlay, false),
+            Verdict::SnipFollowUp
+                if metadata.has_file_drop()
+                    && self.snip_receipt.as_ref().is_some_and(|receipt| {
+                        signals.overlay.is_some_and(|o| o.shown == receipt.overlay)
+                            && (0.0..=OVERLAY_GRACE).contains(&(time - receipt.time))
+                            && (receipt.pending.is_some() || self.log.is_some())
+                    }) =>
+            {
+                (Source::Snip, true, true)
+            }
+            Verdict::SnipFollowUp => {
+                self.ignored(time, "snip already captured");
+                return None;
+            }
             Verdict::Ignore(reason) => {
                 self.ignored(time, reason);
                 return None;
             }
         };
         let format = format?;
-        let overlay = signals.overlay.filter(|o| {
-            source == Source::Snip
-                && !o.used
-                && o.gone.is_none_or(|gone| time - gone <= OVERLAY_GRACE)
-        });
+        let overlay = signals.overlay.filter(|_| use_overlay);
         let key = signals.key.filter(|key| {
             source != Source::Snip
                 || (time - key.time <= OWNER_SHORTCUT
@@ -1904,20 +1940,136 @@ impl Controller {
             .map(|o| o.scale)
             .or(key.map(|k| k.scale))
             .unwrap_or_else(|| monitor_scale(cursor()));
-        match clipboard.read(job.change, format, job.deadline) {
+        let with_file = source == Source::Snip && metadata.has_file_drop();
+        match clipboard.read(job.change, format, with_file, job.deadline) {
             Ok(reply) => Some(ClipboardStage::Read {
                 reply,
-                format,
-                source,
-                scale,
-                key: key.map(|k| k.time),
-                overlay: overlay.map(|o| o.shown),
-                wait_for_file: key.is_some_and(|k| k.shortcut == Shortcut::WinPrint),
+                candidate: ClipboardCandidate {
+                    format,
+                    source,
+                    scale,
+                    key: key.map(|k| k.time),
+                    overlay: overlay.map(|o| o.shown),
+                    wait_for_file: key.is_some_and(|k| k.shortcut == Shortcut::WinPrint),
+                    follow_up,
+                },
             }),
             Err(err) => {
                 self.ignored(time, err.to_string());
                 None
             }
+        }
+    }
+
+    fn clipboard_read(
+        &mut self,
+        change: ClipboardChange,
+        candidate: ClipboardCandidate,
+        result: std::result::Result<ImageRead, clipboard::ClipError>,
+    ) {
+        let time = change.time;
+        let ImageRead { bytes, file } = match result {
+            Ok(read) => read,
+            Err(err) => {
+                self.ignored(time, err.to_string());
+                return;
+            }
+        };
+        if let (Some(path), Some(log)) = (&file, &mut self.log) {
+            let folder = path.parent();
+            let watched = self.watched_folder.as_deref();
+            let same_folder = folder.zip(watched).map(|(a, b)| a == b);
+            let _ = writeln!(
+                log,
+                "t={time:.6} HDROP path={path:?} folder={folder:?} watching={watched:?} same_folder={same_folder:?}"
+            );
+        }
+        let file = file.filter(|path| is_png(path));
+        if candidate.follow_up {
+            // A follow-up can only add metadata. Inspect the size without decoding
+            // all the pixels again while the first image waits for its file path.
+            let dimensions = match candidate.format {
+                ImageFormat::Png => png::Decoder::new(bytes.as_slice())
+                    .read_header_info()
+                    .ok()
+                    .map(|info| info.size()),
+                ImageFormat::DibV5 | ImageFormat::Dib => dib_dimensions(&bytes),
+            };
+            let receipt = self.snip_receipt.as_mut().filter(|receipt| {
+                Some(receipt.overlay) == candidate.overlay && Some(receipt.dimensions) == dimensions
+            });
+            if let Some(receipt) = receipt {
+                if let Some(path) = file
+                    && let Some((_, mut capture)) =
+                        receipt.pending.take_if(|(at, _)| Instant::now() < *at)
+                {
+                    capture.saved_file = Some(path);
+                    self.emit(capture);
+                }
+                self.ignored(time, "duplicate clipboard update for snip");
+            } else {
+                self.ignored(time, "image changed after snip was already captured");
+            }
+            return;
+        }
+
+        let image = match candidate.format {
+            ImageFormat::Png => decode_png(&bytes),
+            ImageFormat::DibV5 | ImageFormat::Dib => decode_dib(&bytes),
+        };
+        let image = match image {
+            Ok(image) => image,
+            Err(reason) => {
+                self.ignored(time, reason);
+                return;
+            }
+        };
+        let dimensions = (image.width, image.height);
+        // A stale sequence or a bad decode never reaches this point.
+        if let Some(key) = self.keys.iter_mut().find(|k| Some(k.time) == candidate.key) {
+            key.clipboard_used = true;
+        }
+        let capture = Capture {
+            time,
+            captured_at: change.captured_at,
+            image,
+            source: candidate.source,
+            scale: candidate.scale,
+            saved_file: file,
+            session: candidate.key.or(candidate.overlay),
+        };
+        if let Some(overlay) = self
+            .overlay
+            .as_mut()
+            .filter(|o| Some(o.shown) == candidate.overlay)
+        {
+            overlay.used = true;
+            let shown = overlay.shown;
+            self.flush_snip(true);
+            let mut receipt = SnipReceipt {
+                overlay: shown,
+                time,
+                dimensions,
+                pending: None,
+            };
+            if capture.saved_file.is_none() {
+                receipt.pending = Some((Instant::now() + SNIP_FILE_WAIT, capture));
+            } else {
+                self.emit(capture);
+            }
+            self.snip_receipt = Some(receipt);
+        } else {
+            self.deliver(capture, candidate.wait_for_file);
+        }
+    }
+
+    fn flush_snip(&mut self, stopping: bool) {
+        if let Some(receipt) = &mut self.snip_receipt
+            && let Some((_, capture)) = receipt
+                .pending
+                .take_if(|(at, _)| stopping || Instant::now() >= *at)
+        {
+            self.emit(capture);
         }
     }
 
@@ -1940,7 +2092,7 @@ impl Controller {
             time,
             session: capture.session,
             dimensions: (capture.image.width, capture.image.height),
-            file: capture.saved_file.is_some(),
+            file: capture.source == Source::FullScreenFile,
             waiting: None,
         };
         if let Some((index, _)) = self
@@ -2079,6 +2231,13 @@ fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
         bytes.get(offset..offset + 4)?.try_into().ok()?,
     ))
+}
+
+fn dib_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let width = u32::try_from(u32_at(bytes, 4)? as i32).ok()?;
+    let height = (u32_at(bytes, 8)? as i32).unsigned_abs();
+    rgba_len(width, height)?;
+    Some((width, height))
 }
 
 fn decode_dib(bytes: &[u8]) -> std::result::Result<Image, &'static str> {
@@ -2236,7 +2395,7 @@ mod tests {
     fn source(signals: &Signals) -> Option<Source> {
         match classify(signals) {
             Verdict::Carry { source, .. } => Some(source),
-            Verdict::Ignore(_) => None,
+            Verdict::Ignore(_) | Verdict::SnipFollowUp => None,
         }
     }
 
@@ -2315,10 +2474,10 @@ mod tests {
                 false,
                 "image accompanied by HTML or text",
             ), // browser
-            (true, false, true, false, "file-transfer format"), // Explorer
+            (true, false, false, false, "file-transfer format"), // Explorer
             (false, true, false, false, "no supported image format"), // text
-            (false, false, true, true, "own clipboard update"), // stage
-            (false, true, true, true, "own clipboard update"),  // restore
+            (false, false, true, true, "own clipboard update"),  // stage
+            (false, true, true, true, "own clipboard update"),   // restore
         ] {
             signals.input = Input::Clipboard {
                 own,
@@ -2333,6 +2492,307 @@ mod tests {
             image_flags(&[(15, None), (0xc001, Some("HTML Format".into()))]),
             (true, true)
         );
+    }
+
+    fn observed_formats(standard: &[u32], registered: &[&str]) -> Vec<(u32, Option<String>)> {
+        standard
+            .iter()
+            .map(|&id| (id, None))
+            .chain(
+                registered
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| (0xc000 + i as u32, Some((*name).to_owned()))),
+            )
+            .collect()
+    }
+
+    fn snip_formats(with_file: bool) -> Vec<(u32, Option<String>)> {
+        if with_file {
+            observed_formats(
+                &[2, 15, 8, 17],
+                &[
+                    "DataObject",
+                    "Preferred DropEffect",
+                    "Shell IDList Array",
+                    "FileContents",
+                    "FileGroupDescriptorW",
+                    "PNG",
+                    "Ole Private Data",
+                ],
+            )
+        } else {
+            observed_formats(
+                &[2, 8, 17],
+                &[
+                    "DataObject",
+                    "Preferred DropEffect",
+                    "PNG",
+                    "Ole Private Data",
+                ],
+            )
+        }
+    }
+
+    fn observed_input(owner: &str, formats: &[(u32, Option<String>)]) -> Input {
+        let (files, rich) = image_flags(formats);
+        Input::Clipboard {
+            own: false,
+            image: ImageFormat::preferred(formats).is_some(),
+            files,
+            rich,
+            capture_owner: capture_process(owner),
+        }
+    }
+
+    #[test]
+    fn observed_svchost_snip_formats_require_capture_evidence_and_prefer_png() {
+        for shortcut in [Shortcut::Snip, Shortcut::Print] {
+            for with_file in [false, true] {
+                let formats = snip_formats(with_file);
+                assert_eq!(formats.len(), if with_file { 11 } else { 7 });
+                assert!(matches!(
+                    ImageFormat::preferred(&formats),
+                    Some(ImageFormat::Png)
+                ));
+                for gone in [None, Some(5.9)] {
+                    let signals = Signals {
+                        input: observed_input("svchost.exe", &formats),
+                        key: key(shortcut, 2.6),
+                        overlay: overlay(3.5, gone),
+                        ..clipboard_signals()
+                    };
+                    assert_eq!(source(&signals), Some(Source::Snip));
+                    assert_eq!(
+                        classify(&Signals {
+                            key: None,
+                            overlay: None,
+                            ..signals
+                        }),
+                        Verdict::Ignore("file-transfer format")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observed_alt_print_browser_explorer_and_text_formats() {
+        let alt = observed_formats(&[2, 8, 17], &[]);
+        assert!(matches!(
+            ImageFormat::preferred(&alt),
+            Some(ImageFormat::DibV5)
+        ));
+        let mut signals = Signals {
+            input: observed_input("", &alt),
+            key: key(Shortcut::AltPrint, 5.8),
+            ..clipboard_signals()
+        };
+        assert_eq!(source(&signals), Some(Source::WindowPrintScreen));
+        let browser = observed_formats(&[17], &["PNG", "HTML Format", "UniformResourceLocatorW"]);
+        signals.input = observed_input("vivaldi.exe", &browser);
+        assert_eq!(
+            classify(&signals),
+            Verdict::Ignore("image accompanied by HTML or text")
+        );
+        signals.key = None;
+        let explorer = observed_formats(
+            &[15],
+            &[
+                "DataObject",
+                "Shell IDList Array",
+                "FileName",
+                "FileContents",
+            ],
+        );
+        signals.input = observed_input("explorer.exe", &explorer);
+        assert_eq!(classify(&signals), Verdict::Ignore("file-transfer format"));
+        signals.input = observed_input("", &observed_formats(&[13, 16, 1, 7], &[]));
+        assert_eq!(
+            classify(&signals),
+            Verdict::Ignore("no supported image format")
+        );
+    }
+
+    fn snip_controller() -> (Arc<Output>, Controller) {
+        let output = Arc::new(Output {
+            wake: Event::new(false).unwrap(),
+            queue: Mutex::default(),
+        });
+        let mut controller = Controller::new(output.clone(), false);
+        controller.log = None;
+        controller.overlay = overlay(3.5, None);
+        controller.keys.extend(key(Shortcut::Snip, 2.6));
+        (output, controller)
+    }
+
+    #[test]
+    fn observed_four_updates_carry_once_and_attach_the_hdrop_path() {
+        let (output, mut controller) = snip_controller();
+        let captured_at = SystemTime::now();
+        let candidate = ClipboardCandidate {
+            format: ImageFormat::Png,
+            source: Source::Snip,
+            key: Some(2.6),
+            overlay: Some(3.5),
+            scale: 1.25,
+            wait_for_file: false,
+            follow_up: false,
+        };
+        let bytes = crate::saver::encode_png(&sample_capture(false, None).image, 1.25).unwrap();
+        let change = ClipboardChange {
+            sequence: 100,
+            time: 5.8,
+            captured_at,
+        };
+        controller.clipboard_read(change, candidate, Err(clipboard::ClipError::Changed));
+        assert!(!controller.overlay.unwrap().used);
+        assert!(!controller.keys[0].clipboard_used);
+        let signals =
+            controller.evidence(5.85, observed_input("svchost.exe", &snip_formats(false)));
+        assert_eq!(source(&signals), Some(Source::Snip));
+        controller.clipboard_read(
+            ClipboardChange {
+                sequence: 105,
+                time: 5.85,
+                ..change
+            },
+            candidate,
+            Ok(ImageRead {
+                bytes: bytes.clone(),
+                file: None,
+            }),
+        );
+        assert!(controller.overlay.unwrap().used);
+        assert!(controller.keys[0].clipboard_used);
+        assert!(controller.snip_receipt.as_ref().unwrap().pending.is_some());
+
+        let follow_up = ClipboardCandidate {
+            follow_up: true,
+            ..candidate
+        };
+        controller.clipboard_read(
+            ClipboardChange {
+                sequence: 117,
+                time: 5.9,
+                ..change
+            },
+            follow_up,
+            Err(clipboard::ClipError::Changed),
+        );
+        controller.overlay.as_mut().unwrap().gone = Some(5.95);
+        let signals = controller.evidence(6.05, observed_input("svchost.exe", &snip_formats(true)));
+        assert_eq!(classify(&signals), Verdict::SnipFollowUp);
+        let file = PathBuf::from(r"C:\Screenshots\Shot.png");
+        controller.clipboard_read(
+            ClipboardChange {
+                sequence: 125,
+                time: 6.05,
+                ..change
+            },
+            follow_up,
+            Ok(ImageRead {
+                bytes: bytes.clone(),
+                file: Some(file.clone()),
+            }),
+        );
+        controller.clipboard_read(
+            ClipboardChange {
+                sequence: 126,
+                time: 6.1,
+                ..change
+            },
+            follow_up,
+            Ok(ImageRead {
+                bytes,
+                file: Some(file.clone()),
+            }),
+        );
+        controller.flush_snip(true);
+
+        let out = output.queue.lock().unwrap();
+        let carries: Vec<_> = out
+            .iter()
+            .filter_map(|event| match event {
+                SnipEvent::Captured {
+                    captured_at,
+                    saved_file,
+                    ..
+                } => Some((*captured_at, saved_file.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(carries, [(captured_at, Some(file.as_path()))]);
+    }
+
+    #[test]
+    fn snip_without_hdrop_expires_and_late_metadata_does_not_carry_again() {
+        let (output, mut controller) = snip_controller();
+        let change = ClipboardChange {
+            sequence: 5,
+            time: 5.85,
+            captured_at: SystemTime::now(),
+        };
+        let candidate = ClipboardCandidate {
+            format: ImageFormat::Png,
+            source: Source::Snip,
+            key: Some(2.6),
+            overlay: Some(3.5),
+            scale: 1.25,
+            wait_for_file: false,
+            follow_up: false,
+        };
+        controller.clipboard_read(
+            change,
+            candidate,
+            Ok(ImageRead {
+                bytes: vec![],
+                file: None,
+            }),
+        );
+        assert!(!controller.overlay.unwrap().used);
+        let bytes = crate::saver::encode_png(&sample_capture(false, None).image, 1.25).unwrap();
+        controller.clipboard_read(
+            change,
+            candidate,
+            Ok(ImageRead {
+                bytes: bytes.clone(),
+                file: None,
+            }),
+        );
+        let (at, _) = controller
+            .snip_receipt
+            .as_mut()
+            .unwrap()
+            .pending
+            .as_mut()
+            .unwrap();
+        assert!(*at <= Instant::now() + SNIP_FILE_WAIT);
+        *at = Instant::now();
+        controller.flush_snip(false);
+        controller.clipboard_read(
+            change,
+            ClipboardCandidate {
+                follow_up: true,
+                ..candidate
+            },
+            Ok(ImageRead {
+                bytes,
+                file: Some(r"C:\Screenshots\Late.png".into()),
+            }),
+        );
+        let out = output.queue.lock().unwrap();
+        let captures: Vec<_> = out
+            .iter()
+            .filter(|event| matches!(event, SnipEvent::Captured { .. }))
+            .collect();
+        assert!(matches!(
+            captures.as_slice(),
+            [SnipEvent::Captured {
+                saved_file: None,
+                ..
+            }]
+        ));
     }
 
     fn sample_capture(file: bool, session: Option<f64>) -> Capture {
