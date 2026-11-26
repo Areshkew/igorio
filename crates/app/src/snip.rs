@@ -1268,6 +1268,14 @@ fn is_png(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
 }
 
+/// The file a snip offers on the clipboard is the Snipping Tool's temporary copy
+/// (`...\Packages\<package>\TempState\ScreenClip\{guid}.png`), which Windows deletes.
+/// It must not mark the card as already saved.
+fn is_temp_copy(path: &Path) -> bool {
+    path.components()
+        .any(|part| part.as_os_str().eq_ignore_ascii_case("TempState"))
+}
+
 fn directory_changes(mut bytes: &[u8]) -> Vec<(u32, OsString)> {
     let mut changes = Vec::new();
     while let (Some(next), Some(action), Some(length)) =
@@ -1984,7 +1992,7 @@ impl Controller {
                 "t={time:.6} HDROP path={path:?} folder={folder:?} watching={watched:?} same_folder={same_folder:?}"
             );
         }
-        let file = file.filter(|path| is_png(path));
+        let file = file.filter(|path| is_png(path) && !is_temp_copy(path));
         if candidate.follow_up {
             // A follow-up can only add metadata. Inspect the size without decoding
             // all the pixels again while the first image waits for its file path.
@@ -2356,6 +2364,15 @@ fn decode_dib(bytes: &[u8]) -> std::result::Result<Image, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_snipping_tools_temp_copy_is_not_a_saved_file() {
+        let temp = Path::new(
+            r"C:UsersAppDataLocalPackagesMicrosoftWindows.Client.Core_cw5n1h2txyewyTempStateScreenClip{DBB1584A}.png",
+        );
+        assert!(is_temp_copy(temp));
+        assert!(!is_temp_copy(Path::new(r"C:UsersPicturesScreenshotsScreenshot 1.png")));
+    }
 
     fn clipboard_signals() -> Signals {
         Signals {
