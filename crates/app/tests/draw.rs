@@ -1,0 +1,179 @@
+//! Pixel-level checks for the software renderer.
+
+use std::sync::Arc;
+
+use igorio_app::draw::{Renderer, movie_label};
+use igorio_app::scene::{Leaving, Scene, SceneCard};
+use igorio_kit::Image;
+use tiny_skia::Pixmap;
+
+fn solid(width: u32, height: u32, color: [u8; 4]) -> Arc<Image> {
+    let mut rgba = vec![0; width as usize * height as usize * 4];
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        pixel.copy_from_slice(&color);
+    }
+    Arc::new(Image::new(width, height, rgba).expect("valid image"))
+}
+
+fn card(image: Arc<Image>, tilt: f64, depth: usize) -> SceneCard {
+    SceneCard {
+        image,
+        tilt,
+        depth,
+        wobble: 0.0,
+        leaving: None,
+        movie: None,
+    }
+}
+
+fn scene(cards: Vec<SceneCard>, hint: Option<&str>, scale: f64) -> Scene {
+    Scene {
+        cards,
+        hint: hint.map(str::to_string),
+        hint_opacity: 1.0,
+        opacity: 1.0,
+        scale,
+    }
+}
+
+fn render(scene: &Scene) -> Pixmap {
+    let (width, height) = Renderer::pixmap_size(scene.scale);
+    let mut pixmap = Pixmap::new(width, height).expect("pixmap");
+    Renderer::new().render(scene, &mut pixmap);
+    pixmap
+}
+
+fn opaque_pixels(pixmap: &Pixmap) -> usize {
+    pixmap
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|p| p[3] > 0)
+        .count()
+}
+
+#[test]
+fn empty_scene_is_transparent() {
+    let scene = scene(Vec::new(), Some("nothing held"), 1.0);
+    let pixmap = render(&scene);
+    assert!(
+        pixmap.data().as_chunks::<4>().0.iter().all(|p| p[3] == 0),
+        "an empty scene must be fully transparent"
+    );
+}
+
+#[test]
+fn zero_opacity_is_transparent() {
+    let mut scene = scene(
+        vec![card(solid(160, 100, [200, 60, 60, 255]), 0.0, 0)],
+        Some("hi"),
+        1.0,
+    );
+    scene.opacity = 0.0;
+    let pixmap = render(&scene);
+    assert!(
+        pixmap.data().as_chunks::<4>().0.iter().all(|p| p[3] == 0),
+        "opacity 0 must be fully transparent"
+    );
+}
+
+#[test]
+fn one_card_has_content_and_a_clear_corner() {
+    let scene = scene(
+        vec![card(solid(160, 100, [240, 240, 240, 255]), 0.0, 0)],
+        None,
+        1.0,
+    );
+    let pixmap = render(&scene);
+    let centre = pixmap.pixel(74, 53).expect("centre pixel");
+    assert_eq!(centre.alpha(), 255, "the card centre must be opaque");
+    let corner = pixmap.pixel(199, 169).expect("corner pixel");
+    assert_eq!(corner.alpha(), 0, "the far corner must stay transparent");
+    let behind = pixmap.pixel(4, 4).expect("top-left pixel");
+    assert_eq!(behind.alpha(), 0, "the inset area must stay transparent");
+}
+
+#[test]
+fn premultiplied_invariant_holds_for_a_busy_scene() {
+    let mut top = card(solid(900, 600, [80, 160, 220, 180]), -11.0, 0);
+    top.movie = Some(Some(75.4));
+    let mut scene = scene(
+        vec![
+            card(solid(1600, 1000, [230, 120, 60, 255]), 12.0, 3),
+            card(solid(900, 1400, [70, 190, 130, 255]), -7.0, 2),
+            card(solid(1200, 1200, [150, 90, 210, 255]), 9.0, 1),
+            top,
+        ],
+        Some("3 held · shake to discard"),
+        1.25,
+    );
+    scene.opacity = 0.9;
+    let pixmap = render(&scene);
+    for pixel in pixmap.data().as_chunks::<4>().0 {
+        assert!(pixel[0] <= pixel[3], "red exceeds alpha");
+        assert!(pixel[1] <= pixel[3], "green exceeds alpha");
+        assert!(pixel[2] <= pixel[3], "blue exceeds alpha");
+    }
+}
+
+#[test]
+fn rendering_twice_gives_identical_bytes() {
+    let scene = scene(
+        vec![
+            card(solid(1600, 1000, [230, 120, 60, 255]), 10.0, 2),
+            card(solid(900, 1400, [70, 190, 130, 255]), -12.0, 1),
+            card(solid(1200, 1200, [150, 90, 210, 255]), 9.0, 0),
+        ],
+        Some("3 held"),
+        1.25,
+    );
+    let mut renderer = Renderer::new();
+    let (width, height) = Renderer::pixmap_size(scene.scale);
+    let mut first = Pixmap::new(width, height).expect("first");
+    let mut second = Pixmap::new(width, height).expect("second");
+    renderer.render(&scene, &mut first);
+    renderer.render(&scene, &mut second);
+    assert_eq!(first.data(), second.data());
+}
+
+#[test]
+fn scale_two_quadruples_the_card_area() {
+    let image = solid(1600, 1000, [210, 140, 90, 255]);
+    let one = render(&scene(vec![card(image.clone(), 0.0, 0)], None, 1.0));
+    let two = render(&scene(vec![card(image, 0.0, 0)], None, 2.0));
+
+    assert_eq!(Renderer::pixmap_size(1.0), (200, 170));
+    assert_eq!((two.width(), two.height()), (400, 340));
+
+    let small = opaque_pixels(&one) as f64;
+    let large = opaque_pixels(&two) as f64;
+    assert!(small > 0.0, "the small card must draw something");
+    let ratio = large / small;
+    assert!(
+        (ratio - 4.0).abs() <= 0.4,
+        "expected about four times the pixels, got {ratio}"
+    );
+}
+
+#[test]
+fn finished_leave_animations_draw_nothing() {
+    for leaving in [Leaving::Dissolve(1.0), Leaving::Drop(1.0)] {
+        let mut top = card(solid(1600, 1000, [200, 90, 60, 255]), 0.0, 0);
+        top.leaving = Some(leaving);
+        let pixmap = render(&scene(vec![top], None, 1.0));
+        assert!(
+            pixmap.data().as_chunks::<4>().0.iter().all(|p| p[3] == 0),
+            "{leaving:?} at 1.0 must leave no pixels"
+        );
+    }
+}
+
+#[test]
+fn movie_labels_round_to_mm_ss() {
+    assert_eq!(movie_label(0.0), "0:00");
+    assert_eq!(movie_label(9.4), "0:09");
+    assert_eq!(movie_label(59.6), "1:00");
+    assert_eq!(movie_label(75.4), "1:15");
+    assert_eq!(movie_label(3599.6), "60:00");
+}
