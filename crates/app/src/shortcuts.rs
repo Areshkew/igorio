@@ -815,6 +815,7 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const WM_APPLY: u32 = WM_APP + 1;
 const WM_PAUSE: u32 = WM_APP + 2;
 const WM_STOP: u32 = WM_APP + 3;
+const WM_REPORT: u32 = WM_APP + 4;
 
 /// An auto-reset event handle, closed on drop.
 struct Event(HANDLE);
@@ -836,9 +837,16 @@ struct Shared {
     queue: Mutex<VecDeque<Pressed>>,
     wake: Event,
     status: Mutex<Vec<(Action, Registration)>>,
+    reports: Mutex<Vec<RegistrationReport>>,
     /// The latest `apply`, not yet taken by the thread.
     pending: Mutex<Option<Shortcuts>>,
     paused: AtomicBool,
+}
+
+/// A status snapshot taken after all earlier commands on the hotkey thread.
+pub struct RegistrationReport {
+    pub tag: usize,
+    pub entries: Vec<(Action, Registration)>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -877,6 +885,7 @@ impl Hotkeys {
             queue: Mutex::new(VecDeque::with_capacity(QUEUE_CAPACITY)),
             wake,
             status: Mutex::new(Vec::new()),
+            reports: Mutex::new(Vec::new()),
             pending: Mutex::new(None),
             paused: AtomicBool::new(false),
         });
@@ -929,6 +938,15 @@ impl Hotkeys {
     /// The latest known registration of every action, in `Action::ALL` order.
     pub fn status(&self) -> Vec<(Action, Registration)> {
         lock(&self.shared.status).clone()
+    }
+
+    /// Requests a tagged status on the same queue as apply and pause.
+    pub fn report_after_commands(&self, tag: usize) -> bool {
+        self.post(WM_REPORT, tag)
+    }
+
+    pub fn reports(&self) -> Vec<RegistrationReport> {
+        std::mem::take(&mut *lock(&self.shared.reports))
     }
 
     /// Appends the presses received so far to `out`, oldest first.
@@ -1138,6 +1156,12 @@ fn run(shared: Arc<Shared>, initial: Shortcuts, ready: mpsc::Sender<windows::cor
                 }
             }
             WM_STOP if ours => break,
+            WM_REPORT if ours => {
+                let entries = lock(&shared.status).clone();
+                lock(&shared.reports).push(RegistrationReport { tag: msg.wParam.0, entries });
+                // SAFETY: owner and worker both hold the event through Shared.
+                let _ = unsafe { SetEvent(shared.wake.0) };
+            }
             _ => {
                 // SAFETY: as above.
                 unsafe {

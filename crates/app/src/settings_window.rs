@@ -6,7 +6,7 @@ use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -41,14 +41,21 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Error, HRESULT, PCWSTR, Result, w};
 
+use crate::input::Held;
 use crate::layout::CardSize;
 use crate::overlay::{cursor_pos, monitor_at};
 use crate::settings::{DefaultFolders, Settings};
+use crate::shortcuts::{
+    Action, Chord, RecorderInput, Registration, RegistrationReport, Shortcuts, chord_from_key_event,
+    display_for_layout, held_for_message,
+};
 
 const SCREENSHOTS: &str = "fairy.screenshots";
 const CLASS: PCWSTR = w!("IgorioSettings");
 const OPEN: u32 = WM_APP + 1;
 const PICK: u32 = WM_APP + 2;
+const SHORTCUT_STATUS: u32 = WM_APP + 6;
+static NEXT_SHORTCUT_TAG: AtomicUsize = AtomicUsize::new(1);
 const WORKER_EXITED: isize = -1;
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
 const EX_STYLE: WINDOW_EX_STYLE = WS_EX_APPWINDOW;
@@ -92,11 +99,19 @@ struct Lifetime {
     hwnd: AtomicIsize,
     stop: AtomicBool,
     wake: Arc<Wake>,
-    saved: Sender<Settings>,
+    events: Sender<SettingsEvent>,
+    reports: Mutex<Vec<RegistrationReport>>,
+    test_modifiers: Mutex<Held>,
     test_choice: Mutex<Option<(Folder, PathBuf)>>,
 }
 
 impl Lifetime {
+    fn emit(&self, event: SettingsEvent) {
+        if self.events.send(event).is_ok() {
+            self.signal();
+        }
+    }
+
     fn post(&self, message: u32) {
         let hwnd = self.hwnd.load(SeqCst);
         if hwnd != 0 && hwnd != WORKER_EXITED {
@@ -111,6 +126,13 @@ impl Lifetime {
         // SAFETY: the Arc keeps the auto-reset event live during this call.
         let _ = unsafe { SetEvent(self.wake.0) };
     }
+}
+
+pub enum SettingsEvent {
+    Saved(Settings),
+    PauseShortcuts(usize),
+    CheckShortcuts { tag: usize, proposed: Shortcuts },
+    ResumeShortcuts,
 }
 
 #[derive(Clone)]
@@ -149,8 +171,8 @@ impl TestMode {
 pub struct SettingsWindow {
     options: Options,
     wake: Arc<Wake>,
-    saved: Sender<Settings>,
-    snapshots: Receiver<Settings>,
+    events_tx: Sender<SettingsEvent>,
+    events_rx: Receiver<SettingsEvent>,
     worker: Option<(Arc<Lifetime>, JoinHandle<()>)>,
 }
 
@@ -167,16 +189,30 @@ impl SettingsWindow {
     fn with_options(options: Options) -> Result<Self> {
         // SAFETY: unnamed auto-reset event; the result is owned by Wake.
         let wake = Arc::new(Wake(unsafe { CreateEventW(None, false, false, None)? }));
-        let (saved, snapshots) = mpsc::channel();
-        Ok(Self { options, wake, saved, snapshots, worker: None })
+        let (events_tx, events_rx) = mpsc::channel();
+        Ok(Self { options, wake, events_tx, events_rx, worker: None })
     }
 
     pub fn wake_handle(&self) -> HANDLE {
         self.wake.0
     }
 
-    pub fn saved(&self) -> impl Iterator<Item = Settings> + '_ {
-        self.snapshots.try_iter()
+    pub fn events(&self) -> impl Iterator<Item = SettingsEvent> + '_ {
+        self.events_rx.try_iter()
+    }
+
+    pub fn publish_registration(&self, report: RegistrationReport) {
+        if let Some((worker, _)) = &self.worker {
+            worker.reports.lock().unwrap_or_else(|e| e.into_inner()).push(report);
+            worker.post(SHORTCUT_STATUS);
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn test_modifiers(&self, held: Held) {
+        if self.options.test.is_some() && let Some((worker, _)) = &self.worker {
+            *worker.test_modifiers.lock().unwrap_or_else(|e| e.into_inner()) = held;
+        }
     }
 
     pub fn open(&mut self) -> io::Result<()> {
@@ -191,7 +227,9 @@ impl SettingsWindow {
             hwnd: AtomicIsize::new(0),
             stop: AtomicBool::new(false),
             wake: Arc::clone(&self.wake),
-            saved: self.saved.clone(),
+            events: self.events_tx.clone(),
+            reports: Mutex::new(Vec::new()),
+            test_modifiers: Mutex::new(Held::default()),
             test_choice: Mutex::new(None),
         });
         let options = self.options.clone();
@@ -568,6 +606,49 @@ pub enum Control {
     Launch,
     Status,
     Retry,
+    GeneralTab,
+    ShortcutsTab,
+    WindowsShortcutNote,
+    RestoreShortcutLabel,
+    RestoreShortcutChord,
+    RestoreShortcutRecord,
+    RestoreShortcutReset,
+    RestoreShortcutStatus,
+    TopShortcutLabel,
+    TopShortcutChord,
+    TopShortcutRecord,
+    TopShortcutReset,
+    TopShortcutStatus,
+    AllShortcutLabel,
+    AllShortcutChord,
+    AllShortcutRecord,
+    AllShortcutReset,
+    AllShortcutStatus,
+    OpenShortcutLabel,
+    OpenShortcutChord,
+    OpenShortcutRecord,
+    OpenShortcutReset,
+    OpenShortcutStatus,
+    NoteShortcutLabel,
+    NoteShortcutChord,
+    NoteShortcutRecord,
+    NoteShortcutReset,
+    NoteShortcutStatus,
+    RecordingShortcutLabel,
+    RecordingShortcutChord,
+    RecordingShortcutRecord,
+    RecordingShortcutReset,
+    RecordingShortcutStatus,
+    PenShortcutLabel,
+    PenShortcutChord,
+    PenShortcutRecord,
+    PenShortcutReset,
+    PenShortcutStatus,
+    HighlighterShortcutLabel,
+    HighlighterShortcutChord,
+    HighlighterShortcutRecord,
+    HighlighterShortcutReset,
+    HighlighterShortcutStatus,
 }
 
 use Control::*;
@@ -586,6 +667,7 @@ enum Kind {
     Status,
 }
 
+#[derive(Clone, Copy)]
 struct Item {
     id: Control,
     kind: Kind,
@@ -598,11 +680,13 @@ const fn item(id: Control, kind: Kind, text: &'static str, rect: [i32; 4]) -> It
 }
 
 const WIDTH: i32 = 512;
-const HEIGHT: i32 = 560;
-const STATUS_HEIGHT: i32 = 53;
+const HEIGHT: i32 = 570;
+const STATUS_HEIGHT: i32 = 34;
 const KEEP_PATCH: [i32; 4] = [24, 116, 464, 36];
 
 const ITEMS: &[Item] = &[
+    item(GeneralTab, Kind::Radio, "General", [24, 14, 107, 32]),
+    item(ShortcutsTab, Kind::Radio, "Shortcuts", [131, 14, 107, 32]),
     item(Capabilities, Kind::Heading, "Capabilities", [24, 19, 464, 22]),
     item(ScreenshotsTitle, Kind::Title, "Screenshots", [24, 48, 408, 22]),
     item(Screenshots, Kind::Switch, "Screenshots", [438, 46, 50, 28]),
@@ -613,6 +697,7 @@ const ITEMS: &[Item] = &[
         "Use Win+Shift+S or PrtScn and your cursor carries the shot.",
         [24, 93, 464, 17],
     ),
+    item(WindowsShortcutNote, Kind::Detail, "Taking a screenshot uses the Windows shortcuts. Change them in Windows settings.", [24, 145, 464, 17]),
     item(KeepTitle, Kind::Title, "Keep every screenshot", [36, 122, 380, 24]),
     item(Keep, Kind::Switch, "Keep every screenshot", [426, 120, 50, 28]),
     item(NotesTitle, Kind::Title, "Notes", [24, 161, 45, 22]),
@@ -644,11 +729,136 @@ const ITEMS: &[Item] = &[
     item(CardDimensions, Kind::Detail, "", [36, 500, 328, 20]),
     item(LaunchTitle, Kind::Title, "Launch at login", [24, 542, 404, 24]),
     item(Launch, Kind::Switch, "Launch at login", [438, 540, 50, 28]),
-    item(Status, Kind::Status, "", [24, 583, 382, 44]),
+    item(Status, Kind::Status, "", [24, 589, 382, 42]),
     item(Retry, Kind::Push("&Retry"), "&Retry saving settings", [418, 588, 70, 29]),
 ];
 
 const CARD_PATCH: [i32; 4] = [24, 437, 464, 91];
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShortcutPart { Label, Chord, Record, Reset, Status }
+
+const SHORTCUT_IDS: [[Control; 5]; Action::ALL.len()] = [
+    [RestoreShortcutLabel, RestoreShortcutChord, RestoreShortcutRecord, RestoreShortcutReset, RestoreShortcutStatus],
+    [TopShortcutLabel, TopShortcutChord, TopShortcutRecord, TopShortcutReset, TopShortcutStatus],
+    [AllShortcutLabel, AllShortcutChord, AllShortcutRecord, AllShortcutReset, AllShortcutStatus],
+    [OpenShortcutLabel, OpenShortcutChord, OpenShortcutRecord, OpenShortcutReset, OpenShortcutStatus],
+    [NoteShortcutLabel, NoteShortcutChord, NoteShortcutRecord, NoteShortcutReset, NoteShortcutStatus],
+    [RecordingShortcutLabel, RecordingShortcutChord, RecordingShortcutRecord, RecordingShortcutReset, RecordingShortcutStatus],
+    [PenShortcutLabel, PenShortcutChord, PenShortcutRecord, PenShortcutReset, PenShortcutStatus],
+    [HighlighterShortcutLabel, HighlighterShortcutChord, HighlighterShortcutRecord, HighlighterShortcutReset, HighlighterShortcutStatus],
+];
+
+impl Control {
+    #[doc(hidden)]
+    pub fn shortcut(action: Action, part: ShortcutPart) -> Self {
+        SHORTCUT_IDS[action as usize][part as usize]
+    }
+
+    fn shortcut_row(self) -> Option<(Action, ShortcutPart)> {
+        let index = (self as usize).checked_sub(RestoreShortcutLabel as usize)?;
+        let action = *Action::ALL.get(index / 5)?;
+        Some((action, [ShortcutPart::Label, ShortcutPart::Chord, ShortcutPart::Record,
+            ShortcutPart::Reset, ShortcutPart::Status][index % 5]))
+    }
+}
+
+const fn shortcut_y(index: usize) -> i32 { 56 + index as i32 * 62 }
+
+const SHORTCUT_ITEMS: [Item; Action::ALL.len() * 5] = {
+    let mut list = [item(RestoreShortcutLabel, Kind::Title, "", [0; 4]); Action::ALL.len() * 5];
+    let mut index = 0;
+    while index < Action::ALL.len() {
+        let y = shortcut_y(index);
+        let ids = SHORTCUT_IDS[index];
+        list[index * 5] = item(ids[0], Kind::Title, "", [24, y, 288, 21]);
+        list[index * 5 + 1] = item(ids[1], Kind::Detail, "", [24, y + 22, 288, 20]);
+        list[index * 5 + 2] = item(ids[2], Kind::Push("Record…"), "", [319, y, 100, 28]);
+        list[index * 5 + 3] = item(ids[3], Kind::Push("Reset"), "", [425, y, 63, 28]);
+        list[index * 5 + 4] = item(ids[4], Kind::Detail, "", [24, y + 43, 464, 17]);
+        index += 1;
+    }
+    list
+};
+
+fn items() -> impl Iterator<Item = &'static Item> {
+    ITEMS.iter().chain(&SHORTCUT_ITEMS)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page { General, Shortcuts }
+
+const RECORDING_HINT: &str = "Press the keys. Esc cancels, Backspace clears.";
+const CHIP_FADE: usize = 0;
+const RESET_FADE: usize = 1;
+const HELP_FADE: usize = 2;
+
+fn shortcut_hint(chord: Chord) -> Option<&'static str> {
+    let key = chord.key.vk();
+    let letter = (u16::from(b'A')..=u16::from(b'Z')).contains(&key);
+    let digit = (u16::from(b'0')..=u16::from(b'9')).contains(&key);
+    if chord.win || chord.shift {
+        return None;
+    }
+    match (chord.ctrl, chord.alt) {
+        (true, true) if letter || digit => Some("On some keyboard layouts this combination types a character"),
+        (false, true) if letter => Some("This may override menu shortcuts in other apps"),
+        (true, false) if b"CXZYASFPNOWT".iter().any(|&byte| u16::from(byte) == key) =>
+            Some("Other apps will no longer receive this shortcut"),
+        _ => None,
+    }
+}
+
+fn shortcut_chips(chord: Chord) -> Vec<String> {
+    let mut chips = chord.chips();
+    let key_start = chips.iter().take(chips.len() - 1).map(|chip| chip.len() + 1).sum::<usize>();
+    if let Some(key) = chips.last_mut() {
+        *key = display_for_layout(&chord)[key_start..].to_owned();
+    }
+    chips
+}
+
+fn modifier_chips(held: Held) -> Vec<String> {
+    [(held.ctrl, "Ctrl"), (held.alt, "Alt"), (held.shift, "Shift"), (held.win, "Win")]
+        .into_iter().filter(|(down, _)| *down).map(|(_, key)| key.to_owned()).collect()
+}
+
+struct Capture {
+    action: Action,
+    tag: usize,
+    ready: bool,
+    held: Held,
+}
+
+struct Proposal {
+    action: Action,
+    tag: usize,
+    value: Shortcuts,
+}
+
+#[derive(Clone, Default)]
+struct RowDisplay {
+    chips: Vec<String>,
+    help: String,
+    error: bool,
+}
+
+#[derive(Default)]
+struct ShortcutEditor {
+    capture: Option<Capture>,
+    proposal: Option<Proposal>,
+    feedback: [Option<String>; Action::ALL.len()],
+    rows: [RowDisplay; Action::ALL.len()],
+    registration: Vec<(Action, Registration)>,
+}
+
+impl Page {
+    fn contains(self, id: Control) -> bool {
+        matches!(id, GeneralTab | ShortcutsTab)
+            || (id.shortcut_row().is_some() == (self == Self::Shortcuts))
+    }
+}
 
 const TIMER: usize = 1;
 const FOCUS_MS: f64 = 80.0;
@@ -709,7 +919,7 @@ impl ButtonMotion {
     }
 }
 
-const CONTROLS: usize = Retry as usize - Capabilities as usize + 1;
+const CONTROLS: usize = HighlighterShortcutStatus as usize - Capabilities as usize + 1;
 
 impl Control {
     fn index(self) -> usize {
@@ -727,6 +937,9 @@ struct Motion {
     status: Transition,
     retry: Transition,
     buttons: [ButtonMotion; CONTROLS],
+    page: Transition,
+    shortcuts: [[Transition; 3]; Action::ALL.len()],
+    pulse_since: Option<f64>,
 }
 
 impl Motion {
@@ -741,6 +954,9 @@ impl Motion {
             status: Transition::default(),
             retry: Transition::default(),
             buttons: [ButtonMotion::default(); CONTROLS],
+            page: Transition::default(),
+            shortcuts: [[Transition::default(); 3]; Action::ALL.len()],
+            pulse_since: None,
         }
     }
 
@@ -756,7 +972,7 @@ impl Motion {
     }
 
     fn active(&self, now: f64) -> bool {
-        self.enabled && self.tracks().any(|track| track.active(now))
+        self.enabled && (self.pulse_since.is_some() || self.tracks().any(|track| track.active(now)))
     }
 
     fn tracks(&self) -> impl Iterator<Item = Transition> + '_ {
@@ -771,6 +987,8 @@ impl Motion {
         ]
         .into_iter()
         .chain(self.selection)
+        .chain([self.page])
+        .chain(self.shortcuts.iter().flatten().copied())
         .chain(self.buttons.iter().flat_map(ButtonMotion::tracks))
     }
 
@@ -788,6 +1006,8 @@ impl Motion {
         }
         snap(&mut self.folders[1]);
         self.selection.iter_mut().for_each(snap);
+        snap(&mut self.page);
+        self.shortcuts.iter_mut().flatten().for_each(snap);
         for button in &mut self.buttons {
             for track in
                 [&mut button.checked, &mut button.hover, &mut button.press, &mut button.focus]
@@ -828,8 +1048,23 @@ impl Layout {
     }
 
     fn offset(self, id: Control) -> i32 {
+        if id as i32 > Retry as i32 {
+            return 0;
+        }
+        let compact = match id as i32 {
+            n if n >= Status as i32 => 0,
+            n if n >= LaunchTitle as i32 => 16,
+            n if n >= CardTitle as i32 => 23,
+            n if n >= CapturesFolder as i32 => 27,
+            n if n >= NotesFolder as i32 => 28,
+            n if n >= General as i32 => 32,
+            n if n >= RecordingTitle as i32 => 40,
+            n if n >= NotesTitle as i32 => 48,
+            n if n >= KeepTitle as i32 => 51,
+            _ => 35,
+        };
         let id = id as usize;
-        15 * if id >= CardTitle as usize {
+        compact + 15 * if id >= CardTitle as usize {
             -2
         } else if id >= CapturesFolder as usize {
             -1
@@ -897,6 +1132,9 @@ impl Item {
     }
 
     fn caption(&self) -> &'static str {
+        if let Some((action, ShortcutPart::Label)) = self.id.shortcut_row() {
+            return action.label();
+        }
         match self.id {
             ScreenshotKeys => "Windows plus Shift plus S, or Print Screen",
             NotesKeys => "Alt plus click",
@@ -908,7 +1146,7 @@ impl Item {
     fn style(&self) -> WINDOW_STYLE {
         let style = match self.kind {
             Kind::Switch => BS_CHECKBOX as u32 | WS_TABSTOP.0,
-            Kind::Radio if self.id == Small => {
+            Kind::Radio if matches!(self.id, Small | GeneralTab) => {
                 BS_AUTORADIOBUTTON as u32 | WS_TABSTOP.0 | WS_GROUP.0
             }
             Kind::Radio => BS_AUTORADIOBUTTON as u32,
@@ -916,12 +1154,16 @@ impl Item {
             Kind::Path => SS_OWNERDRAW.0 | SS_NOTIFY.0 | WS_GROUP.0,
             _ => SS_OWNERDRAW.0 | WS_GROUP.0,
         };
-        let visible = if matches!(self.id, Status | Retry) { 0 } else { WS_VISIBLE.0 };
+        let visible = if matches!(self.id, Status | Retry) || self.id.shortcut_row().is_some() {
+            0
+        } else {
+            WS_VISIBLE.0
+        };
         WINDOW_STYLE(style | WS_CHILD.0 | visible)
     }
 
     fn lookup(id: i32) -> Option<&'static Self> {
-        ITEMS.iter().find(|item| item.id as i32 == id)
+        items().find(|item| item.id as i32 == id)
     }
 }
 
@@ -1052,6 +1294,8 @@ struct Window<'a> {
     frozen: Cell<Option<f64>>,
     surface: RefCell<Option<Surface>>,
     error_label: RefCell<String>,
+    page: Cell<Page>,
+    shortcuts: RefCell<ShortcutEditor>,
     fonts: RefCell<Fonts>,
     tooltip: Cell<HWND>,
     tips: RefCell<[Vec<u16>; 2]>,
@@ -1076,6 +1320,9 @@ struct Frame {
     status: f64,
     retry: f64,
     buttons: [ButtonFrame; CONTROLS],
+    page: f64,
+    shortcuts: [[f64; 3]; Action::ALL.len()],
+    pulse: f64,
 }
 
 impl Frame {
@@ -1104,6 +1351,13 @@ impl Motion {
                 press: button.press.value(now),
                 focus: button.focus.value(now),
             }),
+            page: self.page.value(now),
+            shortcuts: self.shortcuts.map(|row| row.map(|track| track.value(now))),
+            pulse: if self.enabled {
+                self.pulse_since.map_or(0.0, |start| {
+                    0.5 + 0.5 * ((now - start) * std::f64::consts::TAU / 1100.0).cos()
+                })
+            } else { 0.0 },
         }
     }
 }
@@ -1146,7 +1400,7 @@ impl Window<'_> {
         } else {
             // Moving a row exposes the space it occupied and shifts the controls below it.
             let first_moved = if frame.folders[0] != previous.folders[0] {
-                Some(342)
+                Some(342 + layout.offset(NotesFallback))
             } else if frame.folders[1] != previous.folders[1] {
                 Some(410 + layout.offset(CapturesFallback))
             } else if frame.status != previous.status || frame.retry != previous.retry {
@@ -1165,7 +1419,20 @@ impl Window<'_> {
                 rect[1] += layout.offset(CardTitle);
                 self.invalidate(Some(scaled(rect, dpi)));
             }
-            for item in ITEMS.iter().filter(|item| item.button()) {
+            if frame.page != previous.page {
+                self.invalidate(Some(scaled([24, 14, 214, 32], dpi)));
+            }
+            if self.page.get() == Page::Shortcuts {
+                let capture = self.shortcuts.borrow().capture.as_ref().map(|capture| capture.action);
+                for index in 0..Action::ALL.len() {
+                    if frame.shortcuts[index] != previous.shortcuts[index]
+                        || (frame.pulse != previous.pulse && capture == Some(Action::ALL[index]))
+                    {
+                        self.invalidate(Some(scaled([24, shortcut_y(index), 464, 62], dpi)));
+                    }
+                }
+            }
+            for item in items().filter(|item| item.button() && self.page.get().contains(item.id)) {
                 let index = item.id.index();
                 if previous.buttons[index] != frame.buttons[index] {
                     self.invalidate_item(item);
@@ -1190,7 +1457,7 @@ impl Window<'_> {
 
     fn position_children(&self, layout: Layout, prior: Option<Layout>) {
         let dpi = self.dpi.get();
-        for item in ITEMS {
+        for item in items() {
             let rect = layout.rect(item, dpi);
             if prior.is_some_and(|old| old.rect(item, dpi) == rect) {
                 continue;
@@ -1270,7 +1537,7 @@ impl Window<'_> {
     }
 
     fn sync_buttons(&self) {
-        for item in ITEMS.iter().filter(|item| item.button()) {
+        for item in items().filter(|item| item.button() && self.page.get().contains(item.id)) {
             self.button_state(item, self.child(item.id));
         }
         self.update_animation();
@@ -1372,7 +1639,7 @@ impl Window<'_> {
     }
 
     fn init_children(&self, instance: HINSTANCE) -> Result<()> {
-        for item in ITEMS {
+        for item in items() {
             let caption = wide(item.caption());
             let class = if item.button() { w!("BUTTON") } else { w!("STATIC") };
             let rect = scaled(item.rect, self.dpi.get());
@@ -1429,7 +1696,7 @@ impl Window<'_> {
         self.dpi.set(dpi);
         let previous_fonts = self.fonts.replace(Fonts::new(dpi));
         self.position_children(self.frame.get().layout(), None);
-        for item in ITEMS {
+        for item in items() {
             let child = self.child(item.id);
             let font = self.fonts.borrow().0
                 [usize::from(!matches!(item.kind, Kind::Title | Kind::Heading))];
@@ -1451,7 +1718,11 @@ impl Window<'_> {
 
     fn adjust_size(&self, at: Option<(i32, i32)>) {
         let dpi = self.dpi.get();
-        let height = self.frame.get().layout().height();
+        let height = if self.page.get() == Page::General {
+            self.frame.get().layout().height()
+        } else {
+            HEIGHT
+        };
         let mut bounds = scaled([0, 0, WIDTH, height], dpi);
         // SAFETY: a writable RECT for the real window style and target DPI.
         let _ = unsafe {
@@ -1490,6 +1761,260 @@ impl Window<'_> {
         // SAFETY: same-thread child; Win32 copies the terminated UTF-16 string.
         let _ = unsafe { SetWindowTextW(self.child(id), PCWSTR(text.as_ptr())) };
     }
+}
++
+impl Window<'_> {
+    fn set_page(&self, page: Page) {
+        if self.page.replace(page) == page {
+            return;
+        }
+        self.cancel_capture();
+        let now = self.now();
+        {
+            let mut motion = self.motion.borrow_mut();
+            let duration = motion.duration(CARD_MS);
+            motion.page.retarget(if page == Page::Shortcuts { 1.0 } else { 0.0 }, now, duration);
+        }
+        for id in [GeneralTab, ShortcutsTab] {
+            let checked = (id == ShortcutsTab) == (page == Page::Shortcuts);
+            // SAFETY: a scalar state update to a native tab's radio BUTTON.
+            unsafe { SendMessageW(self.child(id), BM_SETCHECK, Some(WPARAM(usize::from(checked))), None) };
+        }
+        self.refresh();
+        self.adjust_size(None);
+        self.invalidate(None);
+    }
+
+    fn visible(&self, id: Control, visible: bool) {
+        // SAFETY: the settings STA owns this child. Showing it never activates another window.
+        let _ = unsafe { ShowWindow(self.child(id), if visible { SW_SHOWNOACTIVATE } else { SW_HIDE }) };
+    }
+
+    fn refresh_shortcuts(&self) {
+        let now = self.now();
+        let on_page = self.page.get() == Page::Shortcuts;
+        for &action in Action::ALL {
+            let index = action as usize;
+            let (chord, loaded) = {
+                let model = self.model.borrow();
+                (if action.available() { model.settings.shortcuts.get(action) } else { action.default_chord() }, model.load_error.is_none())
+            };
+            let (row, reset, busy_label) = {
+                let editor = self.shortcuts.borrow();
+                let capture = editor.capture.as_ref().filter(|capture| capture.action == action);
+                let proposal = editor.proposal.as_ref().filter(|proposal| proposal.action == action);
+                let chips = if let Some(capture) = capture {
+                    modifier_chips(capture.held)
+                } else {
+                    proposal.map_or(chord, |proposal| proposal.value.get(action)).map(shortcut_chips).unwrap_or_default()
+                };
+                let (help, error) = if !action.available() {
+                    ("Not available yet".into(), false)
+                } else if proposal.is_some() {
+                    ("Checking availability…".into(), false)
+                } else if let Some(error) = &editor.feedback[index] {
+                    (error.clone(), true)
+                } else if let Some(capture) = capture {
+                    (if capture.ready { RECORDING_HINT } else { "Preparing recorder…" }.into(), false)
+                } else if let Some(chord) = chord {
+                    match editor.registration.iter().find(|(row, _)| *row == action).map(|(_, status)| status) {
+                        Some(Registration::Taken) => (taken_message(chord), true),
+                        Some(Registration::Failed(message)) => (message.clone(), true),
+                        _ => (shortcut_hint(chord).unwrap_or_default().into(), false),
+                    }
+                } else {
+                    (String::new(), false)
+                };
+                let reset = action.available() && chord != action.default_chord();
+                let busy_label = if capture.is_some() {
+                    Some("Recording")
+                } else if proposal.is_some() {
+                    Some("Checking")
+                } else {
+                    None
+                };
+                (RowDisplay { chips, help, error }, reset, busy_label)
+            };
+            let caption = if row.chips.is_empty() { "None".into() } else { row.chips.join(" + ") };
+            let record = Control::shortcut(action, ShortcutPart::Record);
+            let reset_id = Control::shortcut(action, ShortcutPart::Reset);
+            self.text(Control::shortcut(action, ShortcutPart::Chord), &caption);
+            self.text(Control::shortcut(action, ShortcutPart::Status), &row.help);
+            self.text(record, &format!("{} shortcut for {}", busy_label.unwrap_or("Record"), action.label()));
+            self.text(reset_id, &format!("Reset shortcut for {}", action.label()));
+            {
+                let mut editor = self.shortcuts.borrow_mut();
+                let display = &mut editor.rows[index];
+                let mut motion = self.motion.borrow_mut();
+                let duration = if on_page && self.started.get() { motion.duration(ROW_MS) } else { 0.0 };
+                let tracks = &mut motion.shortcuts[index];
+                if row.chips != display.chips {
+                    tracks[CHIP_FADE].retarget(0.0, now, 0.0);
+                }
+                tracks[CHIP_FADE].retarget(1.0, now, duration);
+                tracks[RESET_FADE].retarget(if reset { 1.0 } else { 0.0 }, now, duration);
+                if !row.help.is_empty() {
+                    if display.help != row.help && tracks[HELP_FADE].to == 1.0 {
+                        tracks[HELP_FADE].retarget(0.0, now, 0.0);
+                    }
+                    display.help = row.help;
+                    display.error = row.error;
+                    tracks[HELP_FADE].retarget(1.0, now, duration);
+                } else {
+                    tracks[HELP_FADE].retarget(0.0, now, duration);
+                }
+                display.chips = row.chips;
+            }
+            // SAFETY: these are two real buttons created by this settings STA.
+            unsafe {
+                let _ = EnableWindow(self.child(record), loaded && action.available());
+                let _ = EnableWindow(self.child(reset_id), loaded && reset);
+            }
+            for part in [ShortcutPart::Label, ShortcutPart::Chord, ShortcutPart::Record, ShortcutPart::Status] {
+                self.visible(Control::shortcut(action, part), on_page);
+            }
+            self.visible(reset_id, on_page && reset);
+        }
+        self.update_animation();
+        if on_page {
+            self.invalidate(Some(scaled([0, 48, WIDTH, HEIGHT - 48], self.dpi.get())));
+        }
+    }
+
+    fn begin_capture(&self, action: Action) {
+        if !action.available() || self.shortcuts.borrow().proposal.is_some() {
+            return;
+        }
+        self.cancel_capture();
+        let tag = NEXT_SHORTCUT_TAG.fetch_add(1, SeqCst);
+        {
+            let mut editor = self.shortcuts.borrow_mut();
+            editor.feedback[action as usize] = None;
+            editor.capture = Some(Capture { action, tag, ready: false, held: Held::default() });
+        }
+        self.motion.borrow_mut().pulse_since = Some(self.now());
+        self.lifetime.emit(SettingsEvent::PauseShortcuts(tag));
+        self.refresh_shortcuts();
+    }
+
+    fn cancel_capture(&self) {
+        let captured = self.shortcuts.borrow_mut().capture.take();
+        if let Some(capture) = captured {
+            self.shortcuts.borrow_mut().feedback[capture.action as usize] = None;
+            self.motion.borrow_mut().pulse_since = None;
+            self.lifetime.emit(SettingsEvent::ResumeShortcuts);
+            self.refresh_shortcuts();
+        }
+    }
+
+    fn abort_shortcut_session(&self) {
+        self.cancel_capture();
+        if self.shortcuts.borrow_mut().proposal.take().is_some() {
+            self.lifetime.emit(SettingsEvent::ResumeShortcuts);
+        }
+    }
+
+    fn records(&self, action: Action) -> bool {
+        self.shortcuts.borrow().capture.as_ref().is_some_and(|capture| capture.action == action)
+    }
+
+    fn recorder_key(&self, vk: u16, down: bool) {
+        let held = if self.options.test.is_some() {
+            *self.lifetime.test_modifiers.lock().unwrap_or_else(|e| e.into_inner())
+        } else {
+            held_for_message()
+        };
+        let (action, ready) = {
+            let mut editor = self.shortcuts.borrow_mut();
+            let Some(capture) = &mut editor.capture else { return };
+            capture.held = held;
+            (capture.action, capture.ready)
+        };
+        let mut proposed = self.model.borrow().settings.shortcuts.clone();
+        let chord = match if down { chord_from_key_event(vk, held) } else { RecorderInput::Pending } {
+            RecorderInput::Cancel => return self.cancel_capture(),
+            RecorderInput::Chord(chord) if ready => Some(chord),
+            RecorderInput::Clear if ready => None,
+            _ => return self.refresh_shortcuts(),
+        };
+        if let Err(error) = proposed.set(action, chord) {
+            self.shortcuts.borrow_mut().feedback[action as usize] = Some(error.to_string());
+            self.refresh_shortcuts();
+            return;
+        }
+        self.check_shortcut(action, proposed);
+    }
+
+    fn check_shortcut(&self, action: Action, proposed: Shortcuts) {
+        let tag = NEXT_SHORTCUT_TAG.fetch_add(1, SeqCst);
+        {
+            let mut editor = self.shortcuts.borrow_mut();
+            editor.capture = None;
+            editor.feedback[action as usize] = None;
+            editor.proposal = Some(Proposal { action, tag, value: proposed.clone() });
+        }
+        self.motion.borrow_mut().pulse_since = None;
+        self.lifetime.emit(SettingsEvent::CheckShortcuts { tag, proposed });
+        self.refresh_shortcuts();
+    }
+
+    fn receive_registration(&self) {
+        let reports = std::mem::take(&mut *self.lifetime.reports.lock().unwrap_or_else(|e| e.into_inner()));
+        for report in reports {
+            let proposal = {
+                let mut editor = self.shortcuts.borrow_mut();
+                if report.tag == 0 {
+                    if editor.capture.is_none() && editor.proposal.is_none() {
+                        editor.registration = report.entries;
+                    }
+                    continue;
+                }
+                if let Some(capture) = editor.capture.as_mut().filter(|capture| capture.tag == report.tag) {
+                    capture.ready = true;
+                    continue;
+                }
+                if editor.proposal.as_ref().is_some_and(|proposal| proposal.tag == report.tag) {
+                    editor.proposal.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(proposal) = proposal {
+                self.finish_shortcut(proposal, &report.entries);
+            }
+        }
+        self.refresh_shortcuts();
+    }
+
+    fn finish_shortcut(&self, proposal: Proposal, status: &[(Action, Registration)]) {
+        let action = proposal.action;
+        let chord = proposal.value.get(action);
+        let registration = status.iter().find(|(row, _)| *row == action).map(|(_, status)| status);
+        let message = if let (Some(Registration::Taken), Some(chord)) = (registration, chord) {
+            Some(taken_message(chord))
+        } else {
+            let old = std::mem::replace(&mut self.model.borrow_mut().settings.shortcuts, proposal.value);
+            if self.save() {
+                match registration {
+                    Some(Registration::Failed(message)) if chord.is_some() => Some(message.clone()),
+                    _ => None,
+                }
+            } else {
+                let mut model = self.model.borrow_mut();
+                model.settings.shortcuts = old;
+                model.save_error.clone()
+            }
+        };
+        self.shortcuts.borrow_mut().feedback[action as usize] = message;
+        self.lifetime.emit(SettingsEvent::ResumeShortcuts);
+    }
+}
+
+fn taken_message(chord: Chord) -> String {
+    format!("Another program already uses {}", display_for_layout(&chord))
+}
+
+impl Window<'_> {
 
     fn refresh(&self) {
         let (
@@ -1560,7 +2085,7 @@ impl Window<'_> {
             };
         }
         for item in ITEMS.iter().filter(|item| item.button()) {
-            let enabled = loaded
+            let enabled = matches!(item.id, GeneralTab | ShortcutsTab) || loaded
                 && match item.id {
                     Notes | Recording => false,
                     Launch => launch_available,
@@ -1584,14 +2109,13 @@ impl Window<'_> {
             motion.status.retarget(if show_status { 1.0 } else { 0.0 }, now, duration);
             motion.retry.retarget(if retry { 1.0 } else { 0.0 }, now, duration);
         }
-        // SAFETY: owned HWNDs, show or hide their status controls, then invalidate the content.
-        unsafe {
-            let _ = ShowWindow(
-                self.child(Status),
-                if show_status { SW_SHOWNOACTIVATE } else { SW_HIDE },
-            );
-            let _ = ShowWindow(self.child(Retry), if retry { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        let page = self.page.get();
+        for item in ITEMS {
+            let visible = page.contains(item.id)
+                && match item.id { Status => show_status, Retry => retry, _ => true };
+            self.visible(item.id, visible);
         }
+        self.refresh_shortcuts();
         self.sync_buttons();
         self.invalidate(None);
     }
@@ -1655,15 +2179,16 @@ impl Window<'_> {
         self.update_animation();
     }
 
-    fn save(&self) {
+    fn save(&self) -> bool {
         let settings = self.model.borrow().settings.clone();
         let result = settings.save(&self.options.path);
         self.model.borrow_mut().save_error =
             result.as_ref().err().map(|err| format!("Settings could not be saved. {err}"));
-        if result.is_ok() && self.lifetime.saved.send(settings).is_ok() {
-            self.lifetime.signal();
+        if result.is_ok() {
+            self.lifetime.emit(SettingsEvent::Saved(settings));
         }
         self.refresh();
+        result.is_ok()
     }
 
     fn set_folder(&self, folder: Folder, path: Option<PathBuf>) {
@@ -1677,6 +2202,14 @@ impl Window<'_> {
 
     fn command(&self, id: i32) {
         let Some(item) = Item::lookup(id) else { return };
+        if !self.page.get().contains(item.id) || self.picking.get() || self.close_pending.get() {
+            return;
+        }
+        match item.id {
+            GeneralTab => return self.set_page(Page::General),
+            ShortcutsTab => return self.set_page(Page::Shortcuts),
+            _ => {}
+        }
         if self.picking.get()
             || self.model.borrow().load_error.is_some()
             || self.close_pending.get()
@@ -1686,6 +2219,21 @@ impl Window<'_> {
         let child = self.child(item.id);
         // SAFETY: only the state of a child of this window is queried.
         if !item.button() || !unsafe { IsWindowEnabled(child) }.as_bool() {
+            return;
+        }
+        if let Some((action, part)) = item.id.shortcut_row() {
+            match part {
+                ShortcutPart::Record => self.begin_capture(action),
+                ShortcutPart::Reset if self.shortcuts.borrow().proposal.is_none() => {
+                    self.cancel_capture();
+                    let mut proposed = self.model.borrow().settings.shortcuts.clone();
+                    if action.available() && proposed.get(action) != action.default_chord() {
+                        proposed.reset(action);
+                        self.check_shortcut(action, proposed);
+                    }
+                }
+                _ => {}
+            }
             return;
         }
         self.model.borrow_mut().action_error = None;
@@ -1836,6 +2384,7 @@ impl Window<'_> {
 
     fn request_close(&self) {
         let already_closing = self.close_pending.replace(true);
+        self.abort_shortcut_session();
         let dialog = self.dialog.borrow().clone();
         if let Some(dialog) = dialog {
             // SAFETY: Close is called on the STA that owns Show, without a borrowed model.
@@ -1864,6 +2413,10 @@ impl Window<'_> {
 
 impl Drop for Window<'_> {
     fn drop(&mut self) {
+        let editor = self.shortcuts.get_mut();
+        if editor.capture.is_some() || editor.proposal.is_some() {
+            self.lifetime.emit(SettingsEvent::ResumeShortcuts);
+        }
         // SAFETY: both handles were created here, and the window has been destroyed.
         for icon in self.icons.iter().copied().filter(|icon| !icon.is_invalid()) {
             let _ = unsafe { DestroyIcon(icon) };
@@ -1979,6 +2532,8 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
         frozen: Cell::new(None),
         surface: RefCell::new(None),
         error_label: RefCell::new(String::new()),
+        page: Cell::new(Page::General),
+        shortcuts: RefCell::new(ShortcutEditor::default()),
         fonts: RefCell::new(Fonts::new(dpi)),
         tooltip: Cell::new(HWND::default()),
         tips: RefCell::new(Default::default()),
@@ -1992,6 +2547,8 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&*window as *const Window<'_>) as isize) };
     let result = (|| {
         window.init_children(instance)?;
+        // SAFETY: select the General page in the native radio group before showing it.
+        unsafe { SendMessageW(window.child(GeneralTab), BM_SETCHECK, Some(WPARAM(1)), None) };
         window.set_theme();
         window.relayout(dpi);
         window.refresh_folders(true);
@@ -2008,6 +2565,7 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
             (at.y + ((at.height - height) / 2.0).max(0.0)) as i32,
         )));
         lifetime.hwnd.store(hwnd.0 as isize, SeqCst);
+        window.receive_registration();
         if !lifetime.stop.load(SeqCst) {
             let now = window.now();
             {
@@ -2048,6 +2606,16 @@ fn pump(window: &Window<'_>) -> Result<()> {
             0 => return Ok(()),
             -1 => return Err(Error::from_thread()),
             _ => {}
+        }
+        if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP) {
+            let recording = window.shortcuts.borrow().capture.as_ref().map(|capture| capture.action);
+            if let Some(action) = recording
+                && message.hwnd == window.child(Control::shortcut(action, ShortcutPart::Record))
+            {
+                // SAFETY: dispatch to the recorder without translating a key into a menu cue or character.
+                unsafe { DispatchMessageW(&message) };
+                continue;
+            }
         }
         if message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN {
             window.change_ui_state(UIS_CLEAR, UISF_HIDEFOCUS);
@@ -2341,14 +2909,118 @@ impl Window<'_> {
         }
     }
 
+
+    fn paint_pages(&self, canvas: &mut Canvas<'_>, frame: Frame, p: Palette) {
+        let dpi = self.dpi.get();
+        let px = |size| scale(size, dpi);
+        let fade = |ink| mix(p.paper, ink, frame.intro);
+        let segment = scaled([24, 14, 214, 32], dpi);
+        let face = mix(p.patch, p.chip, 0.55);
+        canvas.shape(segment, px(8) as f32, fade(face));
+        let left = px(24) + (frame.page * f64::from(px(131) - px(24))).round() as i32;
+        let selected = RECT { left, right: left + px(107), ..segment };
+        canvas.shape(inset(selected, px(3)), px(5) as f32, fade(p.selected));
+        let font = self.fonts.borrow().0[0];
+        for id in [GeneralTab, ShortcutsTab] {
+            let item = Item::lookup(id as i32).expect("page tab");
+            let rect = scaled(item.rect, dpi);
+            let focus = frame.buttons[id.index()].focus;
+            if focus > 0.0 {
+                let shape = inset(rect, px(3));
+                paint_focus(canvas, shape, [px(5), px(1), px(2)], fade(face), fade(p.accent), focus);
+                let current = (id == ShortcutsTab) == (self.page.get() == Page::Shortcuts);
+                canvas.shape(shape, px(5) as f32, fade(if current { p.selected } else { face }));
+            }
+            canvas.text(rect, item.text, fade(p.text), DT_CENTER | DT_VCENTER | DT_SINGLELINE, font);
+        }
+    }
+
+    fn paint_shortcut_rows(&self, canvas: &mut Canvas<'_>, frame: Frame, p: Palette) {
+        let dpi = self.dpi.get();
+        let px = |size| scale(size, dpi);
+        let fade = |ink| mix(p.paper, ink, frame.intro);
+        let fonts = self.fonts.borrow().0;
+        let center = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
+        for &action in Action::ALL {
+            let index = action as usize;
+            let y = shortcut_y(index);
+            if !intersects(canvas.dirty, scaled([24, y, 464, 62], dpi)) {
+                continue;
+            }
+            let (row, recording, checking) = {
+                let editor = self.shortcuts.borrow();
+                (editor.rows[index].clone(),
+                 editor.capture.as_ref().is_some_and(|c| c.action == action),
+                 editor.proposal.as_ref().is_some_and(|c| c.action == action))
+            };
+            let rect = |part| Item::lookup(Control::shortcut(action, part) as i32).expect("shortcut part").rect;
+            let title = if action.available() { p.text } else { p.muted };
+            canvas.text(scaled(rect(ShortcutPart::Label), dpi), action.label(), fade(title), DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX, fonts[0]);
+            let chips = scaled(rect(ShortcutPart::Chord), dpi);
+            let chip_color = |ink| fade(mix(p.paper, ink, frame.shortcuts[index][CHIP_FADE]));
+            if row.chips.is_empty() {
+                let label = if recording { "Waiting for keys…" } else { "None" };
+                canvas.text(chips, label, chip_color(p.muted), DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX, fonts[1]);
+            } else {
+                let mut left = chips.left;
+                for chip in row.chips {
+                    let width = (canvas.width(&chip, fonts[2]) + px(12)).max(px(20));
+                    let bounds = RECT { left, right: left + width, ..chips };
+                    canvas.shape(bounds, px(4) as f32, chip_color(if action.available() { p.chip } else { p.patch }));
+                    let ink = if action.available() { p.muted } else { mix(p.patch, p.muted, 0.72) };
+                    canvas.text(bounds, chip, chip_color(ink), center, fonts[2]);
+                    left += width + px(4);
+                }
+            }
+            for (part, label, opacity) in [
+                (ShortcutPart::Record, if recording { "Recording…" } else if checking { "Checking…" } else { "Record…" }, 1.0),
+                (ShortcutPart::Reset, "Reset", frame.shortcuts[index][RESET_FADE]),
+            ] {
+                if opacity <= 0.0 {
+                    continue;
+                }
+                let id = Control::shortcut(action, part);
+                let bounds = scaled(rect(part), dpi);
+                let shape = inset(bounds, px(3));
+                let state = frame.buttons[id.index()];
+                // SAFETY: this is a button owned by the settings STA.
+                let enabled = unsafe { IsWindowEnabled(self.child(id)) }.as_bool();
+                let focus = state.focus * opacity;
+                paint_focus(canvas, shape, [px(4), px(1), px(2)], fade(p.paper), fade(p.accent), focus);
+                let active = (recording || checking) && part == ShortcutPart::Record;
+                let face = if active { p.selected } else { mix(mix(p.chip, p.selected, state.hover * 0.6), p.outline, state.press * 0.27) };
+                let edge = if active { mix(p.on, p.accent, 0.60 + 0.40 * frame.pulse) } else if enabled { p.outline } else { p.disabled };
+                let button_color = |ink| fade(mix(p.paper, ink, opacity));
+                canvas.outlined(shape, px(4) as f32, button_color(face), button_color(edge));
+                canvas.text(bounds, label, button_color(if enabled { p.text } else { p.muted }), center, fonts[1]);
+            }
+            let opacity = frame.shortcuts[index][HELP_FADE];
+            if opacity > 0.0 {
+                let hint = move_y(scaled(rect(ShortcutPart::Status), dpi), px((3.0 * (1.0 - opacity)).round() as i32));
+                let ink = if row.error { p.error } else { p.muted };
+                canvas.text(hint, row.help, fade(mix(p.paper, ink, opacity)), DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX, fonts[1]);
+            }
+            if index + 1 < Action::ALL.len() {
+                canvas.shape(scaled([24, y + 61, 464, 1], dpi), 0.0, fade(p.patch));
+            }
+        }
+    }
+
     fn paint_content(&self, canvas: &mut Canvas<'_>, frame: Frame, p: Palette, hide_accel: bool) {
+        self.paint_pages(canvas, frame, p);
+        if self.page.get() == Page::Shortcuts {
+            self.paint_shortcut_rows(canvas, frame, p);
+            return;
+        }
         let dpi = self.dpi.get();
         let px = |size| scale(size, dpi);
         let layout = frame.layout();
         let fade = |color| mix(p.paper, color, frame.intro);
         let mut card_patch = CARD_PATCH;
         card_patch[1] += layout.offset(CardTitle);
-        for rect in [KEEP_PATCH, card_patch] {
+        let mut keep_patch = KEEP_PATCH;
+        keep_patch[1] += layout.offset(KeepTitle);
+        for rect in [keep_patch, card_patch] {
             canvas.shape(scaled(rect, dpi), px(8) as f32, fade(p.patch));
         }
         let radio =
@@ -2364,7 +3036,7 @@ impl Window<'_> {
         canvas.shape(inset(highlight, px(3)), px(4) as f32, fade(p.selected));
 
         let fonts = self.fonts.borrow().0;
-        for item in ITEMS {
+        for item in ITEMS.iter().filter(|item| !matches!(item.id, GeneralTab | ShortcutsTab)) {
             let mut rect = layout.rect(item, dpi);
             let local = match item.id {
                 NotesFallback => frame.folders[0],
@@ -2634,6 +3306,23 @@ unsafe extern "system" fn control_proc(
     }
     // SAFETY: querying the ID of our native child uses only its HWND.
     let item = Item::lookup(unsafe { GetDlgCtrlID(hwnd) }).filter(|item| item.button());
+    if let Some((action, ShortcutPart::Record)) = item.and_then(|item| item.id.shortcut_row())
+        && window.records(action)
+    {
+        match msg {
+            WM_GETDLGCODE => {
+                // SAFETY: preserve the native dialog flags and request every key during capture.
+                let native = unsafe { DefSubclassProc(hwnd, msg, wp, lp) };
+                return LRESULT(native.0 | DLGC_WANTALLKEYS as isize);
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
+                window.recorder_key(wp.0 as u16, matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN));
+                return LRESULT(0);
+            }
+            WM_KILLFOCUS => window.cancel_capture(),
+            _ => {}
+        }
+    }
     if let Some(item) = item {
         if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
             window.change_ui_state(UIS_SET, UISF_HIDEFOCUS);
@@ -2718,6 +3407,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 window.activate();
                 return LRESULT(0);
             }
+            SHORTCUT_STATUS => {
+                window.receive_registration();
+                return LRESULT(0);
+            }
+            WM_INPUTLANGCHANGE => window.refresh_shortcuts(),
             WM_CLOSE => {
                 window.request_close();
                 return LRESULT(0);

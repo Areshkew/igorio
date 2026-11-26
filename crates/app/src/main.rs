@@ -18,8 +18,8 @@ use igorio_app::layout::CardSize;
 use igorio_app::overlay::{self, Overlay};
 use igorio_app::saver;
 use igorio_app::settings::{self, DefaultFolders, Settings};
-use igorio_app::settings_window::{LiveSettings, SettingsWindow};
-use igorio_app::shortcuts::{Action, Hotkeys};
+use igorio_app::settings_window::{LiveSettings, SettingsEvent, SettingsWindow};
+use igorio_app::shortcuts::{Action, Hotkeys, Registration, RegistrationReport};
 use igorio_app::snip::{Snip, SnipEvent};
 use igorio_app::state::FairyState;
 use igorio_app::tray::{MenuItem, Tray};
@@ -513,9 +513,6 @@ fn main() -> windows::core::Result<()> {
     // This local is declared after `drops`, so it stops before clipboard restore and
     // shutdown on normal quit, error returns and unwinding.
     let mut detector = Detector::default();
-    // This owner is dropped first on quit, error, and unwind.
-    let mut settings_window = SettingsWindow::new(settings_path)?;
-    // Declared after the settings window, so it stops first (bounded) on every way out.
     let mut hotkeys = match Hotkeys::start(&settings.snapshot.shortcuts) {
         Ok(hotkeys) => Some(hotkeys),
         Err(error) => {
@@ -523,6 +520,9 @@ fn main() -> windows::core::Result<()> {
             None
         }
     };
+    // Close the recorder before the service on all exit paths.
+    let mut settings_window = SettingsWindow::new(settings_path)?;
+    let mut recording_shortcut = false;
     let mut presses = Vec::new();
     let mut snip_events = Vec::new();
     let mut wakes = vec![mouse_hook.wake_handle(), settings_window.wake_handle()];
@@ -539,25 +539,45 @@ fn main() -> windows::core::Result<()> {
 
     while pump_messages() {
         let now = hook::now();
-        if let Some(hotkeys) = &hotkeys {
-            hotkeys.drain(&mut presses);
-        }
-        for pressed in presses.drain(..) {
-            match pressed.action {
-                Action::OpenSettings => open_settings.set(true),
-                action => app.borrow_mut().shortcut(action, now),
-            }
-        }
-        if open_settings.replace(false) && let Err(error) = settings_window.open() {
-            eprintln!("could not queue Settings: {error}");
-        }
-        for saved in settings_window.saved() {
+        for event in settings_window.events() {
+            let saved = match event {
+                SettingsEvent::PauseShortcuts(tag) => {
+                    recording_shortcut = true;
+                    if let Some(service) = &hotkeys {
+                        service.set_paused(true);
+                    }
+                    request_shortcut_status(&settings_window, hotkeys.as_ref(), tag);
+                    continue;
+                }
+                SettingsEvent::CheckShortcuts { tag, proposed } => {
+                    if let Some(service) = &hotkeys {
+                        service.apply(&proposed);
+                        service.set_paused(false);
+                    }
+                    request_shortcut_status(&settings_window, hotkeys.as_ref(), tag);
+                    continue;
+                }
+                SettingsEvent::ResumeShortcuts => {
+                    recording_shortcut = false;
+                    if let Some(service) = &hotkeys {
+                        service.drain(&mut presses);
+                        presses.clear();
+                        service.apply(&settings.snapshot.shortcuts);
+                        service.set_paused(false);
+                    }
+                    request_shortcut_status(&settings_window, hotkeys.as_ref(), 0);
+                    continue;
+                }
+                SettingsEvent::Saved(saved) => saved,
+            };
+            let changed_shortcuts = settings.snapshot.shortcuts != saved.shortcuts;
             settings = saved.into();
             if let Some(drops) = &mut drops {
                 drops.set_settings(&settings.snapshot);
             }
-            if let Some(hotkeys) = &hotkeys {
-                hotkeys.apply(&settings.snapshot.shortcuts);
+            if changed_shortcuts && let Some(service) = &hotkeys {
+                service.apply(&settings.snapshot.shortcuts);
+                request_shortcut_status(&settings_window, hotkeys.as_ref(), 0);
             }
             let mut app = app.borrow_mut();
             app.apply_card_size(settings.card_size, now);
@@ -566,6 +586,27 @@ fn main() -> windows::core::Result<()> {
                 if app.state.hidden_for_capture() {
                     app.capture_ui(false, now);
                 }
+            }
+        }
+        if let Some(hotkeys) = &hotkeys {
+            hotkeys.drain(&mut presses);
+            for report in hotkeys.reports() {
+                settings_window.publish_registration(report);
+            }
+        }
+        if recording_shortcut {
+            presses.clear();
+        }
+        for pressed in presses.drain(..) {
+            match pressed.action {
+                Action::OpenSettings => open_settings.set(true),
+                action => app.borrow_mut().shortcut(action, now),
+            }
+        }
+        if open_settings.replace(false) {
+            match settings_window.open() {
+                Ok(()) => request_shortcut_status(&settings_window, hotkeys.as_ref(), 0),
+                Err(error) => eprintln!("could not queue Settings: {error}"),
             }
         }
         detector.update(settings.screenshot_detector, drops.as_ref(), now);
@@ -628,13 +669,29 @@ fn main() -> windows::core::Result<()> {
         sleeper.wait(wait, &wakes)?;
     }
     // Put the user's clipboard back if a paste left ours there, then stop the workers.
-    if let Some(hotkeys) = hotkeys.take()
-        && !hotkeys.shutdown()
-    {
-        eprintln!("the shortcut thread did not stop within its shutdown budget");
-    }
     drop(settings_window);
+    if let Some(hotkeys) = hotkeys.take() {
+        hotkeys.set_paused(false);
+        if !hotkeys.shutdown() {
+            eprintln!("the shortcut thread did not stop within its shutdown budget");
+        }
+    }
     drop(detector);
     drop(drops);
     Ok(())
+}
+
+fn request_shortcut_status(window: &SettingsWindow, service: Option<&Hotkeys>, tag: usize) {
+    if service.is_some_and(|hotkeys| hotkeys.report_after_commands(tag)) {
+        return;
+    }
+    let entries = Action::ALL.iter().copied().map(|action| {
+        let status = if action.available() {
+            Registration::Failed("The shortcut service is unavailable.".into())
+        } else {
+            Registration::Unavailable
+        };
+        (action, status)
+    }).collect();
+    window.publish_registration(RegistrationReport { tag, entries });
 }
