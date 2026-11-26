@@ -16,6 +16,7 @@ pub mod notes;
 pub mod overlay;
 pub mod saver;
 pub mod settings;
+pub mod settings_window;
 pub mod snip;
 pub mod state;
 pub mod tray;
