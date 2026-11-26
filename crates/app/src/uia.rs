@@ -311,6 +311,26 @@ impl UiaNode {
     pub fn same(&self, other: &UiaNode) -> bool {
         Arc::ptr_eq(&self.tree, &other.tree) && self.index == other.index
     }
+
+    /// An element built from plain data, for tests of code that reads snapshots (the drop
+    /// router). `elements` is the hit first, then its ancestors; each is classified. None
+    /// when `elements` is empty.
+    pub fn from_chain(elements: Vec<ElementInfo>) -> Option<UiaNode> {
+        let mut tree = Tree::default();
+        let mut previous = None;
+        for mut info in elements {
+            info.classify();
+            previous = Some(match previous {
+                None => tree.push_root(info),
+                Some(child) => tree.push_parent(child, info),
+            });
+        }
+        previous?;
+        Some(UiaNode {
+            tree: Arc::new(tree),
+            index: 0,
+        })
+    }
 }
 
 impl std::fmt::Debug for UiaNode {
@@ -1863,6 +1883,23 @@ mod tests {
     }
 
     // --- Role mapping ---
+
+    #[test]
+    fn from_chain_links_the_hit_to_its_ancestors() {
+        assert!(UiaNode::from_chain(Vec::new()).is_none());
+        let hit = UiaNode::from_chain(vec![
+            el(UIA_EditControlTypeId).value(false).text(),
+            el(UIA_PaneControlTypeId),
+            window(),
+        ])
+        .unwrap();
+        assert_eq!(hit.element().role, "AXTextField");
+        let parent = hit.parent().unwrap();
+        assert_eq!(parent.element().role, "AXGroup");
+        assert!(parent.children()[0].same(&hit));
+        assert_eq!(parent.parent().unwrap().element().role, "AXWindow");
+        assert!(parent.parent().unwrap().parent().is_none());
+    }
 
     #[test]
     fn maps_every_role_the_core_tests() {
