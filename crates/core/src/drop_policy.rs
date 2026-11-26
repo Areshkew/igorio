@@ -219,7 +219,8 @@ pub const CANVAS_HOSTS: &[&str] = &[
     "penpot.app",
 ];
 /// Google's editors draw the page themselves and catch typing in a hidden field.
-pub const CANVAS_URL_PREFIXES: &[&str] = &["docs.google.com/presentation", "docs.google.com/drawings"];
+pub const CANVAS_URL_PREFIXES: &[&str] =
+    &["docs.google.com/presentation", "docs.google.com/drawings"];
 /// Text documents drawn the same way. They are found like a canvas but pasted into like a
 /// text field: the double-click selected a word, so the selection is collapsed first and
 /// the image lands after that word instead of replacing it.
@@ -239,7 +240,10 @@ pub fn is_known_canvas_app(bundle_id: Option<&str>, url: Option<&str>) -> bool {
     let Some(key) = url.and_then(host_and_path) else {
         return false;
     };
-    let host = key.split('/').next().unwrap_or(key.as_str());
+    let host = key
+        .split('/')
+        .find(|piece| !piece.is_empty())
+        .unwrap_or(key.as_str());
     if CANVAS_HOSTS
         .iter()
         .any(|h| host == *h || host.ends_with(&format!(".{h}")))

@@ -471,14 +471,15 @@ fn test_canvas_drop_needs_typing_not_to_be_going_elsewhere() {
         ),
         "the hidden field canvas apps use to catch typing"
     );
-    assert!(confirm_canvas_drop(
-        point,
-        true,
-        true,
-        true,
-        Some(composer)
-    ));
+    assert!(confirm_canvas_drop(point, true, true, true, Some(composer)));
     assert!(!confirm_canvas_drop(point, false, true, false, None));
+}
+
+#[test]
+fn test_a_file_url_with_a_triple_slash_finds_the_host() {
+    // Swift's `split(separator:)` drops empty pieces, so the leading "/" of `file:///…` does
+    // not hide the host.
+    assert!(is_known_canvas_app(None, Some("file:///figma.com/x")));
 }
 
 #[test]
