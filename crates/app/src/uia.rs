@@ -64,6 +64,17 @@
 //! Requests replace each other: only the newest waiting request runs. A request that is
 //! replaced before it starts gets no answer.
 //!
+//! # Sharing the worker
+//!
+//! There is one worker, and more than one user (the paste router, the note summoner). Each
+//! user has a lane: [`Uia`] itself is lane 0, and [`Uia::requester`] opens another, with its
+//! own answers and wake event, usable from another thread. A request replaces only the
+//! waiting request of its own lane, so one user's stream of hover lookups can never
+//! replace another user's request. When the worker is free, the waiting requests of the
+//! lanes take turns (round robin), so each lane waits for at most one lookup of every other
+//! lane. Lookups of other lanes skip step 5 (the nearby search): they ask what is at a point,
+//! not where a paste would go.
+//!
 //! # Coordinates
 //!
 //! Points and frames are physical pixels with a top-left origin. UI Automation reports
@@ -517,7 +528,9 @@ pub struct Uia {
     answers: Receiver<(RequestId, Outcome)>,
     answers_tx: Sender<(RequestId, Outcome)>,
     wake: Arc<Event>,
-    next_id: AtomicU64,
+    /// Shared with the requesters, so ids are unique across lanes.
+    next_id: Arc<AtomicU64>,
+    next_lane: AtomicUsize,
     calls: Arc<AtomicU64>,
     controller: Option<JoinHandle<bool>>,
     #[cfg(test)]
@@ -541,6 +554,7 @@ impl Uia {
             id,
             lookup,
             at: Instant::now(),
+            lane: 0,
         };
         if self.inbox.send(msg).is_err() {
             let _ = self.answers_tx.send((
@@ -560,6 +574,27 @@ impl Uia {
     /// An auto-reset event, signalled after answers are queued. Valid while `self` lives.
     pub fn wake_handle(&self) -> HANDLE {
         self.wake.0
+    }
+
+    /// Opens another lane on the same worker (see "Sharing the worker"), for a user on
+    /// another thread. Its requests replace only its own waiting request.
+    pub fn requester(&self) -> Result<Requester> {
+        let lane = self.next_lane.fetch_add(1, Ordering::Relaxed);
+        let wake = Arc::new(Event::new()?);
+        let (answers_tx, answers) = mpsc::channel();
+        let _ = self.inbox.send(Msg::OpenLane {
+            lane,
+            answers: answers_tx.clone(),
+            wake: wake.clone(),
+        });
+        Ok(Requester {
+            inbox: self.inbox.clone(),
+            lane,
+            answers,
+            answers_tx,
+            wake,
+            next_id: self.next_id.clone(),
+        })
     }
 
     /// Cross-process UI Automation calls made since start (for tests and logs).
@@ -617,12 +652,15 @@ impl Uia {
             backend,
             inbox: inbox_rx,
             outbox: inbox.clone(),
-            answers: answers_tx.clone(),
-            wake: wake.clone(),
+            lanes: vec![Some(Lane {
+                answers: answers_tx.clone(),
+                wake: wake.clone(),
+                pending: None,
+            })],
+            turn: 0,
             live: live.clone(),
             worker,
             next_gen: 2,
-            pending: None,
             grace,
         };
         let controller = thread::Builder::new()
@@ -634,7 +672,8 @@ impl Uia {
             answers,
             answers_tx,
             wake,
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
+            next_lane: AtomicUsize::new(1),
             calls,
             controller: Some(controller),
             #[cfg(test)]
@@ -646,6 +685,56 @@ impl Uia {
 impl Drop for Uia {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Another user's lane on the [`Uia`] worker ([`Uia::requester`]). `Send`: it may live on
+/// another thread. Works like [`Uia`]: `request`, then `poll` after `wake_handle` is
+/// signalled. When the [`Uia`] stops, requests are answered `Failed`.
+pub struct Requester {
+    inbox: Sender<Msg>,
+    lane: usize,
+    answers: Receiver<(RequestId, Outcome)>,
+    answers_tx: Sender<(RequestId, Outcome)>,
+    wake: Arc<Event>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl Requester {
+    /// Queues a lookup and returns at once. It replaces this lane's waiting lookup (that one
+    /// gets no answer), never another lane's.
+    pub fn request(&self, lookup: Lookup) -> RequestId {
+        let id = RequestId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let msg = Msg::Request {
+            id,
+            lookup,
+            at: Instant::now(),
+            lane: self.lane,
+        };
+        if self.inbox.send(msg).is_err() {
+            let _ = self.answers_tx.send((
+                id,
+                Outcome::Failed("UI Automation controller stopped".into()),
+            ));
+            self.wake.set();
+        }
+        id
+    }
+
+    /// The next answer, if any. Call until None after each wake.
+    pub fn poll(&self) -> Option<(RequestId, Outcome)> {
+        self.answers.try_recv().ok()
+    }
+
+    /// An auto-reset event, signalled after answers are queued. Valid while `self` lives.
+    pub fn wake_handle(&self) -> HANDLE {
+        self.wake.0
+    }
+}
+
+impl Drop for Requester {
+    fn drop(&mut self) {
+        let _ = self.inbox.send(Msg::CloseLane { lane: self.lane });
     }
 }
 
@@ -971,6 +1060,15 @@ enum Msg {
         id: RequestId,
         lookup: Lookup,
         at: Instant,
+        lane: usize,
+    },
+    OpenLane {
+        lane: usize,
+        answers: Sender<(RequestId, Outcome)>,
+        wake: Arc<Event>,
+    },
+    CloseLane {
+        lane: usize,
     },
     Done {
         generation: u64,
@@ -985,11 +1083,22 @@ enum Msg {
 /// A request that passed the Win32 checks.
 struct Job {
     id: RequestId,
+    lane: usize,
     point: (i32, i32),
     want_focus: bool,
     probe: bool,
+    /// Step 5 (the nearby search); lane 0 only.
+    nearby: bool,
     deadline: Instant,
     target: Target,
+}
+
+/// One user of the worker: where its answers go, and its newest request not yet given to
+/// the worker.
+struct Lane {
+    answers: Sender<(RequestId, Outcome)>,
+    wake: Arc<Event>,
+    pending: Option<Job>,
 }
 
 /// Win32 facts about the window at a point.
@@ -1016,6 +1125,7 @@ trait Session {
 
 struct Busy {
     id: RequestId,
+    lane: usize,
     deadline: Instant,
     target: Target,
     answered: bool,
@@ -1094,13 +1204,13 @@ struct Controller {
     backend: Arc<dyn Backend>,
     inbox: Receiver<Msg>,
     outbox: Sender<Msg>,
-    answers: Sender<(RequestId, Outcome)>,
-    wake: Arc<Event>,
+    /// Indexed by lane; None once a lane is closed. Lane 0 is the [`Uia`] itself.
+    lanes: Vec<Option<Lane>>,
+    /// The lane whose waiting request goes to the worker first next time (round robin).
+    turn: usize,
     live: Arc<AtomicUsize>,
     worker: Worker,
     next_gen: u64,
-    /// The newest request not yet given to the worker.
-    pending: Option<Job>,
     grace: Duration,
 }
 
@@ -1137,28 +1247,56 @@ impl Controller {
     /// Returns true on shutdown.
     fn handle(&mut self, msg: Msg) -> bool {
         match msg {
-            Msg::Request { id, lookup, at } => {
+            Msg::Request {
+                id,
+                lookup,
+                at,
+                lane,
+            } => {
                 let deadline = at + lookup.deadline;
                 let pre = match self.backend.precheck(lookup.point) {
                     Ok(pre) => pre,
                     Err(err) => {
-                        self.answer(id, Outcome::Failed(err));
+                        self.answer(lane, id, Outcome::Failed(err));
                         return false;
                     }
                 };
                 match triage(pre, Instant::now() >= deadline) {
-                    Triage::Answer(outcome) => self.answer(id, outcome),
-                    // Replaces the waiting request, which gets no answer.
+                    Triage::Answer(outcome) => self.answer(lane, id, outcome),
+                    // Replaces the lane's waiting request, which gets no answer.
                     Triage::Run(target) => {
-                        self.pending = Some(Job {
-                            id,
-                            point: lookup.point,
-                            want_focus: lookup.want_focus,
-                            probe: lookup.probe,
-                            deadline,
-                            target,
-                        })
+                        if let Some(Some(slot)) = self.lanes.get_mut(lane) {
+                            slot.pending = Some(Job {
+                                id,
+                                lane,
+                                point: lookup.point,
+                                want_focus: lookup.want_focus,
+                                probe: lookup.probe,
+                                nearby: lane == 0,
+                                deadline,
+                                target,
+                            });
+                        }
                     }
+                }
+            }
+            Msg::OpenLane {
+                lane,
+                answers,
+                wake,
+            } => {
+                if self.lanes.len() <= lane {
+                    self.lanes.resize_with(lane + 1, || None);
+                }
+                self.lanes[lane] = Some(Lane {
+                    answers,
+                    wake,
+                    pending: None,
+                });
+            }
+            Msg::CloseLane { lane } => {
+                if let Some(slot) = self.lanes.get_mut(lane) {
+                    *slot = None;
                 }
             }
             Msg::Done {
@@ -1172,7 +1310,7 @@ impl Controller {
                     let outcome = outcome.unwrap_or(Outcome::TimedOut {
                         target: busy.target,
                     });
-                    self.answer(busy.id, outcome);
+                    self.answer(busy.lane, busy.id, outcome);
                 }
             }
             Msg::Exited { generation } => {
@@ -1197,7 +1335,12 @@ impl Controller {
                 Some(b.deadline)
             }
         });
-        let pending = self.pending.as_ref().map(|job| job.deadline);
+        let pending = self
+            .lanes
+            .iter()
+            .flatten()
+            .filter_map(|lane| lane.pending.as_ref().map(|job| job.deadline))
+            .min();
         match (busy, pending) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1210,11 +1353,17 @@ impl Controller {
             && now >= busy.deadline
         {
             busy.answered = true;
-            let (id, target) = (busy.id, busy.target.clone());
-            self.answer(id, Outcome::TimedOut { target });
+            let (lane, id, target) = (busy.lane, busy.id, busy.target.clone());
+            self.answer(lane, id, Outcome::TimedOut { target });
         }
-        if let Some(job) = self.pending.take_if(|job| now >= job.deadline) {
-            self.answer(job.id, Outcome::TimedOut { target: job.target });
+        let expired: Vec<Job> = self
+            .lanes
+            .iter_mut()
+            .flatten()
+            .filter_map(|lane| lane.pending.take_if(|job| now >= job.deadline))
+            .collect();
+        for job in expired {
+            self.answer(job.lane, job.id, Outcome::TimedOut { target: job.target });
         }
         let stuck = self
             .worker
@@ -1225,10 +1374,11 @@ impl Controller {
             self.replace_worker();
         }
         if self.worker.busy.is_none()
-            && let Some(job) = self.pending.take()
+            && let Some(job) = self.next_job()
         {
             let busy = Busy {
                 id: job.id,
+                lane: job.lane,
                 deadline: job.deadline,
                 target: job.target.clone(),
                 answered: false,
@@ -1238,12 +1388,29 @@ impl Controller {
                 _ => {
                     self.worker.jobs = None;
                     self.answer(
+                        busy.lane,
                         busy.id,
                         Outcome::Failed("UI Automation worker stopped".into()),
                     );
                 }
             }
         }
+    }
+
+    /// The waiting request of the first lane with one, starting at `turn`; the turn then
+    /// passes to the lane after it.
+    fn next_job(&mut self) -> Option<Job> {
+        let count = self.lanes.len();
+        for step in 0..count {
+            let lane = (self.turn + step) % count;
+            if let Some(Some(slot)) = self.lanes.get_mut(lane)
+                && let Some(job) = slot.pending.take()
+            {
+                self.turn = (lane + 1) % count;
+                return Some(job);
+            }
+        }
+        None
     }
 
     /// Abandons the current worker (it exits by itself when its call returns) and starts a
@@ -1283,9 +1450,11 @@ impl Controller {
         }
     }
 
-    fn answer(&self, id: RequestId, outcome: Outcome) {
-        if self.answers.send((id, outcome)).is_ok() {
-            self.wake.set();
+    fn answer(&self, lane: usize, id: RequestId, outcome: Outcome) {
+        if let Some(Some(lane)) = self.lanes.get(lane)
+            && lane.answers.send((id, outcome)).is_ok()
+        {
+            lane.wake.set();
         }
     }
 }
@@ -1750,7 +1919,8 @@ impl Session for UiaSession {
         };
         let mut tree = tree;
         let search_under = nearby_ancestor(&chain, &tree);
-        if job.target.shell.is_none()
+        if job.nearby
+            && job.target.shell.is_none()
             && !job.target.is_terminal
             && editable_self_or_ancestor(&hit_node).is_none()
             && let Some((index, element)) = search_under
@@ -2874,5 +3044,71 @@ mod tests {
         let answers = wait_for(&uia, id, Duration::from_secs(1));
         assert!(last_is(&answers, id, "ran 10"), "{answers:?}");
         uia.shutdown();
+    }
+
+    #[test]
+    fn a_second_lane_is_served_while_the_first_keeps_asking() {
+        let (uia, ran) = fake(STUCK_GRACE);
+        let side = uia.requester().unwrap();
+        // Lane 0 keeps the worker busy with a stream of 30 ms lookups (hover lookups).
+        let mut last = uia.request(lookup(1, 30, 2000));
+        thread::sleep(Duration::from_millis(5));
+        let asked = Instant::now();
+        let mine = side.request(lookup(500, 0, 2000));
+        let mut answered = None;
+        let until = Instant::now() + Duration::from_secs(2);
+        while answered.is_none() && Instant::now() < until {
+            // Lane 0 replaces its waiting request every few ms: it never runs out of work.
+            last = uia.request(lookup(2, 30, 2000));
+            while uia.poll().is_some() {}
+            // SAFETY: the handle is alive while `side` is.
+            unsafe { WaitForSingleObject(side.wake_handle(), 5) };
+            if let Some((id, outcome)) = side.poll() {
+                assert_eq!(id, mine);
+                answered = Some((asked.elapsed(), outcome));
+            }
+        }
+        let (waited, outcome) = answered.expect("the side lane was starved");
+        assert!(
+            matches!(&outcome, Outcome::Failed(t) if t == "ran 500"),
+            "{outcome:?}"
+        );
+        // At most the running lookup and one turn of lane 0 before it.
+        assert!(waited < Duration::from_millis(150), "{waited:?}");
+        // Lane 0 still gets its newest request answered.
+        let answers = wait_for(&uia, last, Duration::from_secs(1));
+        assert!(last_is(&answers, last, "ran 2"), "{answers:?}");
+        assert!(ran.lock().unwrap().contains(&500));
+        drop(side);
+        assert!(uia.shutdown());
+    }
+
+    #[test]
+    fn requests_of_one_lane_replace_only_each_other() {
+        let (uia, ran) = fake(STUCK_GRACE);
+        let side = uia.requester().unwrap();
+        // Occupy the worker, then queue one request per lane plus one that is replaced.
+        let busy = uia.request(lookup(1, 60, 2000));
+        thread::sleep(Duration::from_millis(10));
+        let replaced = side.request(lookup(10, 0, 2000));
+        let side_last = side.request(lookup(11, 0, 2000));
+        let main_last = uia.request(lookup(2, 0, 2000));
+        let main = wait_for(&uia, main_last, Duration::from_secs(1));
+        assert!(main.iter().any(|(id, _)| *id == busy));
+        assert!(last_is(&main, main_last, "ran 2"), "{main:?}");
+        let until = Instant::now() + Duration::from_secs(1);
+        let mut seen = Vec::new();
+        while Instant::now() < until && !seen.iter().any(|(id, _)| *id == side_last) {
+            // SAFETY: the handle is alive while `side` is.
+            unsafe { WaitForSingleObject(side.wake_handle(), 20) };
+            while let Some(answer) = side.poll() {
+                seen.push(answer);
+            }
+        }
+        assert!(last_is(&seen, side_last, "ran 11"), "{seen:?}");
+        assert!(!seen.iter().any(|(id, _)| *id == replaced));
+        assert!(!ran.lock().unwrap().contains(&10));
+        drop(side);
+        assert!(uia.shutdown());
     }
 }

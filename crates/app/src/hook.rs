@@ -6,8 +6,13 @@
 //! [`MouseHook::start`] spawns a hook thread. It sets the hook, then only pumps messages. The
 //! callback runs on that thread and does the minimum (rule 1 in `ROADMAP.md`): it copies
 //! the `MSLLHOOKSTRUCT`, counts clicks, pushes one small event into a preallocated queue,
-//! signals an event handle, and calls `CallNextHookEx`. It never swallows an event. No
-//! logging, COM, clipboard, process queries or heap allocation happen on that thread.
+//! signals an event handle, and calls `CallNextHookEx`. No logging, COM, clipboard,
+//! process queries or heap allocation happen on that thread.
+//!
+//! It swallows exactly one kind of event: the press the [`CLICK_GATE`] is armed for, and the
+//! release of that press (the note gesture). The decision reads one atomic and compares
+//! ([`ClickGate::on_press`]); everything else goes on to `CallNextHookEx`. A swallowed
+//! press and release are not queued: to the rest of the app they did not happen.
 //! A panic inside the callback is caught, so it cannot unwind across the `extern "system"`
 //! boundary, and `CallNextHookEx` still runs.
 //!
@@ -66,12 +71,15 @@
 //!   `uiAccess` build (M6) receives that input. While such a window is in front,
 //!   `seems_stalled` can report a stall; a restart then is harmless.
 //! - The secure desktop (UAC prompt, Ctrl+Alt+Del) is not seen at all.
+//! - If the hook is restarted (or the process ends) between a swallowed press and its
+//!   release, the release reaches the window below without its press. Windows never saw
+//!   the press, so no button is left down.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::os::windows::io::AsRawHandle;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -344,10 +352,192 @@ impl Shared {
     }
 }
 
+// MARK: Click gate
+
+/// Swallows one press of one button, and its release, on request: the click that makes a
+/// note while the summon pill shows (`notes::summoner`).
+///
+/// The summoner arms the gate only while the pill shows, with the epoch it read when the
+/// modifier went down. The keyboard hook of the summoner calls [`disarm`](Self::disarm) on
+/// every key change, which also moves the epoch on: an arm based on an older key state
+/// fails, and a released modifier or a typed key disarms at once, on the hook thread,
+/// before Windows passes the next input on (low-level hooks are called in input order).
+///
+/// The mouse hook asks [`on_press`](Self::on_press) on every press: one load, and a
+/// compare-and-swap only when armed. A press of the armed button that is not injected and
+/// not pen or touch takes the gate (it is disarmed) and is swallowed; any other press while
+/// armed disarms it. The matching release is swallowed by the hook's own state. The taken
+/// click's point and time are kept here and [`wake_handle`](Self::wake_handle) is set.
+pub struct ClickGate {
+    /// Bits 0 to 7: the armed button ([`button_code`]), 0 when not armed. Bits 8 and up:
+    /// the epoch.
+    state: AtomicU64,
+    /// Clicks taken since start.
+    taken: AtomicU64,
+    /// Point of the last taken click: x in the high 32 bits, y in the low.
+    taken_point: AtomicU64,
+    /// Time of the last taken click (`f64` bits, the clock of [`now`]).
+    taken_time: AtomicU64,
+    /// An auto-reset event handle (0 until first asked for). Never closed, so the hook can
+    /// set it without a lock.
+    wake: AtomicIsize,
+}
+
+/// The process's one gate, read by the process's one mouse hook.
+pub static CLICK_GATE: ClickGate = ClickGate::new();
+
+/// A click the gate swallowed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TakenClick {
+    /// Counts up with every taken click; compare with the last one seen.
+    pub count: u64,
+    pub x: i32,
+    pub y: i32,
+    pub time: f64,
+}
+
+/// The gate's code for a button: 1 to 5.
+pub fn button_code(button: Button) -> u64 {
+    match button {
+        Button::Left => 1,
+        Button::Right => 2,
+        Button::Middle => 3,
+        Button::X1 => 4,
+        Button::X2 => 5,
+    }
+}
+
+const ARM_BITS: u64 = 0xFF;
+
+impl ClickGate {
+    pub const fn new() -> ClickGate {
+        ClickGate {
+            state: AtomicU64::new(0),
+            taken: AtomicU64::new(0),
+            taken_point: AtomicU64::new(0),
+            taken_time: AtomicU64::new(0),
+            wake: AtomicIsize::new(0),
+        }
+    }
+
+    /// The current epoch. It moves on with every [`disarm`](Self::disarm) and every taken
+    /// click.
+    pub fn epoch(&self) -> u64 {
+        self.state.load(SeqCst) >> 8
+    }
+
+    /// Arms the gate for one press of `button`, if the epoch is still `epoch` and the gate
+    /// is not armed. False when a key changed since (the caller must not show the pill).
+    pub fn arm(&self, epoch: u64, button: Button) -> bool {
+        self.state
+            .compare_exchange(epoch << 8, epoch << 8 | button_code(button), SeqCst, SeqCst)
+            .is_ok()
+    }
+
+    /// Disarms and moves the epoch on. Returns the new epoch. Cheap enough for a hook
+    /// callback: a compare-and-swap loop on one word.
+    pub fn disarm(&self) -> u64 {
+        let old = self
+            .state
+            .try_update(SeqCst, SeqCst, |v| Some(((v >> 8) + 1) << 8))
+            .unwrap_or(0);
+        (old >> 8) + 1
+    }
+
+    /// Disarms without moving the epoch: the summoner hides the pill but the hold goes on,
+    /// so it may arm again with the same epoch when the pill comes back.
+    pub fn withdraw(&self) {
+        self.state.fetch_and(!ARM_BITS, SeqCst);
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.state.load(SeqCst) & ARM_BITS != 0
+    }
+
+    /// The decision for one press, made in the hook callback. True: swallow it (the gate
+    /// was armed for this button and is now taken). Injected presses never touch the gate;
+    /// any other press while armed disarms it.
+    pub fn on_press(&self, button: Button, injected: bool, touch: bool) -> bool {
+        if injected {
+            return false;
+        }
+        let state = self.state.load(SeqCst);
+        let armed = state & ARM_BITS;
+        if armed == 0 {
+            return false;
+        }
+        let next = ((state >> 8) + 1) << 8;
+        let taken = self
+            .state
+            .compare_exchange(state, next, SeqCst, SeqCst)
+            .is_ok();
+        // A disarm that raced with us already did what the else branch would.
+        taken && armed == button_code(button) && !touch
+    }
+
+    /// Records a taken click and wakes the waiter. Called by the hook after `on_press` said
+    /// true.
+    fn record(&self, x: i32, y: i32, time: f64) {
+        self.taken_point
+            .store(((x as u32 as u64) << 32) | y as u32 as u64, SeqCst);
+        self.taken_time.store(time.to_bits(), SeqCst);
+        self.taken.fetch_add(1, SeqCst);
+        let wake = self.wake.load(SeqCst);
+        if wake != 0 {
+            // SAFETY: the handle was created by `wake_handle` and is never closed.
+            let _ = unsafe { SetEvent(HANDLE(wake as *mut _)) };
+        }
+    }
+
+    /// The last taken click (count 0: none yet).
+    pub fn taken(&self) -> TakenClick {
+        let count = self.taken.load(SeqCst);
+        let point = self.taken_point.load(SeqCst);
+        TakenClick {
+            count,
+            x: (point >> 32) as u32 as i32,
+            y: point as u32 as i32,
+            time: f64::from_bits(self.taken_time.load(SeqCst)),
+        }
+    }
+
+    /// An auto-reset event set after every taken click. Created on the first call (not in
+    /// the hook), never closed. Invalid if it could not be created.
+    pub fn wake_handle(&self) -> HANDLE {
+        let current = self.wake.load(SeqCst);
+        if current != 0 {
+            return HANDLE(current as *mut _);
+        }
+        // SAFETY: no pointers; auto-reset, not signalled, unnamed. Kept for the process's life.
+        let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
+            return HANDLE::default();
+        };
+        match self
+            .wake
+            .compare_exchange(0, event.0 as isize, SeqCst, SeqCst)
+        {
+            Ok(_) => event,
+            Err(existing) => {
+                // SAFETY: our own new handle, which nobody else saw.
+                let _ = unsafe { CloseHandle(event) };
+                HANDLE(existing as *mut _)
+            }
+        }
+    }
+}
+
+impl Default for ClickGate {
+    fn default() -> Self {
+        ClickGate::new()
+    }
+}
+
 /// What the callback reaches. Only the hook thread touches it.
 struct Context {
     shared: Arc<Shared>,
     clicks: ClickCounter,
+    /// The button whose press the gate took: its release is swallowed too.
+    swallow_release: Option<Button>,
 }
 
 thread_local! {
@@ -360,19 +550,33 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         // SAFETY: for HC_ACTION, `lparam` points to an MSLLHOOKSTRUCT that is valid for the
         // duration of this call; it is copied out at once.
         let info = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
-        let _ = catch_unwind(AssertUnwindSafe(|| handle(wparam.0 as u32, &info, started)));
+        let swallow = catch_unwind(AssertUnwindSafe(|| handle(wparam.0 as u32, &info, started)));
+        if matches!(swallow, Ok(true)) {
+            // Taken by the click gate: the press (or its release) goes nowhere.
+            return LRESULT(1);
+        }
     }
     // SAFETY: passes the hook's own arguments on unchanged.
     unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
-fn handle(message: u32, info: &MSLLHOOKSTRUCT, started: Instant) {
+/// Whether to swallow a release: the one of the press the gate took. Clears the mark.
+pub fn swallows_release(pending: &mut Option<Button>, button: Button, injected: bool) -> bool {
+    if !injected && *pending == Some(button) {
+        *pending = None;
+        return true;
+    }
+    false
+}
+
+/// Returns true when the event must be swallowed.
+fn handle(message: u32, info: &MSLLHOOKSTRUCT, started: Instant) -> bool {
     CONTEXT.with(|context| {
         let Ok(mut context) = context.try_borrow_mut() else {
-            return;
+            return false;
         };
         let Some(context) = context.as_mut() else {
-            return;
+            return false;
         };
         let (x, y) = (info.pt.x, info.pt.y);
         let time = started.duration_since(epoch()).as_secs_f64();
@@ -396,8 +600,14 @@ fn handle(message: u32, info: &MSLLHOOKSTRUCT, started: Instant) {
                     WM_MBUTTONDOWN => Button::Middle,
                     _ => xbutton,
                 };
-                let window = top_window_at(info.pt);
                 let touch = is_pen_or_touch(info.dwExtraInfo);
+                if CLICK_GATE.on_press(button, injected, touch) {
+                    context.swallow_release = Some(button);
+                    CLICK_GATE.record(x, y, time);
+                    finish(&context.shared, started);
+                    return true;
+                }
+                let window = top_window_at(info.pt);
                 let click_count = context.clicks.press(
                     button,
                     (x, y),
@@ -424,6 +634,10 @@ fn handle(message: u32, info: &MSLLHOOKSTRUCT, started: Instant) {
                     WM_MBUTTONUP => Button::Middle,
                     _ => xbutton,
                 };
+                if swallows_release(&mut context.swallow_release, button, injected) {
+                    finish(&context.shared, started);
+                    return true;
+                }
                 Some(MouseEvent::Up {
                     button,
                     x,
@@ -442,14 +656,19 @@ fn handle(message: u32, info: &MSLLHOOKSTRUCT, started: Instant) {
             }),
             _ => None,
         };
-        let shared = &context.shared;
         if let Some(event) = event {
-            shared.push(event);
+            context.shared.push(event);
         }
-        shared.callbacks.fetch_add(1, Relaxed);
-        let spent = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        shared.max_callback_ns.fetch_max(spent, Relaxed);
-    });
+        finish(&context.shared, started);
+        false
+    })
+}
+
+/// Counts the callback and its time.
+fn finish(shared: &Shared, started: Instant) {
+    shared.callbacks.fetch_add(1, Relaxed);
+    let spent = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    shared.max_callback_ns.fetch_max(spent, Relaxed);
 }
 
 /// The top-level window at `point`. `WindowFromPoint` reads window manager state and only
@@ -506,6 +725,7 @@ fn run(shared: Arc<Shared>, installed: Arc<AtomicBool>, ready: mpsc::Sender<Resu
     CONTEXT.set(Some(Context {
         shared,
         clicks: ClickCounter::default(),
+        swallow_release: None,
     }));
     // SAFETY: `hook_proc` matches HOOKPROC and lives for the whole program.
     let hook: Result<HHOOK> = module.and_then(|module| unsafe {
@@ -1043,5 +1263,95 @@ mod tests {
         }
         assert_eq!(s.queue().len(), QUEUE_CAPACITY);
         assert_eq!(s.dropped.load(Relaxed), 3);
+    }
+
+    // --- Click gate ---
+
+    #[test]
+    fn unarmed_gate_lets_every_press_through() {
+        let gate = ClickGate::new();
+        for button in [Button::Left, Button::Right, Button::Middle] {
+            assert!(!gate.on_press(button, false, false));
+        }
+        assert!(!gate.is_armed());
+    }
+
+    #[test]
+    fn armed_gate_takes_one_press_of_its_button_and_its_release() {
+        let gate = ClickGate::new();
+        let epoch = gate.epoch();
+        assert!(gate.arm(epoch, Button::Left));
+        assert!(gate.on_press(Button::Left, false, false));
+        // Only that one: the next press passes.
+        assert!(!gate.is_armed());
+        assert!(!gate.on_press(Button::Left, false, false));
+        let mut pending = Some(Button::Left);
+        assert!(!swallows_release(&mut pending, Button::Right, false));
+        assert!(!swallows_release(&mut pending, Button::Left, true));
+        assert!(swallows_release(&mut pending, Button::Left, false));
+        assert!(!swallows_release(&mut pending, Button::Left, false));
+    }
+
+    #[test]
+    fn other_buttons_touch_and_injected_presses_are_never_taken() {
+        let gate = ClickGate::new();
+        assert!(gate.arm(gate.epoch(), Button::Left));
+        // Injected presses do not even look at the gate.
+        assert!(!gate.on_press(Button::Left, true, false));
+        assert!(gate.is_armed());
+        // Another button disarms.
+        assert!(!gate.on_press(Button::Right, false, false));
+        assert!(!gate.is_armed());
+        // A pen or touch press of the armed button disarms and passes.
+        assert!(gate.arm(gate.epoch(), Button::Left));
+        assert!(!gate.on_press(Button::Left, false, true));
+        assert!(!gate.is_armed());
+    }
+
+    #[test]
+    fn a_key_change_disarms_and_stale_arms_fail() {
+        let gate = ClickGate::new();
+        let held = gate.disarm(); // the modifier went down
+        assert!(gate.arm(held, Button::Left));
+        let after = gate.disarm(); // the modifier went up (keyboard hook)
+        assert_eq!(after, held + 1);
+        assert!(!gate.on_press(Button::Left, false, false));
+        // The summoner, a step behind, tries to arm with the old epoch: refused.
+        assert!(!gate.arm(held, Button::Left));
+        assert!(!gate.on_press(Button::Left, false, false));
+        // Arming twice is refused too.
+        assert!(gate.arm(after, Button::Left));
+        assert!(!gate.arm(after, Button::Right));
+    }
+
+    #[test]
+    fn withdrawing_keeps_the_epoch_so_the_same_hold_can_arm_again() {
+        let gate = ClickGate::new();
+        let held = gate.disarm();
+        assert!(gate.arm(held, Button::Left));
+        gate.withdraw(); // the cursor left empty space
+        assert!(!gate.is_armed());
+        assert!(!gate.on_press(Button::Left, false, false));
+        assert!(gate.arm(held, Button::Left)); // and came back
+        assert!(gate.on_press(Button::Left, false, false));
+        // After a key change, withdrawing does not bring an old epoch back.
+        let held = gate.epoch();
+        assert!(gate.arm(held, Button::Left));
+        let after = gate.disarm();
+        gate.withdraw();
+        assert_eq!(gate.epoch(), after);
+        assert!(!gate.arm(held, Button::Left));
+    }
+
+    #[test]
+    fn taken_clicks_are_recorded_with_negative_coordinates() {
+        let gate = ClickGate::new();
+        assert_eq!(gate.taken().count, 0);
+        gate.record(-1920, -5, 12.5);
+        let taken = gate.taken();
+        assert_eq!(
+            (taken.count, taken.x, taken.y, taken.time),
+            (1, -1920, -5, 12.5)
+        );
     }
 }
