@@ -13,7 +13,7 @@ use crate::geom::{Point, Rect, Size};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RecordingViewport {
     /// The recorded display, in global points.
-    pub display: Rect,
+    display: Rect,
     pub min_zoom: f64,
     pub max_zoom: f64,
     /// How quickly the zoom catches up with its target (per second; higher is snappier).
@@ -21,11 +21,10 @@ pub struct RecordingViewport {
     /// How quickly the area glides to the cursor while following (per second).
     pub follow_response: f64,
 
-    pub target_zoom: f64,
-    /// The zoom in use right now. Swift spells the setter `zoom(by:)`; in Rust the method is
-    /// `zoom_by` because a field and a method cannot share the name `zoom`.
-    pub zoom: f64,
-    pub center: Point,
+    target_zoom: f64,
+    /// The zoom in use right now.
+    zoom: f64,
+    center: Point,
     target_center: Point,
 }
 
@@ -43,6 +42,26 @@ impl RecordingViewport {
             center,
             target_center: center,
         }
+    }
+
+    /// The recorded display, in global points.
+    pub fn display(&self) -> Rect {
+        self.display
+    }
+
+    /// The zoom the area is easing toward.
+    pub fn target_zoom(&self) -> f64 {
+        self.target_zoom
+    }
+
+    /// The zoom in use right now.
+    pub fn zoom(&self) -> f64 {
+        self.zoom
+    }
+
+    /// The centre of the area, before it is clamped to the display.
+    pub fn center(&self) -> Point {
+        self.center
     }
 
     /// Change the target zoom by a factor of e^amount (positive zooms in).
