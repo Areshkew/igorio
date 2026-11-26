@@ -206,6 +206,36 @@ The pile should not get in the user's way. The default card is 80 x 60 logical p
   value passed to the renderer (in `Scene`) and to the follower, which uses the card
   box to flip at screen edges. The hint text size does not change.
 
+## Shortcuts the user chooses
+
+Every action that has a keyboard shortcut can be changed, or left without one, in the
+settings window. Stored as `shortcuts` in `settings.json`; a change applies at once.
+
+| Action | Default | Available |
+|---|---|---|
+| Restore last screenshot | none | now |
+| Discard top card (same as one shake) | none | now |
+| Discard all cards | none | now |
+| Open settings | none | now |
+| New note at the cursor | none (the gesture is hold Alt and click) | with M7 |
+| Start or stop recording | Ctrl+Shift+6 | with M8 |
+| Pen | Ctrl+Shift+7 | with M8 |
+| Highlighter | Ctrl+Shift+8 | with M8 |
+
+- Taking a screenshot uses the Windows shortcuts (`Win+Shift+S`, `PrtScn`, `Alt+PrtScn`,
+  `Win+PrtScn`). The app only notices them; they are changed in Windows, not here. The
+  settings window says so next to the Screenshots row.
+- A shortcut is one key with at least one of Ctrl, Alt, Shift, Win. Function keys may be
+  used alone. Keys Windows reserves (for example `Win+L`, `Ctrl+Alt+Del`, `Alt+Tab`) and
+  the screenshot keys are refused, with the reason shown.
+- Two actions cannot share a shortcut. If Windows refuses to register one because another
+  program holds it, the row shows that and the old shortcut stays.
+- Each row has a recorder: click it, press the keys, and it is set; Esc cancels, Backspace
+  clears.
+- Shortcuts are global hotkeys (`RegisterHotKey`), owned by one thread with a message
+  loop. The keys used while drawing (undo, clear, put the pen down) are only active
+  during a recording and are not global.
+
 ## Milestones
 
 Each one ends with a check that must pass before the next starts.
@@ -258,6 +288,7 @@ This is the first usable version.
 ### M5. Settings and guide
 
 Settings JSON, settings window (capability switches, the two folder pickers, card size,
+shortcuts,
 launch at login), first-run guide. The folder settings exist from M3 as JSON values; this adds
 the pickers.
 
