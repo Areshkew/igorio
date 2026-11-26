@@ -98,6 +98,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN,
     WM_XBUTTONUP, XBUTTON1,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    GA_ROOT, GetAncestor, KBDLLHOOKSTRUCT, LLKHF_INJECTED, WH_KEYBOARD_LL, WM_KEYDOWN,
+    WM_SYSKEYDOWN, WindowFromPoint,
+};
 use windows::core::{Error, Result};
 
 /// Most events the queue holds between two drains. Preallocated, so the callback never
@@ -132,7 +136,10 @@ pub enum MouseEvent {
         injected: bool,
     },
     /// `click_count` is 1 for a single click, 2 for the second of a double-click, 3 for a
-    /// triple-click, and so on.
+    /// triple-click, and so on. Injected, pen and touch presses are always 1 and do not take
+    /// part in counting. `window` is the top-level window under the point when the press
+    /// happened (`WindowFromPoint`, 0 for none); presses on different windows never pair.
+    /// `touch` marks a press Windows promoted from pen or touch input.
     Down {
         button: Button,
         x: i32,
@@ -140,6 +147,8 @@ pub enum MouseEvent {
         time: f64,
         click_count: u32,
         injected: bool,
+        window: isize,
+        touch: bool,
     },
     Up {
         button: Button,
@@ -206,16 +215,27 @@ struct LastPress {
     tick: u32,
     count: u32,
     limits: ClickLimits,
+    window: isize,
 }
 
 impl ClickCounter {
     /// Records a press and returns its click count. `tick` is the hook's millisecond time,
     /// which wraps around after 49.7 days. `limits` are those at this press; the next press
-    /// is compared with them.
-    pub fn down(&mut self, button: Button, x: i32, y: i32, tick: u32, limits: ClickLimits) -> u32 {
+    /// is compared with them. `window` is the top-level window under the press: a press on
+    /// another window starts over.
+    pub fn down(
+        &mut self,
+        button: Button,
+        x: i32,
+        y: i32,
+        tick: u32,
+        limits: ClickLimits,
+        window: isize,
+    ) -> u32 {
         let count = match self.last {
             Some(last)
                 if last.button == button
+                    && last.window == window
                     && tick.wrapping_sub(last.tick) <= last.limits.time_ms
                     && x.abs_diff(last.x) <= last.limits.width.max(0) as u32 / 2
                     && y.abs_diff(last.y) <= last.limits.height.max(0) as u32 / 2 =>
@@ -231,9 +251,40 @@ impl ClickCounter {
             tick,
             count,
             limits,
+            window,
         });
         count
     }
+}
+
+impl ClickCounter {
+    /// A press as the hook sees it. Synthetic, pen and touch presses (`skip`) neither count
+    /// nor reset the count: they are 1 and the counter is left as it was. `limits` is only
+    /// read for presses that count.
+    pub fn press(
+        &mut self,
+        button: Button,
+        (x, y): (i32, i32),
+        tick: u32,
+        limits: impl FnOnce() -> ClickLimits,
+        window: isize,
+        skip: bool,
+    ) -> u32 {
+        if skip {
+            return 1;
+        }
+        self.down(button, x, y, tick, limits(), window)
+    }
+}
+
+/// `dwExtraInfo` of mouse messages Windows promoted from pen or touch input
+/// (`MI_WP_SIGNATURE`), under `SIGNATURE_MASK`.
+pub const PEN_OR_TOUCH_SIGNATURE: usize = 0xFF51_5700;
+const SIGNATURE_MASK: usize = 0xFFFF_FF00;
+
+/// Was this mouse event promoted from pen or touch input?
+pub fn is_pen_or_touch(extra_info: usize) -> bool {
+    extra_info & SIGNATURE_MASK == PEN_OR_TOUCH_SIGNATURE
 }
 
 /// An auto-reset event handle, closed on drop.
@@ -345,8 +396,16 @@ fn handle(message: u32, info: &MSLLHOOKSTRUCT, started: Instant) {
                     WM_MBUTTONDOWN => Button::Middle,
                     _ => xbutton,
                 };
-                let limits = click_limits(info.pt);
-                let click_count = context.clicks.down(button, x, y, info.time, limits);
+                let window = top_window_at(info.pt);
+                let touch = is_pen_or_touch(info.dwExtraInfo);
+                let click_count = context.clicks.press(
+                    button,
+                    (x, y),
+                    info.time,
+                    || click_limits(info.pt),
+                    window,
+                    injected || touch,
+                );
                 Some(MouseEvent::Down {
                     button,
                     x,
@@ -354,6 +413,8 @@ fn handle(message: u32, info: &MSLLHOOKSTRUCT, started: Instant) {
                     time,
                     click_count,
                     injected,
+                    window,
+                    touch,
                 })
             }
             WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => {
@@ -389,6 +450,25 @@ fn handle(message: u32, info: &MSLLHOOKSTRUCT, started: Instant) {
         let spent = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         shared.max_callback_ns.fetch_max(spent, Relaxed);
     });
+}
+
+/// The top-level window at `point`. `WindowFromPoint` reads window manager state and only
+/// sends `WM_NCHITTEST` to windows of the calling thread, and this thread owns none, so it
+/// never waits on another process; it costs microseconds, and only presses pay for it.
+fn top_window_at(point: POINT) -> isize {
+    // SAFETY: value arguments only.
+    unsafe {
+        let child = WindowFromPoint(point);
+        if child.is_invalid() {
+            return 0;
+        }
+        let root = GetAncestor(child, GA_ROOT);
+        if root.is_invalid() {
+            child.0 as isize
+        } else {
+            root.0 as isize
+        }
+    }
 }
 
 /// The double-click time and rectangle at `point`, the rectangle scaled for the DPI of the
@@ -630,6 +710,134 @@ impl MouseHook {
     }
 }
 
+// MARK: Key presses
+
+/// Counts the user's key presses (`WH_KEYBOARD_LL` on its own thread, rule 1): the drop
+/// router stops a delivery when the user starts typing. Only a counter is kept, never which
+/// key. Injected keys (ours and others') and the modifier keys do not count; modifiers are
+/// waited out by the paste itself.
+pub struct KeyWatch {
+    presses: Arc<AtomicU64>,
+    thread: Option<JoinHandle<()>>,
+    thread_id: u32,
+}
+
+thread_local! {
+    static KEY_PRESSES: RefCell<Option<Arc<AtomicU64>>> = const { RefCell::new(None) };
+}
+
+/// Virtual keys that only modify others (Shift, Ctrl, Alt, Win, left and right).
+const MODIFIER_KEYS: &[u32] = &[
+    0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
+];
+
+/// Does a low-level key event count as the user typing?
+pub fn counts_as_typing(message: u32, vk: u32, flags: u32, extra_info: usize) -> bool {
+    (message == WM_KEYDOWN || message == WM_SYSKEYDOWN)
+        && flags & LLKHF_INJECTED.0 == 0
+        && extra_info != crate::input::INJECTED_MARKER
+        && !MODIFIER_KEYS.contains(&vk)
+}
+
+unsafe extern "system" fn key_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code == HC_ACTION as i32 {
+        // SAFETY: for HC_ACTION, `lparam` points to a KBDLLHOOKSTRUCT valid for this call.
+        let info = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        if counts_as_typing(wparam.0 as u32, info.vkCode, info.flags.0, info.dwExtraInfo) {
+            let _ = catch_unwind(|| {
+                KEY_PRESSES.with(|cell| {
+                    if let Ok(cell) = cell.try_borrow()
+                        && let Some(presses) = cell.as_ref()
+                    {
+                        presses.fetch_add(1, Relaxed);
+                    }
+                })
+            });
+        }
+    }
+    // SAFETY: passes the hook's own arguments on unchanged.
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+impl KeyWatch {
+    /// Starts the keyboard hook thread. Returns once the hook is set or failed.
+    pub fn start() -> Result<KeyWatch> {
+        let presses = Arc::new(AtomicU64::new(0));
+        let thread_presses = presses.clone();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<u32>>();
+        let thread = thread::Builder::new()
+            .name("key-hook".into())
+            .spawn(move || {
+                let mut msg = MSG::default();
+                // SAFETY: plain calls on this thread; `PeekMessageW` creates its queue.
+                let (thread_id, module) = unsafe {
+                    let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+                    (GetCurrentThreadId(), GetModuleHandleW(None))
+                };
+                KEY_PRESSES.with(|cell| *cell.borrow_mut() = Some(thread_presses));
+                // SAFETY: `key_proc` matches HOOKPROC and lives for the whole program.
+                let hook = module.and_then(|module| unsafe {
+                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(key_proc), Some(module.into()), 0)
+                });
+                let hook = match hook {
+                    Ok(hook) => hook,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(thread_id));
+                // SAFETY: as in `run`.
+                unsafe {
+                    while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                        if msg.hwnd.is_invalid() && msg.message == WM_STOP {
+                            break;
+                        }
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    // SAFETY: set by this thread above, removed once.
+                    let _ = UnhookWindowsHookEx(hook);
+                }
+            })
+            .map_err(|_| Error::from(E_FAIL))?;
+        match ready_rx.recv() {
+            Ok(Ok(thread_id)) => Ok(KeyWatch {
+                presses,
+                thread: Some(thread),
+                thread_id,
+            }),
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                Err(error)
+            }
+            Err(_) => Err(Error::from(E_FAIL)),
+        }
+    }
+
+    /// Key presses counted since start.
+    pub fn presses(&self) -> u64 {
+        self.presses.load(Relaxed)
+    }
+}
+
+impl Drop for KeyWatch {
+    fn drop(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        // SAFETY: posts a message with no pointers to a thread of this process.
+        let _ = unsafe { PostThreadMessageW(self.thread_id, WM_STOP, WPARAM(0), LPARAM(0)) };
+        let until = Instant::now() + STOP_TIMEOUT;
+        while !thread.is_finished() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(2));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,28 +849,91 @@ mod tests {
     };
 
     #[test]
+    fn presses_on_different_windows_never_pair() {
+        let mut c = ClickCounter::default();
+        assert_eq!(c.down(Button::Left, 0, 0, 1000, LIMITS, 0x10), 1);
+        // The first click closed a dialog: the second lands on the window it exposed.
+        assert_eq!(c.down(Button::Left, 0, 0, 1100, LIMITS, 0x20), 1);
+        assert_eq!(c.down(Button::Left, 0, 0, 1200, LIMITS, 0x20), 2);
+    }
+
+    #[test]
+    fn injected_and_touch_presses_do_not_take_part_in_counting() {
+        let mut c = ClickCounter::default();
+        assert_eq!(
+            c.press(Button::Left, (0, 0), 1000, || LIMITS, 0x10, false),
+            1
+        );
+        // A synthetic press in between neither counts nor resets.
+        assert_eq!(
+            c.press(Button::Left, (0, 0), 1050, || LIMITS, 0x10, true),
+            1
+        );
+        assert_eq!(
+            c.press(Button::Left, (0, 0), 1100, || LIMITS, 0x10, false),
+            2
+        );
+        // Two synthetic presses are never a double-click.
+        let mut c = ClickCounter::default();
+        assert_eq!(
+            c.press(Button::Left, (0, 0), 1000, || LIMITS, 0x10, true),
+            1
+        );
+        assert_eq!(
+            c.press(Button::Left, (0, 0), 1100, || LIMITS, 0x10, true),
+            1
+        );
+    }
+
+    #[test]
+    fn pen_and_touch_presses_are_recognised() {
+        assert!(is_pen_or_touch(0xFF51_5700));
+        assert!(is_pen_or_touch(0xFF51_5780));
+        assert!(!is_pen_or_touch(0));
+        assert!(!is_pen_or_touch(crate::input::INJECTED_MARKER));
+    }
+
+    #[test]
+    fn only_the_users_non_modifier_keys_count_as_typing() {
+        assert!(counts_as_typing(WM_KEYDOWN, 0x41, 0, 0));
+        assert!(counts_as_typing(WM_SYSKEYDOWN, 0x09, 0, 0));
+        // Ours, other injected keys, key-ups and modifiers do not.
+        assert!(!counts_as_typing(
+            WM_KEYDOWN,
+            0x41,
+            0,
+            crate::input::INJECTED_MARKER
+        ));
+        assert!(!counts_as_typing(WM_KEYDOWN, 0x41, LLKHF_INJECTED.0, 0));
+        assert!(!counts_as_typing(0x0101, 0x41, 0, 0));
+        for vk in [0x10, 0xA0, 0x11, 0xA3, 0x12, 0x5B] {
+            assert!(!counts_as_typing(WM_KEYDOWN, vk, 0, 0), "{vk:#x}");
+        }
+    }
+
+    #[test]
     fn counts_double_and_triple_clicks() {
         let mut c = ClickCounter::default();
-        assert_eq!(c.down(Button::Left, 100, 100, 1000, LIMITS), 1);
-        assert_eq!(c.down(Button::Left, 101, 99, 1200, LIMITS), 2);
-        assert_eq!(c.down(Button::Left, 102, 98, 1700, LIMITS), 3);
+        assert_eq!(c.down(Button::Left, 100, 100, 1000, LIMITS, 0), 1);
+        assert_eq!(c.down(Button::Left, 101, 99, 1200, LIMITS, 0), 2);
+        assert_eq!(c.down(Button::Left, 102, 98, 1700, LIMITS, 0), 3);
     }
 
     #[test]
     fn late_click_starts_over() {
         let mut c = ClickCounter::default();
-        assert_eq!(c.down(Button::Left, 0, 0, 1000, LIMITS), 1);
-        assert_eq!(c.down(Button::Left, 0, 0, 1501, LIMITS), 1);
-        assert_eq!(c.down(Button::Left, 0, 0, 2001, LIMITS), 2);
+        assert_eq!(c.down(Button::Left, 0, 0, 1000, LIMITS, 0), 1);
+        assert_eq!(c.down(Button::Left, 0, 0, 1501, LIMITS, 0), 1);
+        assert_eq!(c.down(Button::Left, 0, 0, 2001, LIMITS, 0), 2);
     }
 
     #[test]
     fn far_click_starts_over() {
         let mut c = ClickCounter::default();
-        assert_eq!(c.down(Button::Left, 0, 0, 1000, LIMITS), 1);
-        assert_eq!(c.down(Button::Left, 3, 0, 1100, LIMITS), 1);
-        assert_eq!(c.down(Button::Left, 3, -3, 1200, LIMITS), 1);
-        assert_eq!(c.down(Button::Left, 1, -1, 1300, LIMITS), 2);
+        assert_eq!(c.down(Button::Left, 0, 0, 1000, LIMITS, 0), 1);
+        assert_eq!(c.down(Button::Left, 3, 0, 1100, LIMITS, 0), 1);
+        assert_eq!(c.down(Button::Left, 3, -3, 1200, LIMITS, 0), 1);
+        assert_eq!(c.down(Button::Left, 1, -1, 1300, LIMITS, 0), 2);
     }
 
     #[test]
@@ -672,27 +943,27 @@ mod tests {
             width: 20,
             ..LIMITS
         };
-        assert_eq!(c.down(Button::Left, 0, 0, 1000, wide), 1);
-        assert_eq!(c.down(Button::Left, 10, 0, 1100, LIMITS), 2);
+        assert_eq!(c.down(Button::Left, 0, 0, 1000, wide, 0), 1);
+        assert_eq!(c.down(Button::Left, 10, 0, 1100, LIMITS, 0), 2);
     }
 
     #[test]
     fn another_button_starts_over() {
         let mut c = ClickCounter::default();
-        assert_eq!(c.down(Button::Left, 0, 0, 1000, LIMITS), 1);
-        assert_eq!(c.down(Button::Right, 0, 0, 1100, LIMITS), 1);
-        assert_eq!(c.down(Button::Left, 0, 0, 1200, LIMITS), 1);
-        assert_eq!(c.down(Button::X1, 0, 0, 1300, LIMITS), 1);
-        assert_eq!(c.down(Button::X2, 0, 0, 1400, LIMITS), 1);
+        assert_eq!(c.down(Button::Left, 0, 0, 1000, LIMITS, 0), 1);
+        assert_eq!(c.down(Button::Right, 0, 0, 1100, LIMITS, 0), 1);
+        assert_eq!(c.down(Button::Left, 0, 0, 1200, LIMITS, 0), 1);
+        assert_eq!(c.down(Button::X1, 0, 0, 1300, LIMITS, 0), 1);
+        assert_eq!(c.down(Button::X2, 0, 0, 1400, LIMITS, 0), 1);
     }
 
     #[test]
     fn tick_wraps_around() {
         let mut c = ClickCounter::default();
-        assert_eq!(c.down(Button::Left, 0, 0, u32::MAX - 100, LIMITS), 1);
-        assert_eq!(c.down(Button::Left, 0, 0, 200, LIMITS), 2);
+        assert_eq!(c.down(Button::Left, 0, 0, u32::MAX - 100, LIMITS, 0), 1);
+        assert_eq!(c.down(Button::Left, 0, 0, 200, LIMITS, 0), 2);
         // A tick before the previous one (out of order) reads as far in the future.
-        assert_eq!(c.down(Button::Left, 0, 0, 100, LIMITS), 1);
+        assert_eq!(c.down(Button::Left, 0, 0, 100, LIMITS, 0), 1);
     }
 
     fn shared() -> Shared {
@@ -725,6 +996,8 @@ mod tests {
             time: 2.5,
             click_count: 1,
             injected: false,
+            window: 0,
+            touch: false,
         };
         let up = MouseEvent::Up {
             button: Button::Left,

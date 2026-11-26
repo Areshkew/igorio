@@ -47,6 +47,7 @@ fn main() -> windows::core::Result<()> {
                     time,
                     click_count,
                     injected,
+                    ..
                 } => {
                     let mark = match click_count {
                         1 => String::new(),
