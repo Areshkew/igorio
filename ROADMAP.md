@@ -15,6 +15,32 @@ About 8,500 lines of Swift plus 1,500 lines of tests. Its `ausm` dependency
   tuned only after testing on Windows.
 - Keyboard: `⌘` becomes `Ctrl`, `⌥` becomes `Alt`. Final shortcut choice is in M7/M8.
 
+## Rules for the Win32 code
+
+From the review of the M0 spikes. The spikes break some of these; do not copy them as is.
+
+1. Low-level hooks run on their own thread. That thread only pumps messages and pushes
+   small events to a channel: no I/O, logging, clipboard, COM or process queries. It
+   always calls `CallNextHookEx`. Windows silently removes a hook that is too slow.
+2. Every call that waits on another process (UI Automation, Shell, clipboard rendering)
+   runs on a worker with a deadline and a cap on the number of calls. Stale requests
+   are dropped.
+3. No thread that owns windows waits for UI Automation. Hits inside our own process are
+   handled before UI Automation is called.
+4. Open the clipboard with a bounded retry, never on the hook or UI thread, and close it
+   quickly. Ignore clipboard updates our own window caused. Read the sequence number
+   after `CloseClipboard`.
+5. Mark staged and restored clipboard data with
+   `ExcludeClipboardContentFromMonitorProcessing`, so pastes stay out of `Win+V`
+   history and cloud clipboard.
+6. Save and restore only clipboard formats on a known list. Skip GDI, metafile, private
+   (0x200 to 0x3FF) and OLE private formats, and cap the total size.
+7. Right before `SendInput`, check the foreground window and the modifier keys again,
+   and fill scan codes.
+8. Set Per-Monitor V2 DPI awareness in the manifest only. Get DPI with
+   `GetDpiForMonitor`. Keep one cached bitmap for drawing, and tick only while
+   something moves.
+
 ## Workspace layout
 
 ```
