@@ -19,6 +19,7 @@ use igorio_app::overlay::{self, Overlay};
 use igorio_app::saver;
 use igorio_app::settings::{self, DefaultFolders, Settings};
 use igorio_app::settings_window::{LiveSettings, SettingsWindow};
+use igorio_app::shortcuts::{Action, Hotkeys};
 use igorio_app::snip::{Snip, SnipEvent};
 use igorio_app::state::FairyState;
 use igorio_app::tray::{MenuItem, Tray};
@@ -81,6 +82,25 @@ impl App {
     fn restore_last(&mut self) {
         self.state.restore_last(hook::now());
         self.dirty = true;
+    }
+
+    /// Runs a global shortcut. `OpenSettings` is handled by the loop, like the tray item.
+    fn shortcut(&mut self, action: Action, now: f64) {
+        match action {
+            Action::RestoreLast => self.restore_last(),
+            Action::DiscardTop | Action::DiscardAll if self.state.is_holding() => {
+                if action == Action::DiscardTop {
+                    self.state.dissolve(now);
+                } else {
+                    self.state.discard_all(now);
+                }
+                // As after a shake: the gesture starts over, so the motion before the key
+                // press counts toward nothing. Unlike a shake, no "discard all" is armed.
+                self.shake.gesture.reset();
+                self.dirty = true;
+            }
+            _ => {}
+        }
     }
 
     fn capture_ui(&mut self, shown: bool, time: f64) {
@@ -495,8 +515,20 @@ fn main() -> windows::core::Result<()> {
     let mut detector = Detector::default();
     // This owner is dropped first on quit, error, and unwind.
     let mut settings_window = SettingsWindow::new(settings_path)?;
+    // Declared after the settings window, so it stops first (bounded) on every way out.
+    let mut hotkeys = match Hotkeys::start(&settings.snapshot.shortcuts) {
+        Ok(hotkeys) => Some(hotkeys),
+        Err(error) => {
+            eprintln!("keyboard shortcuts are off: {error}");
+            None
+        }
+    };
+    let mut presses = Vec::new();
     let mut snip_events = Vec::new();
     let mut wakes = vec![mouse_hook.wake_handle(), settings_window.wake_handle()];
+    if let Some(hotkeys) = &hotkeys {
+        wakes.push(hotkeys.wake_handle());
+    }
     if let Some(drops) = &drops {
         wakes.extend(drops.wake_handles());
     }
@@ -507,6 +539,15 @@ fn main() -> windows::core::Result<()> {
 
     while pump_messages() {
         let now = hook::now();
+        if let Some(hotkeys) = &hotkeys {
+            hotkeys.drain(&mut presses);
+        }
+        for pressed in presses.drain(..) {
+            match pressed.action {
+                Action::OpenSettings => open_settings.set(true),
+                action => app.borrow_mut().shortcut(action, now),
+            }
+        }
         if open_settings.replace(false) && let Err(error) = settings_window.open() {
             eprintln!("could not queue Settings: {error}");
         }
@@ -514,6 +555,9 @@ fn main() -> windows::core::Result<()> {
             settings = saved.into();
             if let Some(drops) = &mut drops {
                 drops.set_settings(&settings.snapshot);
+            }
+            if let Some(hotkeys) = &hotkeys {
+                hotkeys.apply(&settings.snapshot.shortcuts);
             }
             let mut app = app.borrow_mut();
             app.apply_card_size(settings.card_size, now);
@@ -584,6 +628,11 @@ fn main() -> windows::core::Result<()> {
         sleeper.wait(wait, &wakes)?;
     }
     // Put the user's clipboard back if a paste left ours there, then stop the workers.
+    if let Some(hotkeys) = hotkeys.take()
+        && !hotkeys.shutdown()
+    {
+        eprintln!("the shortcut thread did not stop within its shutdown budget");
+    }
     drop(settings_window);
     drop(detector);
     drop(drops);

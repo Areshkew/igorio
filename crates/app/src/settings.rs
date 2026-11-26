@@ -20,6 +20,7 @@ use windows::Win32::UI::Shell::{
 };
 
 use crate::layout::CardSize;
+use crate::shortcuts::Shortcuts;
 
 /// Sub-folder of Documents where notes are kept by default.
 const NOTES_FOLDER_NAME: &str = "Fairy Notes";
@@ -40,6 +41,9 @@ pub struct Settings {
     /// Size of the screenshot cards. An unknown value is ignored and gives the default.
     #[serde(default, deserialize_with = "card_size_or_default")]
     pub card_size: CardSize,
+    /// Action id -> chord text or null. Read leniently: a bad entry gives that action its
+    /// default and leaves the rest alone (see `Shortcuts::from_json`).
+    pub shortcuts: Shortcuts,
 }
 
 /// Reads one card size, falling back to the default for an unknown or malformed value so a
