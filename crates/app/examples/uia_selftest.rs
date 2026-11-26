@@ -151,8 +151,13 @@ fn main() -> ExitCode {
             ms(started.elapsed())
         ),
     );
-    let id = uia.request(Lookup::at(point));
-    let answer = wait_for(&uia, id, Duration::from_secs(1));
+    // A generous deadline: the app under the cursor may be slow, and this check is about
+    // the worker still working, not about speed.
+    let id = uia.request(Lookup {
+        deadline: Duration::from_secs(3),
+        ..Lookup::at(point)
+    });
+    let answer = wait_for(&uia, id, Duration::from_secs(4));
     check(
         "next request still answered",
         matches!(
