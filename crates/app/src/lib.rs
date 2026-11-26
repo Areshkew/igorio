@@ -14,6 +14,7 @@ pub mod input;
 pub mod overlay;
 pub mod saver;
 pub mod settings;
+pub mod snip;
 pub mod state;
 pub mod tray;
 pub mod uia;
