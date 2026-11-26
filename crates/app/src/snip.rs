@@ -2368,10 +2368,12 @@ mod tests {
     #[test]
     fn the_snipping_tools_temp_copy_is_not_a_saved_file() {
         let temp = Path::new(
-            r"C:UsersAppDataLocalPackagesMicrosoftWindows.Client.Core_cw5n1h2txyewyTempStateScreenClip{DBB1584A}.png",
+            r"C:\Users\a\AppData\Local\Packages\MicrosoftWindows.Client.Core_cw5n1h2txyewy\TempState\ScreenClip\{DBB1584A}.png",
         );
         assert!(is_temp_copy(temp));
-        assert!(!is_temp_copy(Path::new(r"C:UsersPicturesScreenshotsScreenshot 1.png")));
+        assert!(!is_temp_copy(Path::new(
+            r"C:\Users\a\Pictures\Screenshots\Screenshot 1.png"
+        )));
     }
 
     fn clipboard_signals() -> Signals {
