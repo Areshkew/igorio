@@ -22,7 +22,7 @@ use igorio_app::tray::{MenuItem, Tray};
 use igorio_core::shake::{ShakeGate, ShakeResult};
 use igorio_kit::Image;
 use tiny_skia::Pixmap;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED};
 use windows::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, INFINITE,
     SYNCHRONIZATION_SYNCHRONIZE, SetWaitableTimer, TIMER_MODIFY_STATE,
@@ -304,12 +304,16 @@ impl Sleeper {
         // `handles` outlive the call.
         unsafe {
             SetWaitableTimer(self.0, &due, 0, None, None, false)?;
-            MsgWaitForMultipleObjectsEx(
+            let result = MsgWaitForMultipleObjectsEx(
                 Some(&handles),
                 INFINITE,
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE,
             );
+            // A failed wait returns at once: end the loop rather than spin.
+            if result == WAIT_FAILED {
+                return Err(windows::core::Error::from_thread());
+            }
         }
         Ok(())
     }
