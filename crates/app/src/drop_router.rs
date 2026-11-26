@@ -71,6 +71,7 @@ use igorio_core::paste_policy::{
 use igorio_kit::HeldCard;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_RBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
 
 use crate::clipboard::{self, ClipError, Clipboard, Done, Payload, Reply};
@@ -111,8 +112,39 @@ pub const MODIFIER_WAIT: f64 = 2.0;
 pub const PREPARE_TIMEOUT: f64 = 4.0;
 /// A stage or restore reply must come within this long.
 pub const REPLY_TIMEOUT: f64 = 3.0;
-/// A restore refused because the clipboard changed is tried this often in all.
-pub const RESTORE_TRIES: u32 = 3;
+/// A restore that could not run (clipboard locked, queue full) is tried again this often,
+/// for this long.
+pub const RESTORE_RETRY: f64 = 0.5;
+pub const RESTORE_GIVE_UP: f64 = 10.0;
+/// A stage request whose reply did not come in time is waited for this long after it was
+/// sent, so a late write can still be undone.
+pub const STAGE_LATE_WAIT: f64 = 10.0;
+/// At quit, how long to wait for the clipboard replies that put the user's clipboard back.
+pub const QUIT_WAIT: Duration = Duration::from_secs(1);
+
+/// Roles (as `uia::map_role` gives them) where a double-click means "open", "maximise" or
+/// "activate", never "paste here": window chrome (title bar, toolbar, status bar and app
+/// bar map to `AXToolbar`), menus, tabs (`AXRadioButton`, `AXTabGroup`), list, tree and
+/// grid items (`AXRow`), buttons, links and value controls. Checked on the hit and its
+/// ancestors unless the hit itself takes text (an address bar sits inside a toolbar).
+pub const ACTIVATING_ROLES: &[&str] = &[
+    "AXToolbar",
+    "AXMenuBar",
+    "AXMenu",
+    "AXMenuItem",
+    "AXMenuButton",
+    "AXButton",
+    "AXLink",
+    "AXRow",
+    "AXRadioButton",
+    "AXTabGroup",
+    "AXCheckBox",
+    "AXPopUpButton",
+    "AXScrollBar",
+    "AXValueIndicator",
+    "AXSlider",
+    "AXIncrementor",
+];
 
 // Hints. The Swift texts, plus the Windows-only refusals.
 pub const HINT_PASTED: &str = "pasted";
@@ -128,6 +160,7 @@ pub const HINT_ELEVATED: &str = "can't reach this window";
 pub const HINT_CLIPBOARD: &str = "can't save your clipboard · still holding it";
 pub const HINT_SLOW: &str = "this app didn't answer · still holding it";
 pub const HINT_FOLDERS_NEXT: &str = "saving to folders comes next";
+pub const HINT_RESTORE_FAILED: &str = "couldn't put your clipboard back";
 
 /// The hint after the user held a modifier through every retry.
 pub fn modifier_hint(modifier: Modifier) -> String {
@@ -180,6 +213,8 @@ pub struct Spot {
     pub canvas: CanvasFacts,
     /// Web content drawn by Chromium.
     pub chromium: bool,
+    /// The hit is window chrome or a control ([`ACTIVATING_ROLES`]) and takes no text.
+    pub activating: bool,
     /// Only with `want_focus`.
     pub focused: Option<Focus>,
 }
@@ -197,6 +232,7 @@ impl Spot {
             web_terminal: false,
             canvas: CanvasFacts::default(),
             chromium: false,
+            activating: false,
             focused: None,
         }
     }
@@ -305,9 +341,64 @@ pub enum ClipDone<S> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipFail {
-    /// `restore`: the clipboard is not at the given sequence number any more.
+    /// `restore`: the guard refused (the clipboard changed since).
     Changed,
+    /// `stage` / `restage` failed after emptying the clipboard, leaving this sequence.
+    Emptied {
+        sequence: u32,
+    },
+    /// The clipboard was locked, the queue full or the request stale: nothing was written;
+    /// worth another try.
+    Retry(String),
     Other(String),
+}
+
+/// What a restore may write over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreGuard {
+    /// Only our staging (`Clipboard::restore_over_staging`).
+    OwnStaging,
+    /// Only the clipboard at this sequence number (after a failed stage emptied it, or after
+    /// a terminal's copy-on-select was adopted).
+    Sequence(u32),
+}
+
+/// The keys that paste in the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteKeys {
+    CtrlV,
+    CtrlShiftV,
+}
+
+/// What each terminal of `uia::TERMINAL_EXES` gets, and why:
+///
+/// | Terminal | Sent | Why |
+/// |---|---|---|
+/// | `WindowsTerminal.exe` | Ctrl+V | its default key bindings paste on Ctrl+V |
+/// | `OpenConsole.exe` | Ctrl+V | Windows Terminal's console host, same bindings |
+/// | `conhost.exe`, `ConsoleWindowClass` | Ctrl+V | "Ctrl key shortcuts" (on by default since Windows 10) paste on Ctrl+V |
+/// | `wezterm-gui.exe` | Ctrl+Shift+V | by default Ctrl+V reaches the program as a literal ^V |
+/// | `alacritty.exe` | Ctrl+Shift+V | by default Ctrl+V reaches the program as a literal ^V |
+///
+/// Fields, documents, canvases and web terminals (VS Code) get Ctrl+V.
+pub const TERMINAL_PASTE_KEYS: &[(&str, PasteKeys)] = &[
+    ("WindowsTerminal.exe", PasteKeys::CtrlV),
+    ("OpenConsole.exe", PasteKeys::CtrlV),
+    ("conhost.exe", PasteKeys::CtrlV),
+    ("wezterm-gui.exe", PasteKeys::CtrlShiftV),
+    ("alacritty.exe", PasteKeys::CtrlShiftV),
+];
+
+/// The paste keys for a target window ([`TERMINAL_PASTE_KEYS`]).
+pub fn paste_keys_for(target: &Target) -> PasteKeys {
+    if !target.is_terminal {
+        return PasteKeys::CtrlV;
+    }
+    let exe = target.exe.as_deref().unwrap_or("");
+    TERMINAL_PASTE_KEYS
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(exe))
+        .map_or(PasteKeys::CtrlV, |(_, keys)| *keys)
 }
 
 // MARK: Env
@@ -325,14 +416,18 @@ pub trait Env {
     fn clip_snapshot(&mut self) -> Result<u64, String>;
     fn clip_stage(&mut self, payload: Payload) -> Result<u64, String>;
     fn clip_restage(&mut self) -> Result<u64, String>;
-    fn clip_restore(&mut self, snap: &Self::Snap, if_sequence: Option<u32>) -> Result<u64, String>;
+    fn clip_restore(&mut self, snap: &Self::Snap, guard: RestoreGuard) -> Result<u64, String>;
     /// Saves the card as a PNG into the pasted folder, off the UI thread; the result comes
     /// as [`Router::saved`] with the returned id.
     fn save_png(&mut self, card: &HeldCard) -> u64;
     /// Is the target (its top-level window, or its process when `window` is 0) in front?
     fn foreground_is(&self, window: isize, pid: u32) -> bool;
+    /// The user's main mouse button is down right now (the real state, not the hook's).
+    fn primary_down(&self) -> bool;
+    /// The top-level window at `point` is a terminal (Win32 only, no UI Automation).
+    fn terminal_at(&self, point: (i32, i32)) -> bool;
     fn press(&mut self, key: Key) -> Sent;
-    fn paste_shortcut(&mut self) -> Sent;
+    fn paste_shortcut(&mut self, keys: PasteKeys) -> Sent;
     /// One debug line. Only written when `FAIRY_DEBUG=1`.
     fn log(&mut self, now: f64, line: &str);
 }
@@ -444,6 +539,10 @@ pub fn spot_from_snapshot(snapshot: &Snapshot, point: (i32, i32)) -> Spot {
     // iTerm's `AXTextArea` does on macOS. Its tabs and title bar have no Text pattern.
     let terminal_text = snapshot.target.is_terminal && e.text_pattern;
     spot.editable_hit = terminal_text || editable_self_or_ancestor(&hit).is_some();
+    spot.activating = !spot.editable_hit
+        && chain
+            .iter()
+            .any(|n| ACTIVATING_ROLES.contains(&n.element().role));
     let at = Point::new(point.0 as f64, point.1 as f64);
     spot.editable = spot.editable_hit || editable_target(at, &hit).is_some();
     spot
@@ -535,19 +634,6 @@ pub fn confirm_after_up(
     }
 }
 
-/// Nobody but us wrote the clipboard since our last write (or since the write we adopted
-/// as the click's own copy-on-select).
-fn untouched(stage: &StageRec, facts: &ClipFacts) -> bool {
-    let Some(staged) = facts.staged_for(stage.ticket) else {
-        return false;
-    };
-    match (staged.overwritten_at, stage.adopted) {
-        (None, _) => true,
-        (Some(_), Some(base)) => facts.last_change.is_none_or(|c| c <= base),
-        (Some(_), None) => false,
-    }
-}
-
 // MARK: Router
 
 #[derive(Debug, Clone, Copy)]
@@ -556,13 +642,45 @@ struct Click {
     at: f64,
 }
 
+/// Where the keys go: the top-level window that was double-clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Aim {
+    /// Process of the top-level window.
+    pid: u32,
+    window: isize,
+    /// Process of the hit element (a UWP app inside its frame host's window).
+    element_pid: u32,
+    keys: PasteKeys,
+}
+
+impl Aim {
+    fn new(target: &Target, element_pid: u32) -> Aim {
+        Aim {
+            pid: target.pid,
+            window: target.window,
+            element_pid,
+            keys: paste_keys_for(target),
+        }
+    }
+
+    /// A read counts as the target taking the paste when its reader is unknown or is the
+    /// target's window process or element process. Chromium and Electron read the clipboard
+    /// in the browser process, which owns the top-level window, so they count.
+    fn is_reader(&self, reader: Option<u32>) -> bool {
+        reader.is_none_or(|pid| pid == self.pid || pid == self.element_pid)
+    }
+}
+
 /// What the double-click's lookup said, kept for the re-check after the release.
 #[derive(Debug, Clone, Copy)]
 struct First {
+    aim: Aim,
+    /// Process of the first hit element; None when the lookup timed out.
     pid: Option<u32>,
     before: CanvasFacts,
     chromium: bool,
-    /// The lookup timed out: the re-check gets [`SLOW_DEADLINE`].
+    /// The lookup timed out: the re-check gets [`SLOW_DEADLINE`] and must find an editable
+    /// element at the click point itself.
     slow: bool,
 }
 
@@ -583,12 +701,6 @@ enum Phase {
         first: First,
     },
     Delivering(Box<Delivery>),
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Aim {
-    pid: u32,
-    window: isize,
 }
 
 struct Delivery {
@@ -640,31 +752,79 @@ enum Flow {
     Done,
 }
 
-/// One staging of the clipboard.
+/// One staging of the clipboard, from the `stage` request on.
 #[derive(Debug, Clone, Copy)]
 struct StageRec {
     ticket: u64,
+    requested_at: f64,
+    /// The `Staged` reply came: our data is on the clipboard.
+    confirmed: bool,
+    /// The stage failed after emptying the clipboard, leaving this sequence number.
+    emptied: Option<u32>,
     sent_at: Option<f64>,
     terminal: bool,
-    /// `last_change` of the foreign write taken for the click's copy-on-select.
+    aim: Aim,
+    /// Reads seen in the facts so far, and those made by the target.
+    seen_reads: u32,
+    reads: u32,
+    /// `last_change` and sequence number of the foreign write taken for the click's own
+    /// copy-on-select.
     adopted: Option<f64>,
+    adopted_seq: Option<u32>,
     guarding: bool,
     restaging: Option<u64>,
+}
+
+impl StageRec {
+    fn new(ticket: u64, now: f64, terminal: bool, aim: Aim) -> StageRec {
+        StageRec {
+            ticket,
+            requested_at: now,
+            confirmed: false,
+            emptied: None,
+            sent_at: None,
+            terminal,
+            aim,
+            seen_reads: 0,
+            reads: 0,
+            adopted: None,
+            adopted_seq: None,
+            guarding: true,
+            restaging: None,
+        }
+    }
 }
 
 /// The user's clipboard, from the moment a delivery saved it until it is back.
 struct Restore<S> {
     snap: S,
     stage: Option<StageRec>,
+    /// An earlier paste's staging, kept while a new stage request is in flight: if that
+    /// request fails without touching the clipboard, the earlier one is still there.
+    prev: Option<StageRec>,
     /// Restore at once (nothing was pasted).
     now_please: bool,
-    /// Restore even though the facts do not show our staging (a failed stage may have left
-    /// the clipboard empty).
-    unconditional: bool,
     restoring: Option<(u64, f64)>,
-    tries: u32,
-    /// The top card failed; a read after this count means the app took it late.
+    /// First restore attempt, and when to try again after a refusal.
+    first_try: Option<f64>,
+    retry_at: Option<f64>,
+    /// The top card failed; a target read after this count means the app took it late.
     late: Option<(CardId, u32)>,
+}
+
+impl<S> Restore<S> {
+    fn new(snap: S) -> Restore<S> {
+        Restore {
+            snap,
+            stage: None,
+            prev: None,
+            now_please: false,
+            restoring: None,
+            first_try: None,
+            retry_at: None,
+            late: None,
+        }
+    }
 }
 
 enum Rem<S> {
@@ -677,11 +837,12 @@ enum Rem<S> {
     Failed,
 }
 
-/// The clipboard as it was at the first mouse-down (`rememberClipboard`).
+/// The clipboard at the first mouse-down (`rememberClipboard`): the sequence number and the
+/// time, and a snapshot only when that click was in a terminal (see `remember_clipboard`).
 struct Remembered<S> {
     sequence: u32,
     at: f64,
-    rem: Rem<S>,
+    rem: Option<Rem<S>>,
 }
 
 #[derive(Default)]
@@ -707,7 +868,6 @@ pub struct Router<S> {
     remembered: Option<Remembered<S>>,
     hover: Hover,
     lookups: Vec<Pending>,
-    buttons_down: bool,
     last_up: Option<f64>,
     phase_wake: Option<f64>,
     restore_wake: Option<f64>,
@@ -726,6 +886,60 @@ fn yes(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 
+/// Nobody but us wrote the clipboard since our last write (or since the write we adopted
+/// as the click's own copy-on-select).
+fn untouched(stage: &StageRec, facts: &ClipFacts) -> bool {
+    let Some(staged) = facts.staged_for(stage.ticket) else {
+        return false;
+    };
+    match (staged.overwritten_at, stage.adopted) {
+        (None, _) => true,
+        (Some(_), Some(base)) => facts.last_change.is_none_or(|c| c <= base),
+        (Some(_), None) => false,
+    }
+}
+
+/// How to put the user's clipboard back over this staging, or None when nothing of ours is
+/// there to replace: only what we replaced is restored.
+fn restore_guard(stage: &StageRec, facts: &ClipFacts) -> Option<RestoreGuard> {
+    if let Some(sequence) = stage.emptied {
+        return Some(RestoreGuard::Sequence(sequence));
+    }
+    if !stage.confirmed || !untouched(stage, facts) {
+        return None;
+    }
+    Some(match stage.adopted_seq {
+        // The terminal's copy-on-select replaced our data; it is restored over only while
+        // nothing newer came.
+        Some(sequence) => RestoreGuard::Sequence(sequence),
+        None => RestoreGuard::OwnStaging,
+    })
+}
+
+/// Adds the reads that appeared since the last look; reads by another process (a clipboard
+/// manager, the user pasting elsewhere) are not the target taking the paste.
+fn count_reads<E: Env>(stage: &mut StageRec, facts: &ClipFacts, now: f64, env: &mut E) {
+    let Some(staged) = facts.staged_for(stage.ticket) else {
+        return;
+    };
+    if staged.reads <= stage.seen_reads {
+        return;
+    }
+    let new = staged.reads - stage.seen_reads;
+    stage.seen_reads = staged.reads;
+    if stage.aim.is_reader(staged.last_reader) {
+        stage.reads += new;
+    } else {
+        env.log(
+            now,
+            &format!(
+                "{new} read(s) by pid {:?}, not the target → not counted",
+                staged.last_reader
+            ),
+        );
+    }
+}
+
 impl<S: Clone> Router<S> {
     /// `primary` is the physical button of the user's main click (Right when the buttons
     /// are swapped).
@@ -737,7 +951,6 @@ impl<S: Clone> Router<S> {
             remembered: None,
             hover: Hover::default(),
             lookups: Vec::new(),
-            buttons_down: false,
             last_up: None,
             phase_wake: None,
             restore_wake: None,
@@ -802,12 +1015,11 @@ impl<S: Clone> Router<S> {
                 click_count,
                 injected: false,
             } if button == self.primary => {
-                self.buttons_down = true;
                 if !state.is_holding() {
                     return;
                 }
                 match click_count {
-                    1 => self.remember_clipboard(time, env),
+                    1 => self.remember_clipboard((x, y), time, env),
                     2 => self.double_click((x, y), time, state, env),
                     _ => {}
                 }
@@ -819,7 +1031,6 @@ impl<S: Clone> Router<S> {
                 injected: false,
                 ..
             } if button == self.primary => {
-                self.buttons_down = false;
                 self.last_up = Some(time);
                 self.run(time, state, env);
             }
@@ -923,28 +1134,93 @@ impl<S: Clone> Router<S> {
         self.run(now, state, env);
     }
 
-    /// The app quits: put the user's clipboard back if ours is still there. Returns the
-    /// restore's ticket; the caller waits a moment for its reply before stopping the
-    /// clipboard thread.
+    // MARK: Quit
+
+    /// The app quits: stop any delivery and put the user's clipboard back if ours is still
+    /// there. Returns a clipboard ticket to wait for (a stage still in flight, or the
+    /// restore); feed its reply to [`Router::quit_reply`], which returns the next one.
     pub fn quit<E: Env<Snap = S>>(&mut self, now: f64, env: &mut E) -> Option<u64> {
+        if self.busy() {
+            env.log(now, "quit: the delivery stops here");
+        }
         self.phase = Phase::Idle;
-        let restore = self.restore.take()?;
-        let stage = restore.stage?;
+        if let Some(restore) = self.restore.as_mut() {
+            restore.now_please = true;
+            restore.retry_at = None;
+        }
+        self.quit_step(now, env)
+    }
+
+    /// A clipboard reply during quit. Returns the next ticket to wait for.
+    pub fn quit_reply<E: Env<Snap = S>>(
+        &mut self,
+        reply: ClipReply<S>,
+        now: f64,
+        env: &mut E,
+    ) -> Option<u64> {
+        let restore = self.restore.as_mut()?;
+        if let Some(stage) = restore.stage.as_mut()
+            && stage.ticket == reply.ticket
+            && !stage.confirmed
+            && stage.emptied.is_none()
+        {
+            match reply.result {
+                Ok(ClipDone::Staged { .. }) => stage.confirmed = true,
+                Err(ClipFail::Emptied { sequence }) => stage.emptied = Some(sequence),
+                _ => restore.stage = restore.prev.take(),
+            }
+        } else if restore.restoring.is_some_and(|(t, _)| t == reply.ticket) {
+            restore.restoring = None;
+            match reply.result {
+                Ok(_) => {
+                    env.log(now, "quit: clipboard restored");
+                    self.restore = None;
+                    return None;
+                }
+                Err(ClipFail::Retry(why)) => {
+                    env.log(now, &format!("quit: restore refused ({why}), again"))
+                }
+                Err(why) => {
+                    env.log(now, &format!("quit: restore refused ({why:?}) → leave it"));
+                    self.restore = None;
+                    return None;
+                }
+            }
+        }
+        self.quit_step(now, env)
+    }
+
+    fn quit_step<E: Env<Snap = S>>(&mut self, now: f64, env: &mut E) -> Option<u64> {
+        let restore = self.restore.as_mut()?;
+        if let Some((ticket, _)) = restore.restoring {
+            return Some(ticket);
+        }
+        let Some(stage) = restore.stage else {
+            self.restore = None;
+            return None;
+        };
+        if !stage.confirmed && stage.emptied.is_none() {
+            env.log(now, "quit: waiting for the stage in flight");
+            return Some(stage.ticket);
+        }
         let facts = env.clip_facts(now);
-        if !untouched(&stage, &facts) {
+        let Some(guard) = restore_guard(&stage, &facts) else {
             env.log(
                 now,
                 "quit: the clipboard changed since the paste → leave it",
             );
+            self.restore = None;
             return None;
-        }
-        match env.clip_restore(&restore.snap, Some(facts.sequence)) {
+        };
+        match env.clip_restore(&restore.snap, guard) {
             Ok(ticket) => {
-                env.log(now, "quit: restoring the clipboard");
+                env.log(now, &format!("quit: restoring the clipboard ({guard:?})"));
+                restore.restoring = Some((ticket, now));
                 Some(ticket)
             }
             Err(why) => {
                 env.log(now, &format!("quit: restore failed: {why}"));
+                self.restore = None;
                 None
             }
         }
@@ -952,37 +1228,47 @@ impl<S: Clone> Router<S> {
 
     // MARK: Double-click
 
-    /// `rememberClipboard`: keep the clipboard as it is before the click's own side
-    /// effects (a terminal copies the selected word on mouse-up).
-    fn remember_clipboard<E: Env<Snap = S>>(&mut self, now: f64, env: &mut E) {
+    /// `rememberClipboard`, on the first mouse-down. Only the sequence number and the time
+    /// are kept: a snapshot here would make apps render large formats on every plain click.
+    ///
+    /// The exception is a click in a terminal. With copy-on-select, the terminal writes the
+    /// double-clicked word on the second mouse-up, after the router's snapshot (taken once
+    /// the double-click is decided, at the second mouse-down), so that case needs nothing.
+    /// But a selection made by an earlier click (and some terminals copy on the first
+    /// mouse-up) can replace the clipboard before the double-click is decided; then the
+    /// copy taken here is the user's clipboard.
+    fn remember_clipboard<E: Env<Snap = S>>(&mut self, point: (i32, i32), now: f64, env: &mut E) {
         if self.restore.is_some() || self.busy() {
             return;
         }
         let sequence = env.clip_facts(now).sequence;
         if let Some(memory) = self.remembered.as_mut() {
             let same = match &memory.rem {
-                Rem::Ready { sequence: s, .. } => *s == sequence,
-                Rem::Waiting(_) => memory.sequence == sequence,
-                Rem::Failed => false,
+                Some(Rem::Ready { sequence: s, .. }) => *s == sequence,
+                Some(Rem::Waiting(_)) => memory.sequence == sequence,
+                _ => false,
             };
             if same {
                 memory.at = now;
                 return;
             }
         }
-        match env.clip_snapshot() {
-            Ok(ticket) => {
-                self.remembered = Some(Remembered {
-                    sequence,
-                    at: now,
-                    rem: Rem::Waiting(ticket),
-                });
+        let rem = if env.terminal_at(point) {
+            match env.clip_snapshot() {
+                Ok(ticket) => Some(Rem::Waiting(ticket)),
+                Err(why) => {
+                    env.log(now, &format!("remember clipboard: {why}"));
+                    None
+                }
             }
-            Err(why) => {
-                env.log(now, &format!("remember clipboard: {why}"));
-                self.remembered = None;
-            }
-        }
+        } else {
+            None
+        };
+        self.remembered = Some(Remembered {
+            sequence,
+            at: now,
+            rem,
+        });
     }
 
     fn request(
@@ -1084,37 +1370,40 @@ impl<S: Clone> Router<S> {
             click_count: 2,
             ..DoubleClick::default()
         };
-        let mut first = First {
-            pid: None,
-            before: CanvasFacts::default(),
-            chromium: false,
-            slow: false,
-        };
-        let mut paste_to = None;
+        let mut first = None;
+        let mut surface = Surface::Field;
         let what = match &seen {
             Seen::Spot(spot) => {
+                if spot.activating {
+                    env.log(
+                        now,
+                        &format!(
+                            "double-click at {:?}: {} role {} is window chrome or a control → Ignore",
+                            click.point,
+                            spot.target.exe.as_deref().unwrap_or("?"),
+                            spot.role
+                        ),
+                    );
+                    return;
+                }
                 facts.is_finder = spot.is_shell();
                 facts.finder_drop_spot = spot.drop_spot;
                 facts.editable_under_cursor = spot.editable_hit;
-                first.pid = Some(spot.pid);
-                first.before = spot.canvas;
-                first.chromium = spot.chromium;
-                let surface = if spot.target.is_terminal || spot.web_terminal {
-                    Surface::Terminal
-                } else {
-                    Surface::Field
-                };
-                paste_to = Some((
-                    Aim {
-                        pid: spot.target.pid,
-                        window: spot.target.window,
-                    },
-                    surface,
-                ));
+                first = Some(First {
+                    aim: Aim::new(&spot.target, spot.pid),
+                    pid: Some(spot.pid),
+                    before: spot.canvas,
+                    chromium: spot.chromium,
+                    slow: false,
+                });
+                if spot.target.is_terminal || spot.web_terminal {
+                    surface = Surface::Terminal;
+                }
                 format!(
-                    "{} pid {} role {} editable={} terminal={} shell={:?} drop-spot={} canvas={}",
+                    "{} pid {} window {:#x} role {} editable={} terminal={} shell={:?} drop-spot={} canvas={}",
                     spot.target.exe.as_deref().unwrap_or("?"),
                     spot.pid,
+                    spot.target.window,
                     spot.role,
                     yes(spot.editable_hit),
                     yes(spot.target.is_terminal || spot.web_terminal),
@@ -1140,48 +1429,56 @@ impl<S: Clone> Router<S> {
                 // A terminal too busy to answer is still a terminal (`silentTerminal`).
                 facts.silent_terminal = target.is_terminal;
                 facts.is_finder = target.shell.is_some();
-                first.pid = None;
-                first.slow = true;
-                paste_to = Some((
-                    Aim {
-                        pid: target.pid,
-                        window: target.window,
-                    },
-                    Surface::Terminal,
-                ));
+                first = Some(First {
+                    aim: Aim::new(target, target.pid),
+                    pid: None,
+                    before: CanvasFacts::default(),
+                    chromium: false,
+                    slow: true,
+                });
+                surface = Surface::Terminal;
                 format!(
-                    "no answer in time from {} pid {} terminal={}",
+                    "no answer in time from {} pid {} window {:#x} terminal={}",
                     target.exe.as_deref().unwrap_or("?"),
                     target.pid,
+                    target.window,
                     yes(target.is_terminal)
                 )
             }
-            Seen::Failed(why) => format!("lookup failed: {why}"),
+            Seen::Failed(why) => {
+                // Nothing is known about the place: never act on it.
+                env.log(
+                    now,
+                    &format!(
+                        "double-click at {:?}: lookup failed ({why}) → Ignore",
+                        click.point
+                    ),
+                );
+                return;
+            }
         };
         let action = drop_policy::decide(&facts);
         env.log(
             now,
             &format!("double-click at {:?}: {what} → {action:?}", click.point),
         );
-        match action {
-            Action::Ignore => {}
-            Action::SaveToFinder => {
+        match (action, first) {
+            (Action::SaveToFinder, _) => {
                 if let Seen::Spot(spot) = &seen {
                     self.save_to_folder(spot, now, state, env);
                 }
             }
-            Action::Paste => {
-                if let Some((aim, surface)) = paste_to {
-                    self.start_delivery(aim, surface, false, click.at, now, state, env);
-                }
+            (Action::Paste, Some(first)) => {
+                self.start_delivery(first.aim, surface, false, click.at, now, state, env);
             }
-            Action::CheckFocusAfterMouseUp => {
+            (Action::CheckFocusAfterMouseUp, Some(first)) => {
                 self.phase = Phase::AwaitUp {
                     click,
                     first,
                     ready_at: None,
                 };
             }
+            _ => {}
         }
     }
 
@@ -1255,7 +1552,32 @@ impl<S: Clone> Router<S> {
                 return;
             }
         };
-        let confirmed = confirm_after_up(&spot, click.point, first.pid, first.before);
+        // The double-click opened or switched something (a file from an Open dialog, a
+        // maximised window): what is under the point now is not what was clicked.
+        if spot.target.window != first.aim.window {
+            env.log(
+                now,
+                &format!(
+                    "after mouse-up: window {:#x} is not the double-clicked {:#x} → ignore",
+                    spot.target.window, first.aim.window
+                ),
+            );
+            return;
+        }
+        let confirmed = if first.slow {
+            // Nothing was known at the double-click: only an editable element at the click
+            // point itself counts, never a focused field somewhere else.
+            if spot.editable_hit && !spot.activating {
+                Confirmed::Paste {
+                    surface: spot.surface(),
+                    dismiss_editor: false,
+                }
+            } else {
+                Confirmed::Ignore
+            }
+        } else {
+            confirm_after_up(&spot, click.point, first.pid, first.before)
+        };
         let focused = spot.focused.is_some_and(|f| f.editable);
         env.log(
             now,
@@ -1280,8 +1602,8 @@ impl<S: Clone> Router<S> {
             return;
         }
         let aim = Aim {
-            pid: spot.target.pid,
-            window: spot.target.window,
+            element_pid: spot.pid,
+            ..first.aim
         };
         self.start_delivery(aim, surface, dismiss_editor, now, now, state, env);
     }
@@ -1311,8 +1633,8 @@ impl<S: Clone> Router<S> {
             // user's clipboard is the real one. Its restore is taken over.
             restore.restoring = None;
             restore.now_please = false;
-            restore.unconditional = false;
-            restore.tries = 0;
+            restore.first_try = None;
+            restore.retry_at = None;
             env.log(now, "clipboard: taking over the pending restore");
             None
         } else {
@@ -1338,7 +1660,7 @@ impl<S: Clone> Router<S> {
                 first: true,
                 movie: false,
                 started: clicked_at,
-                payload: Pay::Ready(Payload::Text(String::new())),
+                payload: Pay::Failed,
                 is_path: false,
                 step: Step::Prepare,
             },
@@ -1346,10 +1668,11 @@ impl<S: Clone> Router<S> {
         env.log(
             now,
             &format!(
-                "deliver {} card(s) to pid {} window {:#x} as {surface:?}{}",
+                "deliver {} card(s) to pid {} window {:#x} as {surface:?} with {:?}{}",
                 delivery.ids.len(),
                 aim.pid,
                 aim.window,
+                aim.keys,
                 if dismiss_editor {
                     " (close the text box first)"
                 } else {
@@ -1363,8 +1686,9 @@ impl<S: Clone> Router<S> {
         self.phase = Phase::Delivering(Box::new(delivery));
     }
 
-    /// The remembered snapshot if `use_remembered_clipboard` says so, else a fresh one.
-    /// Ok(None): ready in `self.restore`. Ok(Some(ticket)): a reply to wait for.
+    /// The copy remembered at the first click if `use_remembered_clipboard` says so, else a
+    /// fresh snapshot. Ok(None): ready in `self.restore`. Ok(Some(ticket)): a reply to wait
+    /// for.
     fn take_remembered<E: Env<Snap = S>>(
         &mut self,
         now: f64,
@@ -1372,20 +1696,21 @@ impl<S: Clone> Router<S> {
     ) -> Result<Option<u64>, ()> {
         let current = env.clip_facts(now).sequence;
         if let Some(memory) = self.remembered.take() {
-            let (sequence, usable) = match &memory.rem {
-                Rem::Ready { sequence, .. } => (*sequence, true),
-                Rem::Waiting(_) => (memory.sequence, true),
-                Rem::Failed => (memory.sequence, false),
+            let sequence = match &memory.rem {
+                Some(Rem::Ready { sequence, .. }) => Some(*sequence),
+                Some(Rem::Waiting(_)) => Some(memory.sequence),
+                _ => None,
             };
             let age = now - memory.at;
-            if usable && paste_policy::use_remembered_clipboard(Some(sequence), current, Some(age))
+            if let Some(sequence) = sequence
+                && paste_policy::use_remembered_clipboard(Some(sequence), current, Some(age))
             {
                 env.log(
                     now,
                     &format!("clipboard: using the copy from the first click (seq {sequence}, now {current}, {age:.2}s old)"),
                 );
                 match memory.rem {
-                    Rem::Ready { snap, lost, .. } => {
+                    Some(Rem::Ready { snap, lost, .. }) => {
                         if let Some(lost) = lost {
                             env.log(
                                 now,
@@ -1393,19 +1718,11 @@ impl<S: Clone> Router<S> {
                             );
                             return Err(());
                         }
-                        self.restore = Some(Restore {
-                            snap,
-                            stage: None,
-                            now_please: false,
-                            unconditional: false,
-                            restoring: None,
-                            tries: 0,
-                            late: None,
-                        });
+                        self.restore = Some(Restore::new(snap));
                         return Ok(None);
                     }
-                    Rem::Waiting(ticket) => return Ok(Some(ticket)),
-                    Rem::Failed => {}
+                    Some(Rem::Waiting(ticket)) => return Ok(Some(ticket)),
+                    _ => {}
                 }
             }
         }
@@ -1472,6 +1789,36 @@ impl<S: Clone> Router<S> {
         true
     }
 
+    /// Ends the delivery. With a hint the card wobbles; without, it stays quietly.
+    fn end<E: Env<Snap = S>>(
+        &mut self,
+        d: &Delivery,
+        hint: Option<&str>,
+        why: &str,
+        now: f64,
+        state: &mut FairyState,
+        env: &mut E,
+    ) -> Flow {
+        env.log(
+            now,
+            &format!(
+                "card {}: {why} → {}",
+                d.job.id.0,
+                hint.unwrap_or("(no hint)")
+            ),
+        );
+        if let Some(restore) = self.restore.as_mut()
+            && restore.stage.is_some_and(|s| s.sent_at.is_none())
+        {
+            restore.now_please = true;
+        }
+        if let Some(hint) = hint {
+            state.reject(hint, now);
+            self.state_changed = true;
+        }
+        Flow::Done
+    }
+
     fn fail<E: Env<Snap = S>>(
         &mut self,
         d: &Delivery,
@@ -1481,15 +1828,7 @@ impl<S: Clone> Router<S> {
         state: &mut FairyState,
         env: &mut E,
     ) -> Flow {
-        env.log(now, &format!("card {}: {why} → \"{hint}\"", d.job.id.0));
-        if let Some(restore) = self.restore.as_mut()
-            && restore.stage.is_some_and(|s| s.sent_at.is_none())
-        {
-            restore.now_please = true;
-        }
-        state.reject(hint, now);
-        self.state_changed = true;
-        Flow::Done
+        self.end(d, Some(hint), why, now, state, env)
     }
 
     fn fail_hint(d: &Delivery) -> &'static str {
@@ -1524,15 +1863,34 @@ impl<S: Clone> Router<S> {
                 if matches!(d.job.payload, Pay::Failed) {
                     return self.fail(d, Self::fail_hint(d), "no payload", now, state, env);
                 }
-                let elapsed = now - d.job.started;
+                // The button must be up (focus and the selection are final). Still down after
+                // the timeout means a drag (select by words, a touchpad double-tap-drag): the
+                // gesture is not a drop. The real button state is read, since the hook does
+                // not see a release over an elevated window.
+                let up_deadline = d.job.started + paste_policy::MOUSE_UP_TIMEOUT;
+                if env.primary_down() {
+                    if now >= up_deadline {
+                        return self.end(
+                            d,
+                            None,
+                            "the button is still down (a drag)",
+                            now,
+                            state,
+                            env,
+                        );
+                    }
+                    return Flow::Wait(Some(
+                        up_deadline.min(now + paste_policy::MOUSE_UP_POLL_INTERVAL),
+                    ));
+                }
                 if d.terminal {
                     // Wait until the clicking is over and the terminal's copy-on-select landed.
                     let facts = env.clip_facts(now);
                     let since_up = self.last_up.map_or(f64::INFINITY, |t| now - t);
                     let since_change = facts.last_change.map(|t| now - t);
                     match TerminalSettle::default().step(
-                        elapsed,
-                        self.buttons_down,
+                        now - d.job.started,
+                        false,
                         since_up,
                         since_change,
                     ) {
@@ -1545,15 +1903,8 @@ impl<S: Clone> Router<S> {
                         }
                     }
                 } else {
-                    match paste_policy::mouse_up_step(elapsed, self.buttons_down) {
-                        MouseUpStep::Wait => {
-                            Flow::Wait(Some(d.job.started + paste_policy::MOUSE_UP_TIMEOUT))
-                        }
-                        MouseUpStep::Proceed => {
-                            d.job.step = Step::AfterUp(now + paste_policy::AFTER_MOUSE_UP_DELAY);
-                            Flow::Again
-                        }
-                    }
+                    d.job.step = Step::AfterUp(now + paste_policy::AFTER_MOUSE_UP_DELAY);
+                    Flow::Again
                 }
             }
             Step::AfterUp(until) => {
@@ -1577,7 +1928,8 @@ impl<S: Clone> Router<S> {
                     d.job.step = Step::Keys { keys, since: now };
                     return Flow::Again;
                 }
-                if now - since >= paste_policy::ACTIVATION_TIMEOUT {
+                let give_up = since + paste_policy::ACTIVATION_TIMEOUT;
+                if now >= give_up {
                     return self.fail(
                         d,
                         Self::fail_hint(d),
@@ -1587,7 +1939,7 @@ impl<S: Clone> Router<S> {
                         env,
                     );
                 }
-                Flow::Wait(Some(now + ACTIVATION_POLL))
+                Flow::Wait(Some(give_up.min(now + ACTIVATION_POLL)))
             }
             Step::Keys { mut keys, since } => {
                 while let Some(&key) = keys.first() {
@@ -1603,7 +1955,8 @@ impl<S: Clone> Router<S> {
                     }
                     match env.press(key) {
                         Sent::Blocked(modifier) => {
-                            if now - since >= MODIFIER_WAIT {
+                            let give_up = since + MODIFIER_WAIT;
+                            if now >= give_up {
                                 let hint = modifier_hint(modifier);
                                 return self.fail(
                                     d,
@@ -1615,7 +1968,7 @@ impl<S: Clone> Router<S> {
                                 );
                             }
                             d.job.step = Step::Keys { keys, since };
-                            return Flow::Wait(Some(now + MODIFIER_POLL));
+                            return Flow::Wait(Some(give_up.min(now + MODIFIER_POLL)));
                         }
                         sent => {
                             env.log(now, &format!("pressed {key:?}: {sent:?}"));
@@ -1642,20 +1995,16 @@ impl<S: Clone> Router<S> {
                 let Pay::Ready(payload) = &d.job.payload else {
                     return self.fail(d, Self::fail_hint(d), "no payload", now, state, env);
                 };
+                if self.restore.is_none() {
+                    return self.fail(d, HINT_CLIPBOARD, "no saved clipboard", now, state, env);
+                }
                 // Write the clipboard only now: a terminal's copy-on-select on the mouse-up
                 // would replace an earlier write.
                 match env.clip_stage(payload.clone()) {
                     Ok(ticket) => {
                         if let Some(restore) = self.restore.as_mut() {
-                            restore.stage = Some(StageRec {
-                                ticket,
-                                sent_at: None,
-                                terminal: d.terminal,
-                                adopted: None,
-                                guarding: true,
-                                restaging: None,
-                            });
-                            restore.late = None;
+                            restore.prev = restore.stage.take();
+                            restore.stage = Some(StageRec::new(ticket, now, d.terminal, d.aim));
                         }
                         d.job.step = Step::Staging { ticket, since: now };
                         Flow::Wait(Some(now + REPLY_TIMEOUT))
@@ -1671,10 +2020,19 @@ impl<S: Clone> Router<S> {
                 }
             }
             Step::Staging { since, .. } => {
-                if now - since >= REPLY_TIMEOUT {
-                    return self.fail(d, Self::fail_hint(d), "no stage reply", now, state, env);
+                let give_up = since + REPLY_TIMEOUT;
+                if now >= give_up {
+                    // The request may still run: the restore waits for its reply.
+                    return self.fail(
+                        d,
+                        Self::fail_hint(d),
+                        "no stage reply in time (the restore waits for it)",
+                        now,
+                        state,
+                        env,
+                    );
                 }
-                Flow::Wait(Some(since + REPLY_TIMEOUT))
+                Flow::Wait(Some(give_up))
             }
             Step::Send(since) => {
                 // Rule 7: the foreground and the modifiers are checked right before.
@@ -1682,22 +2040,23 @@ impl<S: Clone> Router<S> {
                     return self.fail(
                         d,
                         Self::fail_hint(d),
-                        "the target left the front before Ctrl+V",
+                        "the target left the front before the paste keys",
                         now,
                         state,
                         env,
                     );
                 }
-                match env.paste_shortcut() {
+                match env.paste_shortcut(d.aim.keys) {
                     Sent::Blocked(modifier) => {
-                        if now - since >= MODIFIER_WAIT {
+                        let give_up = since + MODIFIER_WAIT;
+                        if now >= give_up {
                             let hint = modifier_hint(modifier);
                             return self.fail(d, &hint, "a modifier stayed down", now, state, env);
                         }
-                        Flow::Wait(Some(now + MODIFIER_POLL))
+                        Flow::Wait(Some(give_up.min(now + MODIFIER_POLL)))
                     }
                     sent => {
-                        env.log(now, &format!("sent Ctrl+V: {sent:?}"));
+                        env.log(now, &format!("sent {:?}: {sent:?}", d.aim.keys));
                         if let Some(stage) = self.restore.as_mut().and_then(|r| r.stage.as_mut()) {
                             stage.sent_at = Some(now);
                         }
@@ -1709,13 +2068,10 @@ impl<S: Clone> Router<S> {
             Step::Watch(sent_at) => {
                 let facts = env.clip_facts(now);
                 self.reconcile(&facts, now, env);
-                let ticket = self
+                let reads = self
                     .restore
                     .as_ref()
                     .and_then(|r| r.stage)
-                    .map(|s| s.ticket);
-                let reads = ticket
-                    .and_then(|t| facts.staged_for(t))
                     .map_or(0, |s| s.reads);
                 let canvas = matches!(d.surface, Surface::Canvas | Surface::Document);
                 let rules = OutcomeRules::new(false, canvas);
@@ -1734,7 +2090,10 @@ impl<S: Clone> Router<S> {
                         };
                         env.log(
                             now,
-                            &format!("card {}: read {reads} format(s) → accepted", d.job.id.0),
+                            &format!(
+                                "card {}: the target read {reads} format(s) → accepted",
+                                d.job.id.0
+                            ),
                         );
                         state.deliver(&[d.job.id], &hint, now);
                         self.state_changed = true;
@@ -1772,7 +2131,7 @@ impl<S: Clone> Router<S> {
                         self.fail(
                             d,
                             hint,
-                            "nothing read the clipboard (still watching for a late read)",
+                            "the target read nothing (still watching for a late read)",
                             now,
                             state,
                             env,
@@ -1807,12 +2166,14 @@ impl<S: Clone> Router<S> {
         Flow::Done
     }
 
-    /// `reconcileClipboard`: someone else wrote the clipboard after we did.
+    /// Counts the target's reads, then `reconcileClipboard`: someone else wrote the
+    /// clipboard after we did.
     fn reconcile<E: Env<Snap = S>>(&mut self, facts: &ClipFacts, now: f64, env: &mut E) {
         let Some(stage) = self.restore.as_mut().and_then(|r| r.stage.as_mut()) else {
             return;
         };
-        if !stage.guarding || stage.restaging.is_some() {
+        count_reads(stage, facts, now, env);
+        if !stage.guarding || stage.restaging.is_some() || !stage.confirmed {
             return;
         }
         let Some(sent) = stage.sent_at else {
@@ -1831,12 +2192,8 @@ impl<S: Clone> Router<S> {
         if stage.adopted.is_some_and(|base| change <= base) {
             return;
         }
-        match paste_policy::overwrite_step(
-            now - sent,
-            staged.reads,
-            staged.rewrites,
-            stage.terminal,
-        ) {
+        match paste_policy::overwrite_step(now - sent, stage.reads, staged.rewrites, stage.terminal)
+        {
             OverwriteStep::Rewrite => match env.clip_restage() {
                 Ok(ticket) => {
                     stage.restaging = Some(ticket);
@@ -1849,6 +2206,7 @@ impl<S: Clone> Router<S> {
             },
             OverwriteStep::Adopt => {
                 stage.adopted = Some(change);
+                stage.adopted_seq = Some(facts.sequence);
                 env.log(
                     now,
                     "selection copied after the paste → still restoring the clipboard",
@@ -1870,94 +2228,106 @@ impl<S: Clone> Router<S> {
     ) {
         let ticket = reply.ticket;
         // A snapshot: the remembered one, a delivery's, or both.
-        if let Ok(ClipDone::Snapshot {
-            snap,
-            sequence,
-            lost,
-        }) = &reply.result
+        if let Some(memory) = self.remembered.as_mut()
+            && matches!(memory.rem, Some(Rem::Waiting(t)) if t == ticket)
         {
-            if let Some(memory) = self.remembered.as_mut()
-                && matches!(memory.rem, Rem::Waiting(t) if t == ticket)
-            {
-                memory.rem = Rem::Ready {
+            memory.rem = Some(match &reply.result {
+                Ok(ClipDone::Snapshot {
+                    snap,
+                    sequence,
+                    lost,
+                }) => Rem::Ready {
                     snap: snap.clone(),
                     sequence: *sequence,
                     lost: lost.clone(),
-                };
-            }
-            if let Phase::Delivering(d) = &mut self.phase
-                && d.clip == Some(ticket)
-            {
-                d.clip = None;
-                if let Some(lost) = lost {
-                    env.log(
-                        now,
-                        &format!("clipboard: saved copy lost {lost} → do not paste"),
-                    );
-                    self.phase = Phase::Idle;
-                    self.phase_wake = None;
-                    state.reject(HINT_CLIPBOARD, now);
-                    self.state_changed = true;
-                    return;
-                }
-                env.log(now, &format!("clipboard: saved (seq {sequence})"));
-                self.restore = Some(Restore {
-                    snap: snap.clone(),
-                    stage: None,
-                    now_please: false,
-                    unconditional: false,
-                    restoring: None,
-                    tries: 0,
-                    late: None,
-                });
-            }
-            return;
+                },
+                _ => Rem::Failed,
+            });
         }
-        if let Err(why) = &reply.result {
-            if let Some(memory) = self.remembered.as_mut()
-                && matches!(memory.rem, Rem::Waiting(t) if t == ticket)
-            {
-                memory.rem = Rem::Failed;
-            }
-            if let Phase::Delivering(d) = &mut self.phase
-                && d.clip == Some(ticket)
-            {
-                env.log(
-                    now,
-                    &format!("clipboard: cannot save it ({why:?}) → do not paste"),
-                );
+        if let Phase::Delivering(d) = &mut self.phase
+            && d.clip == Some(ticket)
+        {
+            d.clip = None;
+            let refuse = match &reply.result {
+                Ok(ClipDone::Snapshot {
+                    snap,
+                    sequence,
+                    lost: None,
+                }) => {
+                    env.log(now, &format!("clipboard: saved (seq {sequence})"));
+                    self.restore = Some(Restore::new(snap.clone()));
+                    None
+                }
+                Ok(ClipDone::Snapshot {
+                    lost: Some(lost), ..
+                }) => Some(format!("the saved copy lost {lost}")),
+                other => Some(format!("cannot save it ({:?})", other.as_ref().err())),
+            };
+            if let Some(why) = refuse {
+                env.log(now, &format!("clipboard: {why} → do not paste"));
                 self.phase = Phase::Idle;
                 self.phase_wake = None;
                 state.reject(HINT_CLIPBOARD, now);
                 self.state_changed = true;
-                return;
             }
+            return;
         }
-        // A stage.
-        if let Phase::Delivering(d) = &mut self.phase
-            && matches!(d.job.step, Step::Staging { ticket: t, .. } if t == ticket)
+        // A stage, in the delivery or answered after it gave up.
+        let staging_now = matches!(&self.phase, Phase::Delivering(d)
+            if matches!(d.job.step, Step::Staging { ticket: t, .. } if t == ticket));
+        if let Some(restore) = self.restore.as_mut()
+            && let Some(stage) = restore.stage.as_mut()
+            && stage.ticket == ticket
+            && !stage.confirmed
+            && stage.emptied.is_none()
         {
-            match &reply.result {
+            let failure = match &reply.result {
                 Ok(ClipDone::Staged { sequence }) => {
                     env.log(now, &format!("staged (seq {sequence})"));
-                    d.job.step = Step::Send(now);
+                    stage.confirmed = true;
+                    restore.prev = None;
+                    restore.late = None;
+                    if staging_now {
+                        if let Phase::Delivering(d) = &mut self.phase {
+                            d.job.step = Step::Send(now);
+                        }
+                    } else {
+                        env.log(
+                            now,
+                            "the stage landed after the delivery gave up → restore at once",
+                        );
+                        restore.now_please = true;
+                    }
+                    None
+                }
+                Err(ClipFail::Emptied { sequence }) => {
+                    // The clipboard is empty now: put the user's back over exactly that.
+                    stage.emptied = Some(*sequence);
+                    restore.prev = None;
+                    restore.now_please = true;
+                    Some(format!(
+                        "stage failed after emptying the clipboard (seq {sequence})"
+                    ))
                 }
                 other => {
-                    let why = match other {
-                        Err(fail) => format!("stage failed: {fail:?}"),
-                        Ok(_) => "stage: unexpected reply".to_string(),
-                    };
+                    // Nothing was written: an earlier paste's staging (if any) is still there.
+                    restore.stage = restore.prev.take();
+                    Some(format!(
+                        "stage failed, clipboard untouched: {:?}",
+                        other.as_ref().err()
+                    ))
+                }
+            };
+            if let Some(why) = failure {
+                if staging_now {
                     let Phase::Delivering(d) = std::mem::replace(&mut self.phase, Phase::Idle)
                     else {
                         unreachable!("checked above");
                     };
-                    // The clipboard may be left empty: put the user's back whatever the
-                    // facts say (the clipboard thread forgot the staging).
-                    if let Some(restore) = self.restore.as_mut() {
-                        restore.unconditional = true;
-                    }
                     let _ = self.fail(&d, Self::fail_hint(&d), &why, now, state, env);
                     self.finish_delivery(now, env);
+                } else {
+                    env.log(now, &why);
                 }
             }
             return;
@@ -1970,9 +2340,21 @@ impl<S: Clone> Router<S> {
             && stage.restaging == Some(ticket)
         {
             stage.restaging = None;
-            if let Err(why) = &reply.result {
-                stage.guarding = false;
-                env.log(now, &format!("restage failed: {why:?}"));
+            match &reply.result {
+                Ok(_) => {}
+                Err(ClipFail::Emptied { sequence }) => {
+                    stage.emptied = Some(*sequence);
+                    stage.guarding = false;
+                    restore.now_please = true;
+                    env.log(
+                        now,
+                        "restage failed after emptying the clipboard → restore now",
+                    );
+                }
+                Err(why) => {
+                    stage.guarding = false;
+                    env.log(now, &format!("restage failed: {why:?}"));
+                }
             }
             return;
         }
@@ -1985,19 +2367,47 @@ impl<S: Clone> Router<S> {
                     self.restore = None;
                     self.remembered = None;
                 }
-                Err(why) => {
-                    restore.tries += 1;
+                Err(ClipFail::Changed) => {
                     env.log(
                         now,
-                        &format!("restore refused ({why:?}), try {}", restore.tries),
+                        "restore refused: the clipboard changed since → leave it",
                     );
-                    if restore.tries >= RESTORE_TRIES {
-                        env.log(now, "restore abandoned");
-                        self.restore = None;
-                    }
+                    self.restore = None;
+                }
+                Err(why) => {
+                    let why = format!("{why:?}");
+                    self.retry_restore(&why, now, state, env);
                 }
             }
         }
+    }
+
+    /// A restore that could not run (locked clipboard, full queue): try again every
+    /// [`RESTORE_RETRY`] for [`RESTORE_GIVE_UP`], then say so.
+    fn retry_restore<E: Env<Snap = S>>(
+        &mut self,
+        why: &str,
+        now: f64,
+        state: &mut FairyState,
+        env: &mut E,
+    ) {
+        let Some(restore) = self.restore.as_mut() else {
+            return;
+        };
+        let first = *restore.first_try.get_or_insert(now);
+        if now >= first + RESTORE_GIVE_UP {
+            env.log(
+                now,
+                &format!("restore failed ({why}) for too long → abandoned"),
+            );
+            self.restore = None;
+            state.flash_hint(HINT_RESTORE_FAILED, 3.0, now);
+            self.state_changed = true;
+            return;
+        }
+        env.log(now, &format!("restore failed ({why}) → again shortly"));
+        restore.retry_at = Some(now + RESTORE_RETRY);
+        self.restore_wake = earlier(self.restore_wake, restore.retry_at);
     }
 
     // MARK: Driving
@@ -2025,30 +2435,34 @@ impl<S: Clone> Router<S> {
                     click,
                     first,
                     ready_at: None,
-                } => match paste_policy::mouse_up_step(now - click.at, self.buttons_down) {
-                    MouseUpStep::Wait => {
+                } => {
+                    let up_deadline = click.at + paste_policy::MOUSE_UP_TIMEOUT;
+                    if env.primary_down() {
+                        if now >= up_deadline {
+                            env.log(now, "the button is still down (a drag) → ignore");
+                            return;
+                        }
                         self.phase = Phase::AwaitUp {
                             click,
                             first,
                             ready_at: None,
                         };
-                        self.phase_wake = Some(click.at + paste_policy::MOUSE_UP_TIMEOUT);
+                        self.phase_wake =
+                            Some(up_deadline.min(now + paste_policy::MOUSE_UP_POLL_INTERVAL));
                         return;
                     }
-                    MouseUpStep::Proceed => {
-                        // Chromium needs a moment after the release; focus needs one too.
-                        let settle = if first.chromium {
-                            SETTLE_AFTER_UP_CHROMIUM
-                        } else {
-                            SETTLE_AFTER_UP
-                        };
-                        self.phase = Phase::AwaitUp {
-                            click,
-                            first,
-                            ready_at: Some(now + settle),
-                        };
-                    }
-                },
+                    // Chromium needs a moment after the release; focus needs one too.
+                    let settle = if first.chromium {
+                        SETTLE_AFTER_UP_CHROMIUM
+                    } else {
+                        SETTLE_AFTER_UP
+                    };
+                    self.phase = Phase::AwaitUp {
+                        click,
+                        first,
+                        ready_at: Some(now + settle),
+                    };
+                }
                 Phase::AwaitUp {
                     click,
                     first,
@@ -2120,13 +2534,21 @@ impl<S: Clone> Router<S> {
             return;
         };
         if let Some((_, since)) = restore.restoring {
-            if now - since >= REPLY_TIMEOUT {
-                env.log(now, "no restore reply → abandoned");
-                self.restore = None;
+            let give_up = since + REPLY_TIMEOUT;
+            if now >= give_up {
+                restore.restoring = None;
+                self.retry_restore("no reply", now, state, env);
             } else {
-                self.restore_wake = Some(since + REPLY_TIMEOUT);
+                self.restore_wake = Some(give_up);
             }
             return;
+        }
+        if let Some(at) = restore.retry_at {
+            if now < at {
+                self.restore_wake = Some(at);
+                return;
+            }
+            restore.retry_at = None;
         }
         if restore.stage.is_none() {
             self.restore = None;
@@ -2140,49 +2562,63 @@ impl<S: Clone> Router<S> {
         let Some(stage) = restore.stage else {
             return;
         };
-        let staged = facts.staged_for(stage.ticket);
         // The app was busy and took the Ctrl+V after we had given up: the top card did land.
         if let Some((id, before)) = restore.late
-            && staged.is_some_and(|s| s.reads > before)
+            && stage.reads > before
         {
             restore.late = None;
             if state.card(id).is_some() {
-                env.log(now, &format!("card {}: read late → it landed", id.0));
+                env.log(
+                    now,
+                    &format!("card {}: the target read it late → it landed", id.0),
+                );
                 state.deliver(&[id], HINT_PASTED, now);
                 self.state_changed = true;
             }
+        }
+        if !stage.confirmed && stage.emptied.is_none() {
+            // A stage request still in flight: its reply decides.
+            let give_up = stage.requested_at + STAGE_LATE_WAIT;
+            if now >= give_up {
+                env.log(now, "the stage never answered → nothing to restore");
+                self.restore = None;
+            } else {
+                self.restore_wake = Some(give_up);
+            }
+            return;
         }
         if stage.restaging.is_some() {
             self.restore_wake = Some(now + RESTORE_POLL);
             return;
         }
-        let untouched = restore.unconditional || untouched(&stage, &facts);
+        let guard = restore_guard(&stage, &facts);
         let step = match stage.sent_at {
             Some(sent) if !restore.now_please => RestoreRules::default().step(
                 now - sent,
-                staged.and_then(|s| s.last_read_at).map(|t| now - t),
-                untouched,
+                facts
+                    .staged_for(stage.ticket)
+                    .and_then(|s| s.last_read_at)
+                    .map(|t| now - t),
+                guard.is_some(),
             ),
-            _ if untouched => RestoreStep::Restore,
+            _ if guard.is_some() => RestoreStep::Restore,
             _ => RestoreStep::Abandon,
         };
-        match step {
-            RestoreStep::Wait => self.restore_wake = Some(now + RESTORE_POLL),
-            RestoreStep::Abandon => {
-                env.log(now, "clipboard changed by someone else → no restore");
-                self.restore = None;
-            }
-            RestoreStep::Restore => match env.clip_restore(&restore.snap, Some(facts.sequence)) {
+        match (step, guard) {
+            (RestoreStep::Wait, _) => self.restore_wake = Some(now + RESTORE_POLL),
+            (RestoreStep::Restore, Some(guard)) => match env.clip_restore(&restore.snap, guard) {
                 Ok(ticket) => {
-                    env.log(now, "restoring the clipboard");
+                    env.log(now, &format!("restoring the clipboard ({guard:?})"));
+                    restore.first_try.get_or_insert(now);
                     restore.restoring = Some((ticket, now));
                     self.restore_wake = Some(now + REPLY_TIMEOUT);
                 }
-                Err(why) => {
-                    env.log(now, &format!("restore failed: {why}"));
-                    self.restore = None;
-                }
+                Err(why) => self.retry_restore(&why, now, state, env),
             },
+            _ => {
+                env.log(now, "clipboard changed by someone else → no restore");
+                self.restore = None;
+            }
         }
     }
 
@@ -2302,7 +2738,7 @@ impl Drop for WakeEvent {
 }
 
 /// The Windows side of [`Env`]: the UI Automation service, the clipboard thread and the
-/// PNG saver. Every call returns at once; answers come back through [`LiveEnv::pump`].
+/// PNG saver. Every call returns at once; answers come back through [`Drops::pump`].
 pub struct LiveEnv {
     uia: Option<Uia>,
     clip: Option<Clipboard>,
@@ -2312,6 +2748,7 @@ pub struct LiveEnv {
     next_save: u64,
     settings: Settings,
     log: DebugLog,
+    primary: Button,
     /// Converts the clipboard's `Instant`s to the `hook::now` clock.
     origin: Instant,
     origin_secs: f64,
@@ -2336,6 +2773,7 @@ impl LiveEnv {
             next_save: 1,
             settings,
             log,
+            primary: LiveEnv::primary_button(),
             origin: Instant::now(),
             origin_secs: hook::now(),
         })
@@ -2368,13 +2806,8 @@ impl LiveEnv {
         }
     }
 
-    /// Feeds every answer, reply and saved file to the router. Call after every wait.
-    pub fn pump(
-        &mut self,
-        router: &mut Router<clipboard::Snapshot>,
-        state: &mut FairyState,
-        now: f64,
-    ) {
+    /// Feeds every answer, reply and saved file to the router.
+    fn pump(&mut self, router: &mut Router<clipboard::Snapshot>, state: &mut FairyState, now: f64) {
         let mut answers = Vec::new();
         if let Some(uia) = &self.uia {
             while let Some((id, outcome)) = uia.poll() {
@@ -2399,24 +2832,23 @@ impl LiveEnv {
         router.clipboard_changed(now, state, self);
     }
 
-    /// At quit: wait up to `timeout` for the restore's reply, then stop the threads.
-    pub fn shutdown(mut self, restore: Option<u64>, timeout: Duration) {
-        if let (Some(ticket), Some(clip)) = (restore, &self.clip) {
-            let until = Instant::now() + timeout;
-            while let Some(left) = until.checked_duration_since(Instant::now()) {
-                match clip.wait_reply(left) {
-                    Some(reply) if reply.ticket.0 == ticket => {
-                        let line = format!(
-                            "quit: restore reply {:?}",
-                            reply.result.as_ref().map(|_| ())
-                        );
-                        self.log.line(hook::now(), &line);
-                        break;
-                    }
-                    Some(_) => continue,
-                    None => break,
-                }
+    /// At quit: let the router put the user's clipboard back, waiting up to `timeout` for
+    /// the clipboard replies it needs, then stop the threads.
+    fn finish(&mut self, router: &mut Router<clipboard::Snapshot>, timeout: Duration) {
+        let until = Instant::now() + timeout;
+        let mut waiting = router.quit(hook::now(), self);
+        while let Some(ticket) = waiting {
+            let Some(left) = until.checked_duration_since(Instant::now()) else {
+                self.log.line(hook::now(), "quit: out of time");
+                break;
+            };
+            let Some(reply) = self.clip.as_ref().and_then(|c| c.wait_reply(left)) else {
+                break;
+            };
+            if reply.ticket.0 != ticket {
+                continue;
             }
+            waiting = router.quit_reply(convert_reply(reply), hook::now(), self);
         }
         // Dropping the clipboard renders what we still own, so the clipboard stays valid.
         self.clip = None;
@@ -2436,6 +2868,10 @@ fn convert_reply(reply: Reply) -> ClipReply<clipboard::Snapshot> {
         Ok(Done::Staged { sequence }) => Ok(ClipDone::Staged { sequence }),
         Ok(Done::Restored { sequence }) => Ok(ClipDone::Restored { sequence }),
         Err(ClipError::Changed) => Err(ClipFail::Changed),
+        Err(ClipError::Emptied { sequence, .. }) => Err(ClipFail::Emptied { sequence }),
+        Err(other @ (ClipError::Busy | ClipError::Stale | ClipError::Locked { .. })) => {
+            Err(ClipFail::Retry(other.to_string()))
+        }
         Err(other) => Err(ClipFail::Other(other.to_string())),
     };
     ClipReply {
@@ -2496,12 +2932,14 @@ impl Env for LiveEnv {
     fn clip_restore(
         &mut self,
         snap: &clipboard::Snapshot,
-        if_sequence: Option<u32>,
+        guard: RestoreGuard,
     ) -> Result<u64, String> {
         let clip = self.clip.as_ref().ok_or("no clipboard thread")?;
-        clip.restore(snap, if_sequence)
-            .map(|t| t.0)
-            .map_err(|e| e.to_string())
+        let ticket = match guard {
+            RestoreGuard::OwnStaging => clip.restore_over_staging(snap),
+            RestoreGuard::Sequence(sequence) => clip.restore(snap, Some(sequence)),
+        };
+        ticket.map(|t| t.0).map_err(|e| e.to_string())
     }
 
     fn save_png(&mut self, card: &HeldCard) -> u64 {
@@ -2531,16 +2969,86 @@ impl Env for LiveEnv {
         }
     }
 
+    fn primary_down(&self) -> bool {
+        let vk = match self.primary {
+            Button::Right => VK_RBUTTON,
+            _ => VK_LBUTTON,
+        };
+        // SAFETY: plain value argument. The high bit is set while the button is down; the
+        // physical button is read, so a swap needs the matching key code (`primary`).
+        unsafe { GetAsyncKeyState(vk.0 as i32) < 0 }
+    }
+
+    fn terminal_at(&self, point: (i32, i32)) -> bool {
+        uia::terminal_at(point)
+    }
+
     fn press(&mut self, key: Key) -> Sent {
         input::press(key)
     }
 
-    fn paste_shortcut(&mut self) -> Sent {
-        input::paste_shortcut()
+    fn paste_shortcut(&mut self, keys: PasteKeys) -> Sent {
+        match keys {
+            PasteKeys::CtrlV => input::paste_shortcut(),
+            PasteKeys::CtrlShiftV => input::paste_shortcut_with_shift(),
+        }
     }
 
     fn log(&mut self, now: f64, line: &str) {
         self.log.line(now, line);
+    }
+}
+
+/// The router and its Windows environment, for the UI loop. Dropping it (at the end of
+/// `main`, on an error return or while a panic unwinds) puts the user's clipboard back if
+/// a paste left ours there, then stops the workers.
+pub struct Drops {
+    router: Router<clipboard::Snapshot>,
+    env: Option<LiveEnv>,
+}
+
+impl Drops {
+    pub fn start(settings: Settings, log: DebugLog) -> Result<Drops, String> {
+        let env = LiveEnv::start(settings, log)?;
+        Ok(Drops {
+            router: Router::new(LiveEnv::primary_button()),
+            env: Some(env),
+        })
+    }
+
+    pub fn wake_handles(&self) -> Vec<HANDLE> {
+        self.env
+            .as_ref()
+            .map(LiveEnv::wake_handles)
+            .unwrap_or_default()
+    }
+
+    /// One pass of the UI loop: the hook events, then every answer and reply, then the
+    /// deadline. Returns true when the state changed (redraw).
+    pub fn run(&mut self, events: &[MouseEvent], state: &mut FairyState, now: f64) -> bool {
+        let Some(env) = self.env.as_mut() else {
+            return false;
+        };
+        for event in events {
+            self.router.mouse(*event, state, env);
+        }
+        env.pump(&mut self.router, state, now);
+        if self.router.next_deadline().is_some_and(|at| at <= now) {
+            self.router.tick(now, state, env);
+        }
+        self.router.take_state_changed()
+    }
+
+    pub fn next_deadline(&self) -> Option<f64> {
+        self.router.next_deadline()
+    }
+}
+
+impl Drop for Drops {
+    fn drop(&mut self) {
+        if let Some(mut env) = self.env.take() {
+            env.finish(&mut self.router, QUIT_WAIT);
+        }
     }
 }
 

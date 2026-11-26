@@ -1234,6 +1234,23 @@ impl Backend for Win32Backend {
     }
 }
 
+/// Is the top-level window at `point` a terminal? From Win32 only (no UI Automation): the
+/// drop router asks on a first mouse-down, to decide whether to save the clipboard before a
+/// terminal's copy-on-select can replace it. Waits on no other process.
+pub fn terminal_at((x, y): (i32, i32)) -> bool {
+    // SAFETY: value arguments only; see `precheck`.
+    let child = unsafe { WindowFromPoint(POINT { x, y }) };
+    if child.is_invalid() {
+        return false;
+    }
+    // SAFETY: value arguments only; reads window manager state.
+    let root = unsafe { GetAncestor(child, GA_ROOT) };
+    let root = if root.is_invalid() { child } else { root };
+    let class_name = class_name(root);
+    let exe = Handle::process(window_pid(root)).and_then(|h| h.exe_name());
+    is_terminal(exe.as_deref(), &class_name)
+}
+
 fn window_pid(hwnd: HWND) -> u32 {
     let mut pid = 0;
     // SAFETY: `pid` outlives the call; an invalid window leaves it 0.
@@ -1883,6 +1900,11 @@ mod tests {
     }
 
     // --- Role mapping ---
+
+    #[test]
+    fn terminal_at_a_point_without_a_window_is_false() {
+        assert!(!terminal_at((-1_000_000, -1_000_000)));
+    }
 
     #[test]
     fn from_chain_links_the_hit_to_its_ancestors() {

@@ -2,6 +2,7 @@
 //! UI Automation, the clipboard thread, the PNG saver and the keyboard, and each test drives
 //! the router with events and times as they would arrive.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,12 +30,21 @@ struct Fake {
     snapshots: Vec<u64>,
     stages: Vec<(u64, Payload)>,
     restages: Vec<u64>,
-    restores: Vec<(u64, Snap, Option<u32>)>,
+    restores: Vec<(u64, Snap, RestoreGuard)>,
     saves: Vec<u64>,
-    /// The target is in front.
+    /// The foreground window and its process; `front: false` puts something else there.
     front: bool,
-    /// Results for Ctrl+V, in order; `Done` once empty.
+    fg_window: isize,
+    fg_pid: u32,
+    /// Every foreground check: (window, pid) asked about.
+    checks: RefCell<Vec<(isize, u32)>>,
+    /// The user's main button is down (the real state).
+    button: bool,
+    /// The window under a first click is a terminal.
+    terminal: bool,
+    /// Results for the paste keys, in order; `Done` once empty.
     pastes: VecDeque<Sent>,
+    paste_keys: Vec<PasteKeys>,
     pressed: Vec<Key>,
     sent: u32,
     log: Vec<String>,
@@ -48,6 +58,16 @@ impl Fake {
 
     fn logged(&self, text: &str) -> bool {
         self.log.iter().any(|line| line.contains(text))
+    }
+
+    /// Every foreground check asked about the double-clicked window (0x10 of pid 100).
+    fn assert_aimed(&self) {
+        let checks = self.checks.borrow();
+        assert!(!checks.is_empty(), "no foreground check");
+        assert!(
+            checks.iter().all(|c| *c == (0x10, 100)),
+            "checked {checks:?}"
+        );
     }
 }
 
@@ -77,9 +97,9 @@ impl Env for Fake {
         self.restages.push(id);
         Ok(id)
     }
-    fn clip_restore(&mut self, snap: &Snap, if_sequence: Option<u32>) -> Result<u64, String> {
+    fn clip_restore(&mut self, snap: &Snap, guard: RestoreGuard) -> Result<u64, String> {
         let id = self.id();
-        self.restores.push((id, snap, if_sequence));
+        self.restores.push((id, snap, guard));
         Ok(id)
     }
     fn save_png(&mut self, _card: &HeldCard) -> u64 {
@@ -87,14 +107,27 @@ impl Env for Fake {
         self.saves.push(id);
         id
     }
-    fn foreground_is(&self, _window: isize, _pid: u32) -> bool {
-        self.front
+    fn foreground_is(&self, window: isize, pid: u32) -> bool {
+        self.checks.borrow_mut().push((window, pid));
+        let matches = if window != 0 {
+            window == self.fg_window
+        } else {
+            pid == self.fg_pid
+        };
+        self.front && matches
+    }
+    fn primary_down(&self) -> bool {
+        self.button
+    }
+    fn terminal_at(&self, _point: (i32, i32)) -> bool {
+        self.terminal
     }
     fn press(&mut self, key: Key) -> Sent {
         self.pressed.push(key);
         Sent::Done
     }
-    fn paste_shortcut(&mut self) -> Sent {
+    fn paste_shortcut(&mut self, keys: PasteKeys) -> Sent {
+        self.paste_keys.push(keys);
         let result = self.pastes.pop_front().unwrap_or(Sent::Done);
         if !matches!(result, Sent::Blocked(_)) {
             self.sent += 1;
@@ -137,6 +170,8 @@ impl Rig {
         }
         let e = Fake {
             front: true,
+            fg_window: 0x10,
+            fg_pid: 100,
             facts: ClipFacts {
                 sequence: 5,
                 ..ClipFacts::default()
@@ -189,6 +224,8 @@ impl Rig {
 
     fn down(&mut self, t: f64, click_count: u32) {
         let (x, y) = AT;
+        self.to(t);
+        self.e.button = true;
         self.mouse(
             MouseEvent::Down {
                 button: Button::Left,
@@ -204,6 +241,8 @@ impl Rig {
 
     fn up(&mut self, t: f64) {
         let (x, y) = AT;
+        self.to(t);
+        self.e.button = false;
         self.mouse(
             MouseEvent::Up {
                 button: Button::Left,
@@ -288,9 +327,10 @@ impl Rig {
         self.down(0.15, 2);
     }
 
-    /// The remembered snapshot arrives (taken at the first mouse-down).
+    /// The first snapshot arrives (taken when the double-click was decided, or at the first
+    /// mouse-down in a terminal).
     fn remembered_arrives(&mut self, t: f64) {
-        let ticket = *self.e.snapshots.first().expect("remembered");
+        let ticket = *self.e.snapshots.first().expect("a snapshot");
         self.snapshot_reply(t, ticket, None);
     }
 
@@ -348,6 +388,7 @@ fn paste_into_field(rig: &mut Rig) -> f64 {
     assert_eq!(rig.e.stages.len(), 1, "{:#?}", rig.e.log);
     rig.staged_reply(0.41);
     assert_eq!(rig.e.sent, 1, "{:#?}", rig.e.log);
+    rig.e.assert_aimed();
     0.41
 }
 
@@ -376,7 +417,8 @@ fn double_click_on_a_field_pastes_the_image_and_restores_the_clipboard() {
     assert!(rig.e.restores.is_empty());
     rig.to(sent + 2.1);
     assert_eq!(rig.restored(), vec!["user"]);
-    assert_eq!(rig.e.restores[0].2, Some(6));
+    assert_eq!(rig.e.restores[0].2, RestoreGuard::OwnStaging);
+    assert_eq!(rig.e.paste_keys, vec![PasteKeys::CtrlV]);
     let ticket = rig.e.restores[0].0;
     rig.reply(sent + 2.2, ticket, Ok(ClipDone::Restored { sequence: 7 }));
     assert!(!rig.r.restore_pending());
@@ -584,17 +626,15 @@ fn a_slow_app_gets_one_longer_lookup_after_the_mouse_up() {
     assert_eq!(rig.e.lookups.len(), 2);
     let (_, point, focus, deadline) = rig.e.lookups[1];
     assert_eq!((point, focus, deadline), (AT, true, SLOW_DEADLINE));
-    // It answers this time: the focused field is under the click.
+    // It answers this time: a text field is at the click point.
     let mut spot = nothing("RobloxStudioBeta.exe");
-    spot.focused = Some(Focus {
-        pid: 100,
-        editable: true,
-        frame: Some(Rect::new(450.0, 380.0, 200.0, 30.0)),
-    });
+    spot.editable_hit = true;
+    spot.editable = true;
     rig.answer(1.1, Seen::Spot(Box::new(spot)));
     rig.remembered_arrives(1.11);
     rig.to(1.4);
     assert_eq!(rig.e.stages.len(), 1);
+    rig.e.assert_aimed();
 }
 
 #[test]
@@ -618,12 +658,15 @@ fn a_slow_app_that_never_answers_is_not_pasted_into() {
 fn a_lookup_that_never_answers_is_given_up() {
     let mut rig = Rig::new(1);
     rig.double_click();
-    // No answer at all (a replaced request): the router stops waiting.
+    // No answer at all (a replaced request): the router stops waiting and does nothing.
+    rig.up(0.2);
     rig.to(0.15 + LOOKUP_DEADLINE + LOOKUP_GRACE + 0.01);
-    assert!(rig.e.logged("no answer"));
+    assert!(rig.e.logged("lookup failed (no answer) → Ignore"));
     rig.to(3.0);
     assert!(!rig.r.busy());
+    assert_eq!(rig.e.lookups.len(), 1, "no re-check after a failed lookup");
     assert!(rig.e.stages.is_empty());
+    assert!(rig.e.snapshots.is_empty());
 }
 
 #[test]
@@ -867,18 +910,54 @@ fn no_read_fails_and_restores_late_but_a_late_read_still_delivers() {
 }
 
 #[test]
-fn a_refused_restore_is_tried_again_then_abandoned() {
+fn a_restore_refused_because_the_clipboard_changed_is_not_tried_again() {
     let mut rig = Rig::new(1);
     let sent = paste_into_field(&mut rig);
     rig.read(sent + 0.02, 2);
     rig.to(sent + 2.1);
-    for n in 0..RESTORE_TRIES {
+    let ticket = rig.e.restores[0].0;
+    rig.reply(sent + 2.15, ticket, Err(ClipFail::Changed));
+    rig.to(sent + 20.0);
+    assert_eq!(rig.e.restores.len(), 1);
+    assert!(!rig.r.restore_pending());
+}
+
+#[test]
+fn a_locked_clipboard_delays_the_restore_and_then_gives_up() {
+    let mut rig = Rig::new(1);
+    let sent = paste_into_field(&mut rig);
+    rig.read(sent + 0.02, 2);
+    rig.to(sent + 2.1);
+    let first = rig.now;
+    // Locked again and again: tries about 0.5 s apart.
+    while rig.r.restore_pending() && rig.now < first + 20.0 {
         let ticket = rig.e.restores.last().unwrap().0;
-        rig.reply(rig.now + 0.01, ticket, Err(ClipFail::Changed));
-        rig.to(rig.now + 0.2);
-        let expected = (n + 2).min(RESTORE_TRIES) as usize;
-        assert_eq!(rig.e.restores.len(), expected);
+        rig.reply(
+            rig.now + 0.01,
+            ticket,
+            Err(ClipFail::Retry("clipboard held open".into())),
+        );
+        rig.to(rig.now + 0.6);
     }
+    assert!(!rig.r.restore_pending());
+    let tries = rig.e.restores.len();
+    assert!((15..=22).contains(&tries), "{tries} tries");
+    assert!(rig.now - first >= RESTORE_GIVE_UP - 0.6);
+    assert_eq!(rig.s.hint(), Some(HINT_RESTORE_FAILED));
+
+    // A lock that clears: the next try restores.
+    let mut rig = Rig::new(1);
+    let sent = paste_into_field(&mut rig);
+    rig.read(sent + 0.02, 2);
+    rig.to(sent + 2.1);
+    let ticket = rig.e.restores[0].0;
+    rig.reply(sent + 2.12, ticket, Err(ClipFail::Retry("locked".into())));
+    rig.to(sent + 2.5);
+    assert_eq!(rig.e.restores.len(), 1, "not before 0.5 s");
+    rig.to(sent + 2.7);
+    assert_eq!(rig.e.restores.len(), 2);
+    let ticket = rig.e.restores[1].0;
+    rig.reply(sent + 2.75, ticket, Ok(ClipDone::Restored { sequence: 9 }));
     assert!(!rig.r.restore_pending());
 }
 
@@ -971,16 +1050,23 @@ fn the_click_copy_of_a_terminal_is_not_taken_for_the_users_clipboard() {
     // The clipboard changed between the first click and the paste (copy-on-select): the
     // copy remembered at the first mouse-down is used.
     let mut rig = Rig::new(1);
+    rig.e.terminal = true;
     rig.double_click();
+    assert_eq!(
+        rig.e.snapshots.len(),
+        1,
+        "a terminal's first click keeps a copy"
+    );
     rig.remembered_arrives(0.1);
     rig.e.facts.sequence = 8;
     rig.e.facts.last_change = Some(0.12);
-    rig.answer(0.17, field("notepad.exe"));
+    rig.answer(0.17, terminal());
     assert_eq!(rig.e.snapshots.len(), 1);
     assert!(rig.e.logged("using the copy from the first click"));
 
     // A remembered copy older than 2 s whose sequence moved on is not used.
     let mut rig = Rig::new(1);
+    rig.e.terminal = true;
     rig.down(0.0, 1);
     rig.remembered_arrives(0.05);
     rig.up(0.08);
@@ -1035,8 +1121,14 @@ fn quit_puts_the_clipboard_back_when_ours_is_still_there() {
     rig.read(sent + 0.02, 2);
     rig.to(sent + 0.5);
     let ticket = rig.r.quit(sent + 0.5, &mut rig.e);
-    assert!(ticket.is_some());
+    assert_eq!(ticket, Some(rig.e.restores[0].0));
     assert_eq!(rig.restored(), vec!["user"]);
+    assert_eq!(rig.e.restores[0].2, RestoreGuard::OwnStaging);
+    let reply = ClipReply {
+        ticket: ticket.unwrap(),
+        result: Ok(ClipDone::Restored { sequence: 9 }),
+    };
+    assert_eq!(rig.r.quit_reply(reply, sent + 0.6, &mut rig.e), None);
 
     // Not when the user copied something meanwhile.
     let mut rig = Rig::new(1);
@@ -1115,6 +1207,486 @@ fn hover_hints_follow_the_swift_rules() {
         hover_hint(&Seen::Spot(Box::new(spot))),
         Some(HINT_HOVER_SAVE)
     );
+}
+
+// MARK: Review fixes
+
+/// Review item 1: A double-click on window chrome or an item means "maximise" / "open", never a paste.
+#[test]
+fn a_title_bar_or_an_item_double_click_is_ignored() {
+    for role in ["AXToolbar", "AXRow", "AXRadioButton", "AXButton"] {
+        let mut rig = Rig::new(1);
+        rig.double_click();
+        let mut spot = nothing("notepad.exe");
+        spot.role = role.into();
+        spot.activating = true;
+        rig.answer(0.17, Seen::Spot(Box::new(spot)));
+        rig.up(0.25);
+        rig.to(3.0);
+        assert!(
+            rig.e.logged("window chrome or a control → Ignore"),
+            "{role}"
+        );
+        assert_eq!(rig.e.lookups.len(), 1, "{role}: no re-check");
+        assert!(rig.e.stages.is_empty() && rig.e.pressed.is_empty());
+    }
+}
+
+/// Review item 1: The double-click opened a file from an Open dialog (or maximised the window): what is
+/// under the point after the release is another window, even in the same process.
+#[test]
+fn a_window_switch_between_the_click_and_the_recheck_is_ignored() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, Seen::Spot(Box::new(nothing("editor.exe"))));
+    rig.up(0.25);
+    rig.to(0.36);
+    let mut after = nothing("editor.exe");
+    after.target.window = 0x20;
+    after.editable_hit = true;
+    after.editable = true;
+    rig.answer(0.4, Seen::Spot(Box::new(after)));
+    rig.to(3.0);
+    assert!(rig.e.logged("is not the double-clicked 0x10 → ignore"));
+    assert!(rig.e.stages.is_empty() && rig.e.pressed.is_empty());
+    assert!(rig.e.checks.borrow().is_empty());
+}
+
+/// Review item 2: Double-click and keep holding (select by words, a touchpad double-tap-drag): no keys
+/// mid-drag, the card stays, no hint.
+#[test]
+fn a_held_button_cancels_the_paste_quietly() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.to(3.0);
+    assert!(rig.e.logged("the button is still down (a drag)"));
+    assert!(rig.e.pressed.is_empty() && rig.e.stages.is_empty() && rig.e.sent == 0);
+    assert!(rig.s.is_holding());
+    assert_ne!(rig.s.hint(), Some(HINT_PASTE_FAILED));
+    assert!(!rig.r.busy());
+
+    // The same while waiting to re-check after the release.
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, Seen::Spot(Box::new(nothing("app.exe"))));
+    rig.to(3.0);
+    assert_eq!(rig.e.lookups.len(), 1);
+    assert!(!rig.r.busy());
+}
+
+/// Review item 2: The hook never saw the release (over an elevated window): the real button state says
+/// it is up, so the paste goes on.
+#[test]
+fn a_release_the_hook_missed_is_read_from_the_button_state() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.to(0.25);
+    rig.e.button = false;
+    rig.to(0.45);
+    assert_eq!(rig.e.stages.len(), 1, "{:#?}", rig.e.log);
+}
+
+/// Review item 12: Deadlines that land exactly on `start + 1.0` must not re-arm in the past.
+#[test]
+fn deadlines_reached_exactly_do_not_spin() {
+    for start in [0.1, 0.15, 0.2, 0.3, 0.7, 1.1, 2.3] {
+        let mut rig = Rig::new(1);
+        rig.to(start - 0.15);
+        rig.down(start - 0.15, 1);
+        rig.up(start - 0.07);
+        rig.down(start, 2);
+        rig.answer(start + 0.02, field("notepad.exe"));
+        let ticket = *rig.e.snapshots.first().unwrap();
+        rig.snapshot_reply(start + 0.03, ticket, None);
+        // `to` panics when the router does not settle.
+        rig.to(start + paste_policy_timeout());
+        rig.to(start + 5.0);
+        assert!(!rig.r.busy(), "{start}");
+    }
+}
+
+fn paste_policy_timeout() -> f64 {
+    igorio_core::paste_policy::MOUSE_UP_TIMEOUT
+}
+
+/// Review item 3: A failed first lookup is Ignore: no re-check, no keys later.
+#[test]
+fn a_failed_first_lookup_is_ignored() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, Seen::Failed("ElementFromPoint failed".into()));
+    rig.up(0.25);
+    rig.to(3.0);
+    assert_eq!(rig.e.lookups.len(), 1);
+    assert!(rig.e.stages.is_empty() && rig.e.pressed.is_empty());
+    assert!(!rig.r.busy());
+}
+
+/// Review item 3: After a timeout, a focused field elsewhere is not enough: the field must be at the
+/// click point.
+#[test]
+fn a_slow_app_needs_an_editable_element_at_the_point() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(
+        0.4,
+        Seen::TimedOut {
+            target: target("RobloxStudioBeta.exe", false),
+        },
+    );
+    rig.up(0.42);
+    rig.to(0.6);
+    let mut spot = nothing("RobloxStudioBeta.exe");
+    spot.focused = Some(Focus {
+        pid: 100,
+        editable: true,
+        frame: Some(Rect::new(450.0, 380.0, 200.0, 30.0)),
+    });
+    rig.answer(1.1, Seen::Spot(Box::new(spot)));
+    // No delivery starts: no clipboard snapshot, no keys, no stage.
+    assert!(rig.e.snapshots.is_empty(), "{:#?}", rig.e.log);
+    assert!(!rig.r.busy());
+    rig.to(3.0);
+    assert!(rig.e.stages.is_empty() && rig.e.pressed.is_empty());
+}
+
+/// Review item 4: The stage reply comes after the router gave up: the screenshot that then lands is
+/// still replaced by the user's clipboard.
+#[test]
+fn a_stage_reply_after_the_timeout_is_still_undone() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.4);
+    assert_eq!(rig.e.stages.len(), 1);
+    rig.to(0.39 + REPLY_TIMEOUT + 0.1);
+    assert_eq!(rig.s.hint(), Some(HINT_PASTE_FAILED));
+    assert!(rig.e.restores.is_empty());
+    assert!(rig.r.restore_pending());
+    rig.staged_reply(5.0);
+    assert_eq!(rig.e.sent, 0, "no paste keys after giving up");
+    assert_eq!(rig.restored(), vec!["user"]);
+    assert_eq!(rig.e.restores[0].2, RestoreGuard::OwnStaging);
+}
+
+/// Review item 5: A stage that failed before touching the clipboard restores nothing over the user's
+/// data.
+#[test]
+fn a_stage_error_before_emptying_restores_nothing() {
+    for error in [
+        ClipFail::Retry("clipboard held open".into()),
+        ClipFail::Other("bad payload".into()),
+    ] {
+        let mut rig = Rig::new(1);
+        rig.double_click();
+        rig.answer(0.17, field("notepad.exe"));
+        rig.remembered_arrives(0.18);
+        rig.up(0.25);
+        rig.to(0.4);
+        let ticket = rig.e.stages[0].0;
+        rig.reply(0.41, ticket, Err(error.clone()));
+        rig.to(10.0);
+        assert!(rig.e.restores.is_empty(), "{error:?}");
+        assert!(!rig.r.restore_pending());
+        assert_eq!(rig.s.hint(), Some(HINT_PASTE_FAILED));
+    }
+}
+
+/// Review item 5: A stage that failed after emptying the clipboard: the user's clipboard goes back,
+/// but only over the empty clipboard that stage left.
+#[test]
+fn a_stage_error_after_emptying_restores_over_exactly_that() {
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.4);
+    let ticket = rig.e.stages[0].0;
+    rig.reply(0.41, ticket, Err(ClipFail::Emptied { sequence: 12 }));
+    assert_eq!(rig.restored(), vec!["user"]);
+    assert_eq!(rig.e.restores[0].2, RestoreGuard::Sequence(12));
+    assert_eq!(rig.e.sent, 0);
+}
+
+/// Review item 5: A failed stage during a taken-over restore keeps the earlier staging (still on the
+/// clipboard) and its restore.
+#[test]
+fn a_stage_error_keeps_the_earlier_paste_restore() {
+    let mut rig = Rig::new(2);
+    let sent = paste_into_field(&mut rig);
+    rig.read(sent + 0.02, 2);
+    rig.to(sent + 0.2);
+    rig.to(sent + 1.0);
+    let first_stage = rig.e.stages[0].0;
+    let ticket = rig.e.stages[1].0;
+    rig.reply(rig.now, ticket, Err(ClipFail::Retry("locked".into())));
+    // The first card's staging is still ours: the restore goes on with it.
+    rig.e.facts.staged = Some(StagedFacts {
+        ticket: first_stage,
+        reads: 2,
+        last_read_at: Some(sent + 0.02),
+        ..StagedFacts::default()
+    });
+    rig.to(sent + 2.2);
+    assert_eq!(rig.restored(), vec!["user"]);
+}
+
+/// Review item 8: Quit in each step of a delivery.
+#[test]
+fn quit_in_each_delivery_step() {
+    // Before anything was staged: nothing to restore.
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    assert_eq!(rig.r.quit(0.2, &mut rig.e), None);
+    assert!(rig.e.restores.is_empty());
+
+    // A stage in flight: wait for it, then restore.
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.4);
+    let stage = rig.e.stages[0].0;
+    assert_eq!(rig.r.quit(0.4, &mut rig.e), Some(stage));
+    assert!(rig.e.restores.is_empty());
+    rig.e.facts.staged = Some(StagedFacts {
+        ticket: stage,
+        ..StagedFacts::default()
+    });
+    let next = rig.r.quit_reply(
+        ClipReply {
+            ticket: stage,
+            result: Ok(ClipDone::Staged { sequence: 6 }),
+        },
+        0.45,
+        &mut rig.e,
+    );
+    assert_eq!(next, Some(rig.e.restores[0].0));
+    assert_eq!(rig.e.restores[0].2, RestoreGuard::OwnStaging);
+    assert_eq!(rig.e.sent, 0);
+
+    // A stage in flight that then fails after emptying: restore over the empty clipboard.
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.4);
+    let stage = rig.e.stages[0].0;
+    rig.r.quit(0.4, &mut rig.e);
+    rig.r.quit_reply(
+        ClipReply {
+            ticket: stage,
+            result: Err(ClipFail::Emptied { sequence: 7 }),
+        },
+        0.45,
+        &mut rig.e,
+    );
+    assert_eq!(rig.e.restores[0].2, RestoreGuard::Sequence(7));
+
+    // A stage in flight that then fails without touching the clipboard: nothing to do.
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.4);
+    let stage = rig.e.stages[0].0;
+    rig.r.quit(0.4, &mut rig.e);
+    rig.r.quit_reply(
+        ClipReply {
+            ticket: stage,
+            result: Err(ClipFail::Retry("locked".into())),
+        },
+        0.45,
+        &mut rig.e,
+    );
+    assert!(rig.e.restores.is_empty(), "nothing was written");
+
+    // While watching for reads, and with a restore already in flight.
+    let mut rig = Rig::new(1);
+    let sent = paste_into_field(&mut rig);
+    let ticket = rig.r.quit(sent + 0.1, &mut rig.e);
+    assert_eq!(ticket, Some(rig.e.restores[0].0));
+    let mut rig = Rig::new(1);
+    let sent = paste_into_field(&mut rig);
+    rig.read(sent + 0.02, 2);
+    rig.to(sent + 2.1);
+    let in_flight = rig.e.restores[0].0;
+    assert_eq!(rig.r.quit(sent + 2.11, &mut rig.e), Some(in_flight));
+    assert_eq!(rig.e.restores.len(), 1);
+    // A locked clipboard at quit: try again within the caller's time.
+    let again = rig.r.quit_reply(
+        ClipReply {
+            ticket: in_flight,
+            result: Err(ClipFail::Retry("locked".into())),
+        },
+        sent + 2.2,
+        &mut rig.e,
+    );
+    assert_eq!(again, Some(rig.e.restores[1].0));
+}
+
+/// Review item 9: A read by another process (a clipboard manager, the user pasting elsewhere) is not
+/// the target taking the paste.
+#[test]
+fn reads_by_another_process_are_not_a_paste() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    let sent = paste_into_field(&mut rig);
+    rig.to(sent + 0.02);
+    {
+        let staged = rig.e.facts.staged.as_mut().unwrap();
+        staged.reads = 2;
+        staged.last_read_at = Some(sent + 0.02);
+        staged.last_reader = Some(4242);
+    }
+    rig.r.clipboard_changed(sent + 0.02, &mut rig.s, &mut rig.e);
+    rig.to(sent + 1.7);
+    assert_eq!(rig.s.hint(), Some(HINT_PASTE_FAILED));
+    assert!(rig.s.card(id).is_some());
+    assert!(rig.e.logged("not the target → not counted"));
+    // A later read by the same other process is not a late paste either.
+    {
+        let staged = rig.e.facts.staged.as_mut().unwrap();
+        staged.reads = 3;
+        staged.last_reader = Some(4242);
+    }
+    rig.r.clipboard_changed(sent + 3.0, &mut rig.s, &mut rig.e);
+    rig.to(sent + 3.1);
+    assert!(rig.s.card(id).is_some());
+
+    // The target's own process reading counts.
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    let sent = paste_into_field(&mut rig);
+    rig.to(sent + 0.02);
+    {
+        let staged = rig.e.facts.staged.as_mut().unwrap();
+        staged.reads = 2;
+        staged.last_read_at = Some(sent + 0.02);
+        staged.last_reader = Some(100);
+    }
+    rig.r.clipboard_changed(sent + 0.02, &mut rig.s, &mut rig.e);
+    rig.to(sent + 0.3);
+    assert!(rig.s.card(id).is_none());
+}
+
+/// Review item 10: WezTerm and Alacritty paste on Ctrl+Shift+V; Windows Terminal and conhost on Ctrl+V.
+#[test]
+fn each_terminal_gets_its_paste_keys() {
+    let keys = |exe: &str| paste_keys_for(&target(exe, true));
+    assert_eq!(keys("WindowsTerminal.exe"), PasteKeys::CtrlV);
+    assert_eq!(keys("OpenConsole.exe"), PasteKeys::CtrlV);
+    assert_eq!(keys("conhost.exe"), PasteKeys::CtrlV);
+    assert_eq!(keys("wezterm-gui.exe"), PasteKeys::CtrlShiftV);
+    assert_eq!(keys("ALACRITTY.EXE"), PasteKeys::CtrlShiftV);
+    assert_eq!(
+        paste_keys_for(&target("wezterm-gui.exe", false)),
+        PasteKeys::CtrlV
+    );
+
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    let mut spot = Spot::new(target("wezterm-gui.exe", true));
+    spot.editable_hit = true;
+    spot.editable = true;
+    rig.answer(0.17, Seen::Spot(Box::new(spot)));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    let job = rig.e.saves[0];
+    rig.r.saved(
+        job,
+        Ok(PathBuf::from(r"C:\p\a.png")),
+        0.26,
+        &mut rig.s,
+        &mut rig.e,
+    );
+    rig.to(0.5);
+    rig.staged_reply(0.5);
+    assert_eq!(rig.e.paste_keys, vec![PasteKeys::CtrlShiftV]);
+    rig.e.assert_aimed();
+}
+
+/// Review item 11: A plain first click takes no clipboard snapshot; the snapshot is taken once the
+/// double-click is decided.
+#[test]
+fn a_first_click_takes_no_snapshot_outside_terminals() {
+    let mut rig = Rig::new(1);
+    rig.down(0.0, 1);
+    rig.up(0.08);
+    assert!(rig.e.snapshots.is_empty());
+    rig.down(0.15, 2);
+    assert!(rig.e.snapshots.is_empty());
+    rig.answer(0.17, field("notepad.exe"));
+    assert_eq!(rig.e.snapshots.len(), 1);
+    // Not for an ignored double-click either.
+    let mut rig = Rig::new(1);
+    rig.double_click();
+    rig.answer(0.17, Seen::OwnProcess);
+    assert!(rig.e.snapshots.is_empty());
+}
+
+/// The canvas rule is kept as in Swift, and the hover says so first.
+#[test]
+fn a_web_canvas_shows_the_paste_hint_on_hover() {
+    let mut spot = nothing("chrome.exe");
+    spot.canvas = CanvasFacts {
+        canvas: true,
+        known: false,
+        document: false,
+    };
+    assert_eq!(
+        hover_hint(&Seen::Spot(Box::new(spot.clone()))),
+        Some(HINT_HOVER_PASTE)
+    );
+    let mut rig = Rig::new(1);
+    rig.moved(0.0, AT.0, AT.1);
+    rig.to(0.23);
+    rig.answer(0.24, Seen::Spot(Box::new(spot)));
+    assert_eq!(rig.s.hint(), Some(HINT_HOVER_PASTE));
+}
+
+#[test]
+fn title_bar_and_items_are_activating_but_an_address_bar_is_not() {
+    let title = el(UIA_TitleBarControlTypeId);
+    let s = snapshot(target("notepad.exe", false), vec![title, window()], None);
+    assert!(spot_from_snapshot(&s, AT).activating);
+    // A text inside a list item.
+    let s = snapshot(
+        target("explorer.exe", false),
+        vec![
+            el(UIA_TextControlTypeId),
+            el(UIA_ListItemControlTypeId),
+            el(UIA_ListControlTypeId),
+            window(),
+        ],
+        None,
+    );
+    assert!(spot_from_snapshot(&s, AT).activating);
+    // Chrome's address bar sits in a toolbar but takes text.
+    let omnibox = ElementInfo {
+        value_pattern: true,
+        value_read_only: Some(false),
+        ..el(UIA_EditControlTypeId)
+    };
+    let s = snapshot(
+        target("chrome.exe", false),
+        vec![omnibox, el(UIA_ToolBarControlTypeId), window()],
+        None,
+    );
+    let spot = spot_from_snapshot(&s, AT);
+    assert!(spot.editable_hit && !spot.activating);
 }
 
 // MARK: Snapshot → facts

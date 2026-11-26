@@ -9,9 +9,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use igorio_app::clipboard;
 use igorio_app::draw::Renderer;
-use igorio_app::drop_router::{DebugLog, LiveEnv, Router};
+use igorio_app::drop_router::{DebugLog, Drops};
 use igorio_app::follower::Follower;
 use igorio_app::hook::{self, MouseEvent, MouseHook};
 use igorio_app::overlay::{self, Overlay};
@@ -40,8 +39,6 @@ const FRAME: f64 = 0.008;
 /// The longest sleep. The loop wakes at least this often to check that the mouse hook is
 /// still installed (Windows removes a slow hook without notice).
 const HEALTH_CHECK: f64 = 1.0;
-/// At quit, how long to wait for the user's clipboard to be put back.
-const QUIT_RESTORE_WAIT: Duration = Duration::from_secs(1);
 
 struct App {
     state: FairyState,
@@ -347,21 +344,19 @@ fn main() -> windows::core::Result<()> {
     let sleeper = Sleeper::new()?;
 
     // The drop router and its workers (UI Automation, clipboard). Without them the app
-    // still carries, shakes and restores.
+    // still carries, shakes and restores. Dropping `drops` (on every way out of `main`,
+    // errors and panics included) puts the user's clipboard back if a paste left ours there.
     let settings = Settings::load(&settings::default_settings_path()).unwrap_or_default();
-    let mut drops = match LiveEnv::start(settings, DebugLog::from_env()) {
-        Ok(env) => Some((
-            Router::<clipboard::Snapshot>::new(LiveEnv::primary_button()),
-            env,
-        )),
+    let mut drops = match Drops::start(settings, DebugLog::from_env()) {
+        Ok(drops) => Some(drops),
         Err(why) => {
             eprintln!("double-click drops are off: {why}");
             None
         }
     };
     let mut wakes = vec![mouse_hook.wake_handle()];
-    if let Some((_, env)) = &drops {
-        wakes.extend(env.wake_handles());
+    if let Some(drops) = &drops {
+        wakes.extend(drops.wake_handles());
     }
     // When the next frame runs; `None` waits for a mouse move or a menu action.
     let mut due = Some(hook::now());
@@ -375,18 +370,11 @@ fn main() -> windows::core::Result<()> {
             let mut app = app.borrow_mut();
             let app = &mut *app;
             let moved = app.mouse(&events);
-            if let Some((router, env)) = drops.as_mut() {
-                for event in &events {
-                    router.mouse(*event, &mut app.state, env);
-                }
-                env.pump(router, &mut app.state, now);
-                if router.next_deadline().is_some_and(|at| at <= now) {
-                    router.tick(now, &mut app.state, env);
-                }
-                if router.take_state_changed() {
+            if let Some(drops) = drops.as_mut() {
+                if drops.run(&events, &mut app.state, now) {
                     app.dirty = true;
                 }
-                router_due = router.next_deadline();
+                router_due = drops.next_deadline();
             }
             events.clear();
             if app.needs_frame() {
@@ -412,9 +400,6 @@ fn main() -> windows::core::Result<()> {
         sleeper.wait(wait, &wakes)?;
     }
     // Put the user's clipboard back if a paste left ours there, then stop the workers.
-    if let Some((mut router, mut env)) = drops {
-        let restore = router.quit(hook::now(), &mut env);
-        env.shutdown(restore, QUIT_RESTORE_WAIT);
-    }
+    drop(drops);
     Ok(())
 }

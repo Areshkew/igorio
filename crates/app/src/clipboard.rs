@@ -239,6 +239,13 @@ pub enum ClipError {
     Win32 { call: &'static str, code: i32 },
     /// The clipboard thread is gone.
     Stopped,
+    /// `stage` or `restage` failed after the clipboard was emptied: it is left empty (none
+    /// of the user's data is on it any more). `sequence` is read after `CloseClipboard`.
+    /// Every other `stage` error leaves the clipboard as it was.
+    Emptied {
+        cause: Box<ClipError>,
+        sequence: u32,
+    },
 }
 
 impl fmt::Display for ClipError {
@@ -256,6 +263,9 @@ impl fmt::Display for ClipError {
             ClipError::Payload(why) => write!(f, "bad payload: {why}"),
             ClipError::Win32 { call, code } => write!(f, "{call} failed: {code:#010x}"),
             ClipError::Stopped => write!(f, "clipboard thread stopped"),
+            ClipError::Emptied { cause, sequence } => {
+                write!(f, "clipboard left empty (seq {sequence}) after: {cause}")
+            }
         }
     }
 }
@@ -521,7 +531,18 @@ impl Clipboard {
         snapshot: &Snapshot,
         if_sequence: Option<u32>,
     ) -> Result<Ticket, ClipError> {
-        self.send(Request::Restore(snapshot.clone(), if_sequence))
+        self.send(Request::Restore(
+            snapshot.clone(),
+            RestoreGuard::Sequence(if_sequence),
+        ))
+    }
+
+    /// Writes the snapshot back only if the clipboard still holds our current staging
+    /// (we own it and nobody emptied it since; checked while it is open), else
+    /// [`ClipError::Changed`]. Renders of the staging do not count as changes, unlike a
+    /// sequence-number guard. Reply: [`Done::Restored`].
+    pub fn restore_over_staging(&self, snapshot: &Snapshot) -> Result<Ticket, ClipError> {
+        self.send(Request::Restore(snapshot.clone(), RestoreGuard::OwnStaging))
     }
 
     pub fn try_reply(&self) -> Option<Reply> {
@@ -713,7 +734,7 @@ enum Request {
     Snapshot,
     Stage(Payload),
     Restage,
-    Restore(Snapshot, Option<u32>),
+    Restore(Snapshot, RestoreGuard),
     InspectImage(
         ClipboardChange,
         Instant,
@@ -725,6 +746,38 @@ enum Request {
         Instant,
         Sender<Result<Vec<u8>, ClipError>>,
     ),
+}
+
+/// When a restore may write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreGuard {
+    /// Always, or only at this sequence number.
+    Sequence(Option<u32>),
+    /// Only while our staging is still on the clipboard.
+    OwnStaging,
+}
+
+impl RestoreGuard {
+    /// `current`: the sequence number now; `own_staging`: we own the clipboard and our
+    /// staging was not emptied by someone else.
+    fn allows(self, current: u32, own_staging: bool) -> bool {
+        match self {
+            RestoreGuard::Sequence(expected) => expected.is_none_or(|e| e == current),
+            RestoreGuard::OwnStaging => own_staging,
+        }
+    }
+}
+
+/// A stage error, marked when the clipboard was already emptied.
+fn after_empty(err: ClipError, emptied: bool, sequence: u32) -> ClipError {
+    if emptied {
+        ClipError::Emptied {
+            cause: Box::new(err),
+            sequence,
+        }
+    } else {
+        err
+    }
 }
 
 struct Command {
@@ -887,8 +940,9 @@ fn execute(window: HWND, command: Command) -> Option<Reply> {
         Request::Restage => {
             write_stage(window, ticket, None).map(|sequence| Done::Staged { sequence })
         }
-        Request::Restore(snapshot, if_sequence) => write_restore(window, &snapshot, if_sequence)
-            .map(|sequence| Done::Restored { sequence }),
+        Request::Restore(snapshot, guard) => {
+            write_restore(window, &snapshot, guard).map(|sequence| Done::Restored { sequence })
+        }
     };
     Some(Reply { ticket, result })
 }
@@ -1212,6 +1266,7 @@ fn write_stage(window: HWND, ticket: Ticket, payload: Option<Payload>) -> Result
         .collect::<Result<Vec<_>, ClipError>>()?;
     let open = Open::new(window)?;
     let mut result = empty();
+    let emptied = result.is_ok();
     if result.is_ok() {
         with_owner(|owner| {
             let cache = match owner.stage.take() {
@@ -1237,7 +1292,9 @@ fn write_stage(window: HWND, ticket: Ticket, payload: Option<Payload>) -> Result
     if result.is_err() {
         // Leave no half-written promise behind; the caller restores its snapshot.
         with_owner(|owner| owner.stage = None);
-        let _ = empty();
+        if emptied {
+            let _ = empty();
+        }
     }
     drop(open);
     // Rule 4: after `CloseClipboard`.
@@ -1249,7 +1306,7 @@ fn write_stage(window: HWND, ticket: Ticket, payload: Option<Payload>) -> Result
     .ok_or(ClipError::Stopped)?;
     if let Err(err) = result {
         shared.update(|facts| facts.staged = None);
-        return Err(err);
+        return Err(after_empty(err, emptied, sequence));
     }
     let now = Instant::now();
     shared.update(|facts| match facts.staged.as_mut() {
@@ -1275,11 +1332,7 @@ fn write_stage(window: HWND, ticket: Ticket, payload: Option<Payload>) -> Result
     Ok(sequence)
 }
 
-fn write_restore(
-    window: HWND,
-    snapshot: &Snapshot,
-    if_sequence: Option<u32>,
-) -> Result<u32, ClipError> {
+fn write_restore(window: HWND, snapshot: &Snapshot, guard: RestoreGuard) -> Result<u32, ClipError> {
     let mut blocks = Vec::new();
     for saved in &snapshot.0.formats {
         blocks.push((saved.format, Global::new(&saved.bytes)?));
@@ -1289,7 +1342,10 @@ fn write_restore(
     }
     let open = Open::new(window)?;
     // Comparing while open is exact: nobody else can change the clipboard now.
-    if if_sequence.is_some_and(|expected| sequence() != expected) {
+    // SAFETY: the clipboard is open by this thread.
+    let owner_is_us = unsafe { GetClipboardOwner() }.is_ok_and(|owner| owner == window);
+    let staged = with_owner(|o| o.stage.as_ref().is_some_and(|s| s.owned)).unwrap_or(false);
+    if !guard.allows(sequence(), owner_is_us && staged) {
         return Err(ClipError::Changed);
     }
     with_owner(|owner| owner.stage = None);
@@ -1898,6 +1954,30 @@ fn build_snapshot(
 mod tests {
     use super::*;
     use windows::Win32::UI::Shell::{DragQueryFileW, HDROP as Hdrop};
+
+    #[test]
+    fn restore_guards() {
+        assert!(RestoreGuard::Sequence(None).allows(7, false));
+        assert!(RestoreGuard::Sequence(Some(7)).allows(7, false));
+        assert!(!RestoreGuard::Sequence(Some(7)).allows(8, true));
+        assert!(RestoreGuard::OwnStaging.allows(8, true));
+        assert!(!RestoreGuard::OwnStaging.allows(7, false));
+    }
+
+    #[test]
+    fn stage_errors_say_whether_the_clipboard_was_emptied() {
+        let locked = ClipError::Locked { holder: Some(4) };
+        assert_eq!(after_empty(locked.clone(), false, 9), locked);
+        let emptied = after_empty(locked.clone(), true, 9);
+        assert_eq!(
+            emptied,
+            ClipError::Emptied {
+                cause: Box::new(locked),
+                sequence: 9
+            }
+        );
+        assert!(emptied.to_string().contains("left empty"));
+    }
 
     fn named(id: u32, name: &str) -> (u32, Option<String>) {
         (id, Some(name.into()))
