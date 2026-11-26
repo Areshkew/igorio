@@ -161,6 +161,8 @@ fn reset_snaps_to_the_current_target() {
 #[test]
 fn is_settled_tracks_the_target() {
     let mut follower = Follower::new();
+    // (4, 0) maps to the initial (0, 0) position, but nothing has started yet.
+    assert!(!follower.is_settled(Point::new(4.0, 0.0), SCREEN, 1.0));
     assert!(!follower.is_settled(MIDDLE, SCREEN, 1.0));
     follower.step(MIDDLE, SCREEN, 1.0, 0.016);
     assert!(follower.is_settled(MIDDLE, SCREEN, 1.0));
@@ -170,5 +172,51 @@ fn is_settled_tracks_the_target() {
     for _ in 0..200 {
         follower.step(moved, SCREEN, 1.0, 0.05);
     }
+    assert!(follower.is_settled(moved, SCREEN, 1.0));
+}
+
+#[test]
+fn non_finite_scale_or_mouse_is_ignored() {
+    let mut follower = Follower::new();
+    let snapped = follower.step(MIDDLE, SCREEN, 1.0, 0.016).unwrap();
+    assert_eq!(snapped, Point::new(956.0, 540.0));
+
+    let moved = Point::new(1200.0, 700.0);
+    // A bad scale changes nothing, so the follower is still settled at the old target.
+    assert_eq!(follower.step(moved, SCREEN, f64::NAN, 0.016), None);
+    assert!(follower.is_settled(MIDDLE, SCREEN, 1.0));
+    // A bad mouse makes the target non-finite, which is ignored too.
+    assert_eq!(
+        follower.step(Point::new(f64::NAN, f64::NAN), SCREEN, 1.0, 0.016),
+        None
+    );
+    assert!(follower.is_settled(MIDDLE, SCREEN, 1.0));
+
+    // The follower still works afterwards.
+    assert!(follower.step(moved, SCREEN, 1.0, 0.016).is_some());
+}
+
+#[test]
+fn non_finite_or_non_positive_scale_is_ignored() {
+    let mut follower = Follower::new();
+    for scale in [0.0, -1.0, f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+        assert_eq!(follower.step(MIDDLE, SCREEN, scale, 0.016), None, "scale {scale}");
+        assert!(!follower.is_settled(MIDDLE, SCREEN, scale), "scale {scale}");
+    }
+    // The ignored calls did not start the follower, so this one snaps.
+    assert_eq!(follower.step(MIDDLE, SCREEN, 1.0, 0.016), Some(Point::new(956.0, 540.0)));
+}
+
+#[test]
+fn a_non_finite_position_heals_by_snapping() {
+    let mut follower = Follower::new();
+    follower.step(MIDDLE, SCREEN, 1.0, 0.016);
+    // `stiffness` is public; a bad value drives the stored position non-finite.
+    follower.stiffness = f64::NAN;
+    let moved = Point::new(1200.0, 700.0);
+    assert_eq!(follower.step(moved, SCREEN, 1.0, 0.016), None);
+    follower.stiffness = 16.0;
+    let target = follower.target_origin(moved, SCREEN, 1.0);
+    assert_eq!(follower.step(moved, SCREEN, 1.0, 0.016), Some(target));
     assert!(follower.is_settled(moved, SCREEN, 1.0));
 }

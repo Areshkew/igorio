@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,26 +45,30 @@ impl Settings {
         self.capabilities.insert(capability_id.to_owned(), on);
     }
 
-    /// Reads the file. A missing file gives defaults. A file that cannot be parsed gives
-    /// defaults and is copied to `<name>.bad` so the user's data is not lost on the next save.
-    pub fn load(path: &Path) -> Settings {
+    /// Reads the file. A missing file gives defaults. A UTF-8 byte order mark is skipped.
+    /// A file that cannot be parsed gives defaults after a copy was kept as `<name>.bad`
+    /// (or `.bad.1`, `.bad.2`, ... so older copies survive). Any other read error, or a
+    /// failed copy, is returned as `Err`; the caller must not save then.
+    pub fn load(path: &Path) -> io::Result<Settings> {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
-            Err(_) => return Settings::default(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Settings::default());
+            }
+            Err(error) => return Err(error),
         };
-        match serde_json::from_slice(&bytes) {
-            Ok(settings) => settings,
+        let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+        match serde_json::from_slice(bytes) {
+            Ok(settings) => Ok(settings),
             Err(_) => {
-                let mut bad = path.as_os_str().to_owned();
-                bad.push(".bad");
-                let _ = fs::copy(path, PathBuf::from(bad));
-                Settings::default()
+                fs::copy(path, bad_path(path))?;
+                Ok(Settings::default())
             }
         }
     }
 
-    /// Writes pretty JSON to a temp file in the same folder, then renames it over `path`
-    /// (so a crash never leaves half a file). Creates the parent folder.
+    /// Writes pretty JSON to a temp file in the same folder, flushes it to disk, then renames
+    /// it over `path` (so a crash never leaves half a file). Creates the parent folder.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -73,16 +77,23 @@ impl Settings {
         }
         let json = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
         let temp = temp_path(path);
-        fs::write(&temp, json)?;
-        if let Err(error) = fs::rename(&temp, path) {
+        let result = (|| -> io::Result<()> {
+            {
+                let mut file = fs::File::create(&temp)?;
+                file.write_all(&json)?;
+                file.sync_all()?;
+            }
+            fs::rename(&temp, path)
+        })();
+        if result.is_err() {
             let _ = fs::remove_file(&temp);
-            return Err(error);
         }
-        Ok(())
+        result
     }
 
-    /// The folder to use for notes: the chosen one if it exists or can be created and is
-    /// writable, otherwise the default. Returns (folder, used_fallback).
+    /// The folder to use for notes: the chosen one if it is an absolute path that exists or
+    /// can be created, otherwise the default. The returned folder is created when possible.
+    /// Returns (folder, used_fallback).
     pub fn notes_dir(&self, defaults: &DefaultFolders) -> (PathBuf, bool) {
         pick_folder(self.notes_folder.as_deref(), &defaults.notes)
     }
@@ -93,38 +104,50 @@ impl Settings {
 
     /// `<captures>\Pasted`: screenshots pasted into a terminal as a file path are kept here.
     pub fn pasted_dir(&self, defaults: &DefaultFolders) -> PathBuf {
-        self.captures_dir(defaults).0.join("Pasted")
+        let folder = self.captures_dir(defaults).0.join("Pasted");
+        let _ = fs::create_dir_all(&folder);
+        folder
     }
 }
 
-/// The chosen folder when it is usable, else the default.
+/// The chosen folder when it is absolute and can be created, else the default. The returned
+/// folder is created; if even the default cannot be created it is still returned, so the
+/// caller can report the error when writing.
 fn pick_folder(chosen: Option<&Path>, default: &Path) -> (PathBuf, bool) {
     match chosen {
-        Some(chosen) => match usable_folder(chosen) {
-            Some(folder) => (folder, false),
-            None => (default.to_path_buf(), true),
-        },
-        None => (default.to_path_buf(), false),
+        Some(chosen) if chosen.is_absolute() && fs::create_dir_all(chosen).is_ok() => {
+            (chosen.to_path_buf(), false)
+        }
+        Some(_) => {
+            let _ = fs::create_dir_all(default);
+            (default.to_path_buf(), true)
+        }
+        None => {
+            let _ = fs::create_dir_all(default);
+            (default.to_path_buf(), false)
+        }
     }
 }
 
-/// Creates the folder if needed and checks that a small file can be written there.
-fn usable_folder(path: &Path) -> Option<PathBuf> {
-    if fs::create_dir_all(path).is_err() || !path.is_dir() {
-        return None;
+/// The first free name for the copy of an unparsable file: `<file name>.bad`, then
+/// `.bad.1` through `.bad.9`; an existing `.bad.9` is reused last.
+fn bad_path(path: &Path) -> PathBuf {
+    let mut base = path.as_os_str().to_owned();
+    base.push(".bad");
+    let first = PathBuf::from(&base);
+    if !first.exists() {
+        return first;
     }
-    let probe = path.join(format!(
-        ".igorio-write-probe-{}-{}",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    match fs::write(&probe, b"") {
-        Ok(()) => {
-            let _ = fs::remove_file(&probe);
-            Some(path.to_path_buf())
+    let mut candidate = first;
+    for n in 1..=9 {
+        let mut name = base.clone();
+        name.push(format!(".{n}"));
+        candidate = PathBuf::from(name);
+        if n == 9 || !candidate.exists() {
+            break;
         }
-        Err(_) => None,
     }
+    candidate
 }
 
 /// A sibling temp file used by `save` before the rename.
@@ -180,10 +203,11 @@ pub fn default_settings_path() -> PathBuf {
 /// Resolves a known folder. The only unsafe code in this module: one Win32 call and freeing
 /// its result.
 fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
-    // SAFETY: SHGetKnownFolderPath returns a NUL-terminated UTF-16 path allocated with
-    // CoTaskMemAlloc, or an error. We copy the wide string into an OsString and then free
-    // that exact pointer once with CoTaskMemFree, as the API requires. `id` points at a
-    // `'static` GUID provided by the windows crate.
+    // SAFETY: `id` points at a `'static` GUID from the windows crate. On success the call
+    // returns the single out pointer, a NUL-terminated UTF-16 path allocated with
+    // CoTaskMemAlloc. We copy the text into an OsString and free that exact pointer once
+    // with CoTaskMemFree. The windows crate wrapper only exposes the out pointer in its Ok
+    // result, so on failure there is no pointer to free and nothing leaks.
     unsafe {
         let path = SHGetKnownFolderPath(id, KF_FLAG_DONT_VERIFY, None).ok()?;
         let result = OsString::from_wide(path.as_wide());
