@@ -17,6 +17,8 @@ use crate::scene::{Leaving, Scene, SceneCard};
 
 /// How many reduced copies of source images are kept between frames.
 const CACHE_LIMIT: usize = 16;
+/// Opacity of the dark pill behind the hint text, out of 255.
+const HINT_PILL_ALPHA: u32 = 150;
 /// Transparent padding around the movie-card layer, so its rotated edge can be filtered.
 const LAYER_BORDER: f32 = 2.0;
 
@@ -72,16 +74,13 @@ struct StaticLayer {
 }
 
 pub struct Renderer {
-    medium: Font,
     semibold: Font,
     /// Card content (image plus badge) drawn unrotated before it is placed in the sprite.
     layer: Pixmap,
-    /// Reused alpha mask for shadows and the hint glow.
+    /// Reused alpha mask for shadows.
     mask: Mask,
     /// Ping-pong buffer for the box blur.
     blur: Vec<u8>,
-    /// Rasterized hint coverage, kept for the text pass after the glow is blurred.
-    hint_alpha: Vec<u8>,
     images: HashMap<(usize, u64), CachedImage>,
     cards: HashMap<CardKey, CachedCard>,
     hint: Option<Arc<HintSprite>>,
@@ -96,12 +95,10 @@ impl Renderer {
             Font::from_bytes(bytes, FontSettings::default()).expect("embedded Barlow font")
         };
         Self {
-            medium: load(theme::FONT_MEDIUM),
             semibold: load(theme::FONT_SEMIBOLD),
             layer: Pixmap::new(1, 1).expect("1x1 pixmap"),
             mask: Mask::new(1, 1).expect("1x1 mask"),
             blur: Vec::new(),
-            hint_alpha: Vec::new(),
             images: HashMap::new(),
             cards: HashMap::new(),
             hint: None,
@@ -610,8 +607,11 @@ impl Renderer {
     }
 
     fn build_hint_sprite(&mut self, text: &str, s: f32) -> HintSprite {
+        // White text on a dark pill. A glow behind the text (the Swift look) reads as
+        // blur whenever its colour contrasts with the desktop; a hard-edged pill does not.
+        let font = &self.semibold;
         let px = 11.0 * s;
-        let Some(metrics) = self.medium.horizontal_line_metrics(px) else {
+        let Some(metrics) = font.horizontal_line_metrics(px) else {
             return HintSprite {
                 text: text.to_string(),
                 scale: s.to_bits(),
@@ -620,60 +620,49 @@ impl Renderer {
                 origin_y: 0,
             };
         };
-        let text_width = text_advance(&self.medium, text, px);
+        let text_width = text_advance(font, text, px);
         let text_height = metrics.ascent - metrics.descent;
-        let blur_radius = shadow_blur_radius(2.0 * s);
-        let pad = 3.0 * blur_radius as f32 + 2.0 + 2.0 * s;
-        let left = -pad.ceil() as i32;
-        let top = -pad.ceil() as i32;
-        let right = (text_width + pad).ceil() as i32;
-        let bottom = (text_height + pad).ceil() as i32;
+        // The pill reaches past the text on every side; one more pixel for its soft edge.
+        let (pad_x, pad_y) = (6.0 * s, 2.5 * s);
+        let left = -(pad_x + 1.0).ceil() as i32;
+        let top = -(pad_y + 1.0).ceil() as i32;
+        let right = (text_width + pad_x + 1.0).ceil() as i32;
+        let bottom = (text_height + pad_y + 1.0).ceil() as i32;
         let box_w = (right - left).max(1) as u32;
         let box_h = (bottom - top).max(1) as u32;
 
-        self.hint_alpha.clear();
-        self.hint_alpha.resize(box_w as usize * box_h as usize, 0);
-        rasterize_text(
-            &self.medium,
-            text,
-            px,
-            -left as f32,
-            metrics.ascent - top as f32,
-            box_w,
-            &mut self.hint_alpha,
-        );
-
-        // White glow behind the text, like the Swift white shadow at 90%, radius 2.
-        ensure_mask(&mut self.mask, box_w, box_h);
-        self.mask.clear();
-        self.mask.data_mut().copy_from_slice(&self.hint_alpha);
-        box_blur_3(&mut self.mask, &mut self.blur, blur_radius);
-        // Thin glyphs blur to a faint haze, which makes the text look out of focus. Boost
-        // the halo so it is a compact light plate under the text.
-        for alpha in self.mask.data_mut() {
-            *alpha = (*alpha as u32 * 3).min(255) as u8;
-        }
-        let glow = Paint {
-            shader: Shader::SolidColor(Color::from_rgba8(
-                255,
-                255,
-                255,
-                (0.9f32 * 255.0).round().clamp(0.0, 255.0) as u8,
-            )),
+        let mut pixmap = Pixmap::new(box_w, box_h).expect("hint pixmap");
+        let (pill_x, pill_y) = (-left as f32 - pad_x, -top as f32 - pad_y);
+        let (pill_w, pill_h) = (text_width + 2.0 * pad_x, text_height + 2.0 * pad_y);
+        let r = pill_h / 2.0;
+        let opaque = Paint {
+            shader: Shader::SolidColor(Color::BLACK),
+            anti_alias: true,
             ..Paint::default()
         };
-        let rect = Rect::from_xywh(0.0, 0.0, box_w as f32, box_h as f32).expect("hint rect");
-        let mut pixmap = Pixmap::new(box_w, box_h).expect("hint pixmap");
-        pixmap.fill(Color::TRANSPARENT);
-        pixmap.fill_rect(rect, &glow, Transform::identity(), Some(&self.mask));
+        // Drawn opaque so the overlapping parts do not add up, then faded as a whole.
+        let body = Rect::from_xywh(pill_x + r, pill_y, (pill_w - 2.0 * r).max(1.0), pill_h);
+        for path in [
+            body.map(PathBuilder::from_rect),
+            PathBuilder::from_circle(pill_x + r, pill_y + r, r),
+            PathBuilder::from_circle(pill_x + pill_w - r, pill_y + r, r),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            pixmap.fill_path(&path, &opaque, FillRule::Winding, Transform::identity(), None);
+        }
+        for pixel in pixmap.data_mut().as_chunks_mut::<4>().0 {
+            pixel[3] = (pixel[3] as u32 * HINT_PILL_ALPHA / 255) as u8;
+        }
         draw_text(
-            &self.medium,
+            font,
             &mut pixmap,
             text,
             px,
             -left as f32,
             metrics.ascent - top as f32,
-            theme::MUTED,
+            [255, 255, 255, 255],
         );
 
         HintSprite {
@@ -960,45 +949,6 @@ fn draw_text(
                     if coverage > 0.0 {
                         let index = (y as usize * width as usize + x as usize) * 4;
                         blend_pixel(data, index, color, coverage);
-                    }
-                }
-            }
-        }
-        pen += metrics.advance_width;
-    }
-}
-
-fn rasterize_text(
-    font: &Font,
-    text: &str,
-    px: f32,
-    x: f32,
-    baseline: f32,
-    width: u32,
-    out: &mut [u8],
-) {
-    let height = (out.len() / width.max(1) as usize) as u32;
-    let mut pen = x;
-    for ch in text.chars() {
-        let (metrics, bitmap) = font.rasterize(ch, px);
-        if metrics.width > 0 && metrics.height > 0 {
-            let glyph_x = (pen + metrics.xmin as f32).round() as i32;
-            let glyph_y = (baseline - (metrics.ymin + metrics.height as i32) as f32).round() as i32;
-
-            for row in 0..metrics.height {
-                let y = glyph_y + row as i32;
-                if y < 0 || y >= height as i32 {
-                    continue;
-                }
-                for col in 0..metrics.width {
-                    let x = glyph_x + col as i32;
-                    if x < 0 || x >= width as i32 {
-                        continue;
-                    }
-                    let coverage = bitmap[row * metrics.width + col];
-                    let index = y as usize * width as usize + x as usize;
-                    if coverage > out[index] {
-                        out[index] = coverage;
                     }
                 }
             }
