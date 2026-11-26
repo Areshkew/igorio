@@ -49,7 +49,10 @@ fn defaults_are_empty_and_off() {
     assert_eq!(settings.captures_folder, None);
     assert!(!settings.keep_every_screenshot);
     assert!(!settings.launch_at_login);
-    assert_eq!(settings, Settings::load(&PathBuf::from("does-not-exist-anywhere.json")));
+    assert_eq!(
+        settings,
+        Settings::load(&PathBuf::from("does-not-exist-anywhere.json")).unwrap()
+    );
 }
 
 #[test]
@@ -80,13 +83,16 @@ fn save_then_load_round_trips() {
     settings.launch_at_login = true;
 
     settings.save(&path).unwrap();
-    assert_eq!(Settings::load(&path), settings);
+    assert_eq!(Settings::load(&path).unwrap(), settings);
 }
 
 #[test]
 fn missing_file_gives_defaults() {
     let scratch = Scratch::new("missing");
-    assert_eq!(Settings::load(&scratch.path("settings.json")), Settings::default());
+    assert_eq!(
+        Settings::load(&scratch.path("settings.json")).unwrap(),
+        Settings::default()
+    );
 }
 
 #[test]
@@ -96,10 +102,61 @@ fn corrupt_file_gives_defaults_and_keeps_a_bad_copy() {
     let junk = "{ this is not json";
     fs::write(&path, junk).unwrap();
 
-    assert_eq!(Settings::load(&path), Settings::default());
+    assert_eq!(Settings::load(&path).unwrap(), Settings::default());
     let bad = scratch.path("settings.json.bad");
     assert!(bad.is_file(), "expected {:?} to exist", bad);
     assert_eq!(fs::read_to_string(&bad).unwrap(), junk);
+}
+
+#[test]
+fn older_bad_copies_are_kept_up_to_nine() {
+    let scratch = Scratch::new("bad-copies");
+    let path = scratch.path("settings.json");
+    let junk = "{ this is not json";
+    fs::write(&path, junk).unwrap();
+
+    for _ in 0..3 {
+        assert_eq!(Settings::load(&path).unwrap(), Settings::default());
+    }
+    for name in ["settings.json.bad", "settings.json.bad.1", "settings.json.bad.2"] {
+        assert_eq!(fs::read_to_string(scratch.path(name)).unwrap(), junk, "{name}");
+    }
+
+    for n in 3..=8 {
+        fs::write(scratch.path(&format!("settings.json.bad.{n}")), "older").unwrap();
+    }
+    Settings::load(&path).unwrap();
+    assert_eq!(
+        fs::read_to_string(scratch.path("settings.json.bad.9")).unwrap(),
+        junk
+    );
+
+    // An existing .bad.9 is the last one and is overwritten, nothing newer is made.
+    fs::write(scratch.path("settings.json.bad.9"), "older").unwrap();
+    Settings::load(&path).unwrap();
+    assert_eq!(
+        fs::read_to_string(scratch.path("settings.json.bad.9")).unwrap(),
+        junk
+    );
+    assert_eq!(
+        fs::read_to_string(scratch.path("settings.json.bad.1")).unwrap(),
+        junk,
+        "an older copy must not be overwritten"
+    );
+    assert!(!scratch.path("settings.json.bad.10").exists());
+}
+
+#[test]
+fn a_utf8_bom_is_skipped() {
+    let scratch = Scratch::new("bom");
+    let path = scratch.path("settings.json");
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(br#"{"launch_at_login": true}"#);
+    fs::write(&path, bytes).unwrap();
+
+    let settings = Settings::load(&path).unwrap();
+    assert!(settings.launch_at_login);
+    assert!(!scratch.path("settings.json.bad").exists());
 }
 
 #[test]
@@ -112,7 +169,7 @@ fn unknown_fields_are_ignored_and_missing_fields_default() {
     )
     .unwrap();
 
-    let settings = Settings::load(&path);
+    let settings = Settings::load(&path).unwrap();
     assert!(settings.launch_at_login);
     assert!(!settings.is_enabled("notes"));
     assert!(settings.is_enabled("screenshots"));
@@ -123,6 +180,33 @@ fn unknown_fields_are_ignored_and_missing_fields_default() {
         settings.capabilities,
         BTreeMap::from([("notes".to_owned(), false)])
     );
+}
+
+#[test]
+fn a_locked_file_is_an_error_not_defaults() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let scratch = Scratch::new("locked");
+    let path = scratch.path("settings.json");
+    Settings {
+        launch_at_login: true,
+        ..Settings::default()
+    }
+    .save(&path)
+    .unwrap();
+
+    // Another program (antivirus, a sync tool) holding the file with no sharing.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+    let error = Settings::load(&path).unwrap_err();
+    assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+    drop(lock);
+
+    // Once the file is free again, the real settings are still there.
+    assert!(Settings::load(&path).unwrap().launch_at_login);
 }
 
 #[test]
@@ -141,6 +225,23 @@ fn save_creates_the_parent_folder_and_leaves_no_temp_file() {
 }
 
 #[test]
+fn save_syncs_the_temp_file_before_the_rename() {
+    let scratch = Scratch::new("sync");
+    let path = scratch.path("settings.json");
+    let settings = Settings {
+        launch_at_login: true,
+        ..Settings::default()
+    };
+
+    settings.save(&path).unwrap();
+
+    // The write handle is closed and the whole document is on disk, not a prefix.
+    let bytes = fs::read(&path).unwrap();
+    assert!(!bytes.is_empty());
+    assert_eq!(Settings::load(&path).unwrap(), settings);
+}
+
+#[test]
 fn notes_dir_uses_and_creates_the_chosen_folder() {
     let scratch = Scratch::new("notes-dir");
     let chosen = scratch.path("chosen-notes");
@@ -155,7 +256,39 @@ fn notes_dir_uses_and_creates_the_chosen_folder() {
 }
 
 #[test]
-fn unwritable_chosen_folder_falls_back() {
+fn folders_are_created_without_write_probes() {
+    let scratch = Scratch::new("no-probe");
+    let chosen = scratch.path("chosen");
+    let defaults = defaults(&scratch);
+    let settings = Settings {
+        notes_folder: Some(chosen.clone()),
+        ..Settings::default()
+    };
+
+    assert_eq!(settings.notes_dir(&defaults), (chosen.clone(), false));
+    // No probe file (or anything else) was left behind.
+    assert_eq!(fs::read_dir(&chosen).unwrap().count(), 0);
+}
+
+#[test]
+fn relative_chosen_folders_are_unusable() {
+    let scratch = Scratch::new("relative");
+    let defaults = defaults(&scratch);
+    let relative = format!("igorio-rel-notes-{}", std::process::id());
+
+    for chosen in [PathBuf::from(&relative), PathBuf::from("C:notes")] {
+        let settings = Settings {
+            notes_folder: Some(chosen),
+            ..Settings::default()
+        };
+        assert_eq!(settings.notes_dir(&defaults), (defaults.notes.clone(), true));
+    }
+    // Nothing was created relative to the current directory.
+    assert!(!std::env::current_dir().unwrap().join(&relative).exists());
+}
+
+#[test]
+fn unwritable_chosen_folder_falls_back_and_creates_the_default() {
     let scratch = Scratch::new("fallback");
     let blocker = scratch.path("blocker");
     fs::write(&blocker, b"a file, not a folder").unwrap();
@@ -166,28 +299,37 @@ fn unwritable_chosen_folder_falls_back() {
     };
 
     assert_eq!(settings.notes_dir(&defaults), (defaults.notes.clone(), true));
+    assert!(defaults.notes.is_dir());
 }
 
 #[test]
-fn no_chosen_folder_uses_the_default_without_fallback() {
+fn no_chosen_folder_uses_and_creates_the_default() {
     let scratch = Scratch::new("default-folder");
     let defaults = defaults(&scratch);
     let settings = Settings::default();
+    assert!(!defaults.notes.exists());
+    assert!(!defaults.captures.exists());
 
     assert_eq!(settings.notes_dir(&defaults), (defaults.notes.clone(), false));
     assert_eq!(settings.captures_dir(&defaults), (defaults.captures.clone(), false));
+    assert!(defaults.notes.is_dir());
+    assert!(defaults.captures.is_dir());
 }
 
 #[test]
-fn pasted_dir_is_captures_pasted() {
+fn pasted_dir_is_captures_pasted_and_created() {
     let scratch = Scratch::new("pasted");
     let defaults = defaults(&scratch);
     let mut settings = Settings::default();
-    assert_eq!(settings.pasted_dir(&defaults), defaults.captures.join("Pasted"));
+    let pasted = settings.pasted_dir(&defaults);
+    assert_eq!(pasted, defaults.captures.join("Pasted"));
+    assert!(pasted.is_dir());
 
     let chosen = scratch.path("chosen-captures");
     settings.captures_folder = Some(chosen.clone());
-    assert_eq!(settings.pasted_dir(&defaults), chosen.join("Pasted"));
+    let pasted = settings.pasted_dir(&defaults);
+    assert_eq!(pasted, chosen.join("Pasted"));
+    assert!(pasted.is_dir());
 }
 
 #[test]

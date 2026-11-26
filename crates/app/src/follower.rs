@@ -83,9 +83,11 @@ impl Follower {
     /// Advances by `dt` seconds (clamped to 0.0..=0.05; NaN counts as 0).
     /// The first call after new/reset snaps to the target. Returns the new origin when it
     /// moved more than 0.05 px on either axis since the last returned value, else None.
+    /// A call whose target is not finite (NaN/infinite mouse, scale or work area) is ignored.
     pub fn step(&mut self, mouse: Point, work_area: Rect, scale: f64, dt: f64) -> Option<Point> {
-        let target = self.target_origin(mouse, work_area, scale);
-        if !self.started {
+        let target = self.finite_target(mouse, work_area, scale)?;
+        if !self.started || !self.position.x.is_finite() || !self.position.y.is_finite() {
+            // A non-finite position (for example from a bad `stiffness`) heals by snapping.
             self.started = true;
             self.position = target;
             self.reported = target;
@@ -108,9 +110,28 @@ impl Follower {
     }
 
     /// True when the position is within 0.5 px of the target (the caller can stop ticking).
+    /// False before the first `step` and for a non-finite or non-positive scale.
     pub fn is_settled(&self, mouse: Point, work_area: Rect, scale: f64) -> bool {
-        let target = self.target_origin(mouse, work_area, scale);
+        if !self.started {
+            return false;
+        }
+        let Some(target) = self.finite_target(mouse, work_area, scale) else {
+            return false;
+        };
         (self.position.x - target.x).abs() <= 0.5 && (self.position.y - target.y).abs() <= 0.5
+    }
+
+    /// The target when the inputs and the result are finite, so callers can ignore bad
+    /// values without touching the stored position.
+    fn finite_target(&self, mouse: Point, work_area: Rect, scale: f64) -> Option<Point> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        let target = self.target_origin(mouse, work_area, scale);
+        if !target.x.is_finite() || !target.y.is_finite() {
+            return None;
+        }
+        Some(target)
     }
 }
 
