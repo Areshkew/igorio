@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use igorio_kit::theme;
 use windows::Win32::Foundation::{
@@ -29,7 +30,8 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObj
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetFocus, IsWindowEnabled, SetFocus, VK_RETURN,
+    EnableWindow, GetFocus, IsWindowEnabled, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VK_MENU, VK_RETURN,
 };
 use windows::Win32::UI::Shell::{
     DefSubclassProc, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog,
@@ -48,8 +50,7 @@ const CLASS: PCWSTR = w!("IgorioSettings");
 const OPEN: u32 = WM_APP + 1;
 const PICK: u32 = WM_APP + 2;
 const WORKER_EXITED: isize = -1;
-const STYLE: WINDOW_STYLE =
-    WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0 | WS_CLIPCHILDREN.0);
+const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
 const EX_STYLE: WINDOW_EX_STYLE = WS_EX_APPWINDOW;
 
 fn wide(text: impl AsRef<OsStr>) -> Vec<u16> {
@@ -250,6 +251,105 @@ impl Drop for SettingsWindow {
 }
 
 const TEST_CHOOSE: u32 = WM_APP + 3;
+
+/// Isolated compositor samples. A scene changes only the test clock and paint state.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub enum TestScene {
+    Settled,
+    SwitchSlide,
+    CardSlide,
+    ButtonHover,
+    ButtonPress,
+    SwitchFocus,
+    CardFocus,
+}
+
+const TEST_SCENE: u32 = WM_APP + 4;
+const TEST_IDLE: u32 = WM_APP + 5;
+
+impl SettingsWindow {
+    #[doc(hidden)]
+    pub fn test_scene(&self, scene: TestScene) {
+        if let Some(hwnd) = self.test_hwnd() {
+            // SAFETY: scalar test command to our own settings window.
+            unsafe { SendMessageW(hwnd, TEST_SCENE, Some(WPARAM(scene as usize)), None) };
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn test_idle(&self) -> bool {
+        self.test_hwnd().is_some_and(|hwnd| {
+            // SAFETY: scalar query to our own settings window.
+            unsafe { SendMessageW(hwnd, TEST_IDLE, None, None) }.0 == 1
+        })
+    }
+}
+
+impl Window<'_> {
+    fn test_scene(&self, scene: usize) {
+        let settings = self.model.borrow().settings.clone();
+        let size = match settings.card_size {
+            CardSize::Small => 0,
+            CardSize::Medium => 1,
+            CardSize::Large => 2,
+        };
+        let dimensions = if scene == TestScene::CardSlide as usize {
+            CardSize::Large
+        } else {
+            settings.card_size
+        }
+        .thumb_max();
+        self.text(CardDimensions, &format!("{} × {} px", dimensions.width, dimensions.height));
+        let mut motion = self.motion.borrow_mut();
+        motion.settle();
+        motion.select_card(size, 0.0, 0.0);
+        for button in &mut motion.buttons {
+            button.focus = Transition::default();
+            button.hover = Transition::default();
+            button.press = Transition::default();
+        }
+        let from = 1000.0;
+        let sample = match scene {
+            n if n == TestScene::SwitchSlide as usize => {
+                let track = &mut motion.buttons[Screenshots.index()].checked;
+                track.retarget(0.0, from, 0.0);
+                track.retarget(1.0, from, SWITCH_MS);
+                from + SWITCH_MS / 8.0
+            }
+            n if n == TestScene::CardSlide as usize => {
+                motion.select_card(0, from, 0.0);
+                motion.select_card(2, from, CARD_MS);
+                from + CARD_MS / 8.0
+            }
+            n if n == TestScene::ButtonHover as usize || n == TestScene::ButtonPress as usize => {
+                let button = &mut motion.buttons[ChooseNotes.index()];
+                button.hover.retarget(1.0, from, 80.0);
+                if n == TestScene::ButtonPress as usize {
+                    button.press.retarget(1.0, from, 80.0);
+                }
+                from + 80.0
+            }
+            n if n == TestScene::SwitchFocus as usize => {
+                motion.buttons[Screenshots.index()].focus.retarget(1.0, from, FOCUS_MS);
+                from + FOCUS_MS
+            }
+            n if n == TestScene::CardFocus as usize => {
+                motion.select_card(0, from, 0.0);
+                motion.buttons[Small.index()].focus.retarget(1.0, from, FOCUS_MS);
+                from + FOCUS_MS
+            }
+            _ => from,
+        };
+        drop(motion);
+        self.frozen.set(Some(sample));
+        self.update_animation();
+        // SAFETY: test-only flush of our own client before PrintWindow samples the frame.
+        let _ =
+            unsafe { RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW) };
+    }
+}
 const RUN_KEY: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
 
 trait RunValue {
@@ -341,6 +441,7 @@ struct Palette {
     accent: COLORREF,
     selected: COLORREF,
     on: COLORREF,
+    off: COLORREF,
     thumb: COLORREF,
     disabled: COLORREF,
     error: COLORREF,
@@ -361,9 +462,10 @@ const LIGHT: Palette = Palette {
     text: token(theme::TEXT),
     muted: token(theme::MUTED),
     outline: rgb(0x768398),
-    accent: rgb(0x215bc1),
+    accent: rgb(0x09265b),
     selected: rgb(0xdce9fc),
-    on: token(theme::TEXT),
+    on: rgb(0x5976a6),
+    off: rgb(0x768398),
     thumb: rgb(0xffffff),
     disabled: rgb(0xb2bac7),
     error: rgb(0x9a2926),
@@ -375,10 +477,11 @@ const DARK: Palette = Palette {
     text: rgb(0xeaf0fc),
     muted: rgb(0xaab7cc),
     outline: rgb(0x8090a8),
-    accent: rgb(0x91baff),
+    accent: rgb(0xd9e8ff),
     selected: rgb(0x344a6b),
-    on: rgb(0xb1ceff),
-    thumb: rgb(0x192435),
+    on: rgb(0x4775aa),
+    off: rgb(0x536781),
+    thumb: rgb(0xf1f5ff),
     disabled: rgb(0x525d70),
     error: rgb(0xffaaa4),
 };
@@ -495,7 +598,7 @@ const fn item(id: Control, kind: Kind, text: &'static str, rect: [i32; 4]) -> It
 }
 
 const WIDTH: i32 = 512;
-const HEIGHT: i32 = 590;
+const HEIGHT: i32 = 560;
 const STATUS_HEIGHT: i32 = 53;
 const KEEP_PATCH: [i32; 4] = [24, 116, 464, 36];
 
@@ -545,8 +648,230 @@ const ITEMS: &[Item] = &[
     item(Retry, Kind::Push("&Retry"), "&Retry saving settings", [418, 588, 70, 29]),
 ];
 
-// Keep a fixed client size. Reserve a line under each folder for fallback feedback.
 const CARD_PATCH: [i32; 4] = [24, 437, 464, 91];
+
+const TIMER: usize = 1;
+const FOCUS_MS: f64 = 80.0;
+const SWITCH_MS: f64 = 150.0;
+const CARD_MS: f64 = 180.0;
+const ROW_MS: f64 = 150.0;
+const OPEN_MS: f64 = 120.0;
+const THEME_MS: f64 = 200.0;
+
+fn ease(progress: f64) -> f64 {
+    // For cubic-bezier(0, 0, 0, 1), x = t³ and y = 3t² - 2t³.
+    let t = progress.clamp(0.0, 1.0).cbrt();
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[derive(Clone, Copy, Default)]
+struct Transition {
+    from: f64,
+    to: f64,
+    start: f64,
+    duration: f64,
+}
+
+impl Transition {
+    fn value(self, now: f64) -> f64 {
+        if self.active(now) {
+            let progress = ease((now - self.start) / self.duration);
+            self.from + (self.to - self.from) * progress
+        } else {
+            self.to
+        }
+    }
+
+    fn active(self, now: f64) -> bool {
+        self.from != self.to && self.duration > 0.0 && now < self.start + self.duration
+    }
+
+    fn retarget(&mut self, to: f64, now: f64, duration: f64) {
+        if duration == 0.0 {
+            *self = Self { from: to, to, ..Self::default() };
+        } else if self.to != to {
+            *self = Self { from: self.value(now), to, start: now, duration };
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ButtonMotion {
+    checked: Transition,
+    hover: Transition,
+    press: Transition,
+    focus: Transition,
+}
+
+impl ButtonMotion {
+    fn tracks(&self) -> [Transition; 4] {
+        [self.checked, self.hover, self.press, self.focus]
+    }
+}
+
+const CONTROLS: usize = Retry as usize - Capabilities as usize + 1;
+
+impl Control {
+    fn index(self) -> usize {
+        self as usize - Capabilities as usize
+    }
+}
+
+struct Motion {
+    enabled: bool,
+    intro: Transition,
+    theme: Transition,
+    card: Transition,
+    selection: [Transition; 2],
+    folders: [Transition; 2],
+    status: Transition,
+    retry: Transition,
+    buttons: [ButtonMotion; CONTROLS],
+}
+
+impl Motion {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            intro: Transition::default(),
+            theme: Transition::default(),
+            card: Transition::default(),
+            selection: [Transition::default(); 2],
+            folders: [Transition::default(); 2],
+            status: Transition::default(),
+            retry: Transition::default(),
+            buttons: [ButtonMotion::default(); CONTROLS],
+        }
+    }
+
+    fn select_card(&mut self, index: i32, now: f64, duration: f64) {
+        let item = Item::lookup(Small as i32 + index).expect("size choice");
+        self.card.retarget(f64::from(index), now, duration);
+        self.selection[0].retarget(f64::from(item.rect[0]), now, duration);
+        self.selection[1].retarget(f64::from(item.rect[0] + item.rect[2]), now, duration);
+    }
+
+    fn duration(&self, duration: f64) -> f64 {
+        if self.enabled { duration } else { 0.0 }
+    }
+
+    fn active(&self, now: f64) -> bool {
+        self.enabled && self.tracks().any(|track| track.active(now))
+    }
+
+    fn tracks(&self) -> impl Iterator<Item = Transition> + '_ {
+        [
+            self.intro,
+            self.theme,
+            self.card,
+            self.folders[0],
+            self.folders[1],
+            self.status,
+            self.retry,
+        ]
+        .into_iter()
+        .chain(self.selection)
+        .chain(self.buttons.iter().flat_map(ButtonMotion::tracks))
+    }
+
+    fn settle(&mut self) {
+        let snap = |track: &mut Transition| track.retarget(track.to, 0.0, 0.0);
+        for track in [
+            &mut self.intro,
+            &mut self.theme,
+            &mut self.card,
+            &mut self.folders[0],
+            &mut self.status,
+            &mut self.retry,
+        ] {
+            snap(track);
+        }
+        snap(&mut self.folders[1]);
+        self.selection.iter_mut().for_each(snap);
+        for button in &mut self.buttons {
+            for track in
+                [&mut button.checked, &mut button.hover, &mut button.press, &mut button.focus]
+            {
+                snap(track);
+            }
+        }
+    }
+}
+
+fn animation_effects() -> bool {
+    let mut enabled = windows::core::BOOL(0);
+    // SAFETY: SPI_GETCLIENTAREAANIMATION writes exactly one BOOL.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&mut enabled as *mut windows::core::BOOL).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .is_ok()
+        && enabled.as_bool()
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Layout {
+    notes: i32,
+    captures: i32,
+    status: i32,
+}
+
+impl Layout {
+    fn rect(self, item: &Item, dpi: u32) -> RECT {
+        let mut rect = item.rect;
+        rect[1] += self.offset(item.id);
+        scaled(rect, dpi)
+    }
+
+    fn offset(self, id: Control) -> i32 {
+        let id = id as usize;
+        15 * if id >= CardTitle as usize {
+            -2
+        } else if id >= CapturesFolder as usize {
+            -1
+        } else {
+            0
+        } + if id >= CapturesFolder as usize { self.notes } else { 0 }
+            + if id >= CardTitle as usize { self.captures } else { 0 }
+    }
+
+    fn height(self) -> i32 {
+        HEIGHT + self.notes + self.captures + self.status
+    }
+}
+
+fn mix(a: COLORREF, b: COLORREF, amount: f64) -> COLORREF {
+    COLORREF([0, 8, 16].into_iter().fold(0, |value, shift| {
+        let from = f64::from((a.0 >> shift) & 255);
+        let to = f64::from((b.0 >> shift) & 255);
+        value | (((from + (to - from) * amount).round() as u32) << shift)
+    }))
+}
+
+impl Palette {
+    fn at(amount: f64) -> Self {
+        let color = |a, b| mix(a, b, amount);
+        Self {
+            paper: color(LIGHT.paper, DARK.paper),
+            patch: color(LIGHT.patch, DARK.patch),
+            chip: color(LIGHT.chip, DARK.chip),
+            text: color(LIGHT.text, DARK.text),
+            muted: color(LIGHT.muted, DARK.muted),
+            outline: color(LIGHT.outline, DARK.outline),
+            accent: color(LIGHT.accent, DARK.accent),
+            selected: color(LIGHT.selected, DARK.selected),
+            on: color(LIGHT.on, DARK.on),
+            off: color(LIGHT.off, DARK.off),
+            thumb: color(LIGHT.thumb, DARK.thumb),
+            disabled: color(LIGHT.disabled, DARK.disabled),
+            error: color(LIGHT.error, DARK.error),
+        }
+    }
+}
 
 fn scale(value: i32, dpi: u32) -> i32 {
     (value * dpi as i32 + 48) / 96
@@ -718,12 +1043,268 @@ struct Window<'a> {
     picking: Cell<bool>,
     close_pending: Cell<bool>,
     dpi: Cell<u32>,
-    dark: Cell<bool>,
-    large_client: Cell<bool>,
+    epoch: Instant,
+    motion: RefCell<Motion>,
+    frame: Cell<Frame>,
+    hover: Cell<Option<Control>>,
+    timer: Cell<bool>,
+    started: Cell<bool>,
+    frozen: Cell<Option<f64>>,
+    surface: RefCell<Option<Surface>>,
+    error_label: RefCell<String>,
     fonts: RefCell<Fonts>,
     tooltip: Cell<HWND>,
     tips: RefCell<[Vec<u16>; 2]>,
     icons: [HICON; 2],
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+struct ButtonFrame {
+    checked: f64,
+    hover: f64,
+    press: f64,
+    focus: f64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Frame {
+    intro: f64,
+    theme: f64,
+    card: f64,
+    selection: [f64; 2],
+    folders: [f64; 2],
+    status: f64,
+    retry: f64,
+    buttons: [ButtonFrame; CONTROLS],
+}
+
+impl Frame {
+    fn layout(self) -> Layout {
+        Layout {
+            notes: (self.folders[0] * 15.0).round() as i32,
+            captures: (self.folders[1] * 15.0).round() as i32,
+            status: (self.status * f64::from(STATUS_HEIGHT)).round() as i32,
+        }
+    }
+}
+
+impl Motion {
+    fn frame(&self, now: f64) -> Frame {
+        Frame {
+            intro: self.intro.value(now),
+            theme: self.theme.value(now),
+            card: self.card.value(now),
+            selection: self.selection.map(|track| track.value(now)),
+            folders: self.folders.map(|track| track.value(now)),
+            status: self.status.value(now),
+            retry: self.retry.value(now),
+            buttons: self.buttons.map(|button| ButtonFrame {
+                checked: button.checked.value(now),
+                hover: button.hover.value(now),
+                press: button.press.value(now),
+                focus: button.focus.value(now),
+            }),
+        }
+    }
+}
+
+impl Window<'_> {
+    fn now(&self) -> f64 {
+        self.frozen.get().unwrap_or_else(|| self.epoch.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    fn invalidate(&self, rect: Option<RECT>) {
+        // SAFETY: this STA owns the parent HWND, and Win32 copies the optional RECT.
+        let _ = unsafe {
+            InvalidateRect(Some(self.hwnd), rect.as_ref().map(std::ptr::from_ref), false)
+        };
+    }
+
+    fn invalidate_item(&self, item: &Item) {
+        self.invalidate(Some(self.frame.get().layout().rect(item, self.dpi.get())));
+    }
+
+    fn update_animation(&self) {
+        let now = self.now();
+        let (frame, active) = {
+            let motion = self.motion.borrow();
+            (motion.frame(now), motion.active(now))
+        };
+        let previous = self.frame.replace(frame);
+        let layout = frame.layout();
+        let prior = previous.layout();
+        let dpi = self.dpi.get();
+        if prior != layout {
+            self.position_children(layout, Some(prior));
+            if prior.height() != layout.height() {
+                self.adjust_size(None);
+            }
+        }
+
+        if frame.intro != previous.intro || frame.theme != previous.theme {
+            self.invalidate(None);
+        } else {
+            // Moving a row exposes the space it occupied and shifts the controls below it.
+            let first_moved = if frame.folders[0] != previous.folders[0] {
+                Some(342)
+            } else if frame.folders[1] != previous.folders[1] {
+                Some(410 + layout.offset(CapturesFallback))
+            } else if frame.status != previous.status || frame.retry != previous.retry {
+                Some(575 + layout.offset(Status))
+            } else {
+                None
+            };
+            if let Some(top) = first_moved {
+                self.invalidate(Some(scaled(
+                    [0, top, WIDTH, layout.height().max(prior.height()) - top],
+                    dpi,
+                )));
+            }
+            if frame.card != previous.card || frame.selection != previous.selection {
+                let mut rect = CARD_PATCH;
+                rect[1] += layout.offset(CardTitle);
+                self.invalidate(Some(scaled(rect, dpi)));
+            }
+            for item in ITEMS.iter().filter(|item| item.button()) {
+                let index = item.id.index();
+                if previous.buttons[index] != frame.buttons[index] {
+                    self.invalidate_item(item);
+                }
+            }
+        }
+
+        let should_run = active && self.started.get() && self.frozen.get().is_none();
+        if should_run != self.timer.get() {
+            // SAFETY: this window owns the single timer and dispatches it on this STA.
+            let running = unsafe {
+                if should_run {
+                    SetTimer(Some(self.hwnd), TIMER, 10, None) != 0
+                } else {
+                    let _ = KillTimer(Some(self.hwnd), TIMER);
+                    false
+                }
+            };
+            self.timer.set(running);
+        }
+    }
+
+    fn position_children(&self, layout: Layout, prior: Option<Layout>) {
+        let dpi = self.dpi.get();
+        for item in ITEMS {
+            let rect = layout.rect(item, dpi);
+            if prior.is_some_and(|old| old.rect(item, dpi) == rect) {
+                continue;
+            }
+            // SAFETY: same-thread children, with parent responsible for the composed repaint.
+            let _ = unsafe {
+                SetWindowPos(
+                    self.child(item.id),
+                    None,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+                )
+            };
+        }
+    }
+
+    fn ui_state(&self) -> u32 {
+        // SAFETY: scalar query to this thread's top-level window.
+        unsafe { SendMessageW(self.hwnd, WM_QUERYUISTATE, None, None) }.0 as u32
+    }
+
+    fn change_ui_state(&self, action: u32, flags: u32) {
+        let current = self.ui_state();
+        if (action == UIS_SET && current & flags != flags)
+            || (action == UIS_CLEAR && current & flags != 0)
+        {
+            // SAFETY: normal dialog UI cue propagation, with scalar flags.
+            unsafe {
+                SendMessageW(
+                    self.hwnd,
+                    WM_CHANGEUISTATE,
+                    Some(WPARAM((action | flags << 16) as usize)),
+                    None,
+                )
+            };
+        }
+    }
+
+    fn button_state(&self, item: &Item, child: HWND) {
+        // SAFETY: all queries are scalar and this thread owns the native button.
+        let (enabled, pressed, focused) = unsafe {
+            (
+                IsWindowEnabled(child).as_bool(),
+                SendMessageW(child, BM_GETSTATE, None, None).0 as u32 & BST_PUSHED != 0,
+                GetFocus() == child,
+            )
+        };
+        let show_focus = self.ui_state() & UISF_HIDEFOCUS == 0;
+        let now = self.now();
+        let mut motion = self.motion.borrow_mut();
+        let enter = motion.duration(80.0);
+        let leave = motion.duration(120.0);
+        let focus_in = motion.duration(FOCUS_MS);
+        let button = &mut motion.buttons[item.id.index()];
+        let pointer_effects = matches!(item.kind, Kind::Push(_) | Kind::Switch);
+        let hover = pointer_effects && enabled && self.hover.get() == Some(item.id);
+        let pressed = pointer_effects && enabled && pressed;
+        button.hover.retarget(
+            if hover { 1.0 } else { 0.0 },
+            now,
+            if hover { enter } else { leave },
+        );
+        button.press.retarget(
+            if pressed { 1.0 } else { 0.0 },
+            now,
+            if pressed { enter } else { leave },
+        );
+        let focus = enabled && focused && show_focus;
+        button.focus.retarget(
+            if focus { 1.0 } else { 0.0 },
+            now,
+            if focus { focus_in } else { 0.0 },
+        );
+    }
+
+    fn sync_buttons(&self) {
+        for item in ITEMS.iter().filter(|item| item.button()) {
+            self.button_state(item, self.child(item.id));
+        }
+        self.update_animation();
+    }
+
+    fn observe_hover(&self, item: &Item, hwnd: HWND, msg: u32, point: LPARAM) {
+        let mut bounds = RECT::default();
+        let x = i32::from(point.0 as i16);
+        let y = i32::from((point.0 >> 16) as i16);
+        // SAFETY: the current native button owns its client rectangle. A captured button
+        // can also receive WM_MOUSEMOVE with coordinates outside that rectangle.
+        let inside = msg == WM_MOUSEMOVE
+            && unsafe { GetClientRect(hwnd, &mut bounds) }.is_ok()
+            && x >= bounds.left
+            && x < bounds.right
+            && y >= bounds.top
+            && y < bounds.bottom;
+        if inside && self.hover.get() != Some(item.id) {
+            let old_hover = self.hover.replace(Some(item.id));
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            // SAFETY: track is an initialized request for a live native button.
+            let _ = unsafe { TrackMouseEvent(&mut track) };
+            if let Some(old) = old_hover.and_then(|id| Item::lookup(id as i32)) {
+                self.button_state(old, self.child(old.id));
+            }
+        } else if !inside && self.hover.get() == Some(item.id) {
+            self.hover.set(None);
+        }
+    }
 }
 
 impl Window<'_> {
@@ -732,13 +1313,15 @@ impl Window<'_> {
         unsafe { GetDlgItem(Some(self.hwnd), id as i32) }.unwrap_or_default()
     }
 
-    fn palette(&self) -> Palette {
-        if self.dark.get() { DARK } else { LIGHT }
-    }
-
     fn set_theme(&self) {
         let dark = self.options.test.as_ref().map_or_else(system_dark, |test| test.dark);
-        self.dark.set(dark);
+        let now = self.now();
+        {
+            let mut motion = self.motion.borrow_mut();
+            let duration = if self.started.get() { motion.duration(THEME_MS) } else { 0.0 };
+            motion.theme.retarget(if dark { 1.0 } else { 0.0 }, now, duration);
+        }
+        self.update_animation();
         let immersive = i32::from(dark);
         // SAFETY: DWM copies the DWORD immediately; the HWND belongs to this thread.
         let _ = unsafe {
@@ -751,7 +1334,7 @@ impl Window<'_> {
         };
         let tooltip = self.tooltip.get();
         if !tooltip.is_invalid() {
-            let palette = self.palette();
+            let palette = if dark { DARK } else { LIGHT };
             // SAFETY: the tooltip is settings-owned; the two empty strings select classic
             // tooltip painting so it honors our theme colors.
             unsafe {
@@ -784,7 +1367,7 @@ impl Window<'_> {
                 Some(WPARAM(ICON_BIG as usize)),
                 Some(LPARAM(self.icons[usize::from(dark)].0 as isize)),
             );
-            let _ = RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
     }
 
@@ -810,10 +1393,10 @@ impl Window<'_> {
                     None,
                 )?
             };
-            if matches!(item.kind, Kind::Switch | Kind::Radio) {
+            {
                 // SAFETY: same-thread subclass of our child. The parent state outlives the child.
                 if !unsafe {
-                    SetWindowSubclass(child, Some(check_proc), 1, self as *const _ as usize)
+                    SetWindowSubclass(child, Some(control_proc), 1, self as *const _ as usize)
                 }
                 .as_bool()
                 {
@@ -845,25 +1428,15 @@ impl Window<'_> {
     fn relayout(&self, dpi: u32) {
         self.dpi.set(dpi);
         let previous_fonts = self.fonts.replace(Fonts::new(dpi));
+        self.position_children(self.frame.get().layout(), None);
         for item in ITEMS {
             let child = self.child(item.id);
-            let rect = scaled(item.rect, dpi);
-            // SAFETY: all children are owned by this thread, and the arguments are scalar.
-            unsafe {
-                let _ = SetWindowPos(
-                    child,
-                    None,
-                    rect.left,
-                    rect.top,
-                    rect.right - rect.left,
-                    rect.bottom - rect.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                let font = self.fonts.borrow().0
-                    [usize::from(!matches!(item.kind, Kind::Title | Kind::Heading))];
-                SendMessageW(child, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
-            }
+            let font = self.fonts.borrow().0
+                [usize::from(!matches!(item.kind, Kind::Title | Kind::Heading))];
+            // SAFETY: this STA owns the child and retains the new font.
+            unsafe { SendMessageW(child, WM_SETFONT, Some(WPARAM(font.0 as usize)), None) };
         }
+        self.invalidate(None);
         // SAFETY: this is the settings-owned tooltip; both message parameters are scalar.
         unsafe {
             SendMessageW(
@@ -878,7 +1451,7 @@ impl Window<'_> {
 
     fn adjust_size(&self, at: Option<(i32, i32)>) {
         let dpi = self.dpi.get();
-        let height = HEIGHT + if self.large_client.get() { STATUS_HEIGHT } else { 0 };
+        let height = self.frame.get().layout().height();
         let mut bounds = scaled([0, 0, WIDTH, height], dpi);
         // SAFETY: a writable RECT for the real window style and target DPI.
         let _ = unsafe {
@@ -952,6 +1525,29 @@ impl Window<'_> {
                 format!("{} × {} px", dimensions.width, dimensions.height),
             )
         };
+        let now = self.now();
+        {
+            let mut motion = self.motion.borrow_mut();
+            let duration = if self.started.get() { motion.duration(SWITCH_MS) } else { 0.0 };
+            for (id, selected) in checked {
+                if matches!(id, Screenshots | Keep | Notes | Recording | Launch) {
+                    motion.buttons[id.index()].checked.retarget(
+                        if selected { 1.0 } else { 0.0 },
+                        now,
+                        duration,
+                    );
+                }
+            }
+            let card = if checked[6].1 {
+                2
+            } else if checked[5].1 {
+                1
+            } else {
+                0
+            };
+            let duration = if self.started.get() { motion.duration(CARD_MS) } else { 0.0 };
+            motion.select_card(card, now, duration);
+        }
         for (id, checked) in checked {
             // SAFETY: checkbox and radio BUTTONs accept scalar BM_SETCHECK parameters.
             unsafe {
@@ -979,8 +1575,14 @@ impl Window<'_> {
         self.text(CardDimensions, &dimensions);
         self.text(Status, &status);
         let show_status = !status.is_empty();
-        if self.large_client.replace(show_status) != show_status {
-            self.adjust_size(None);
+        if show_status {
+            self.error_label.replace(status);
+        }
+        {
+            let mut motion = self.motion.borrow_mut();
+            let duration = motion.duration(ROW_MS);
+            motion.status.retarget(if show_status { 1.0 } else { 0.0 }, now, duration);
+            motion.retry.retarget(if retry { 1.0 } else { 0.0 }, now, duration);
         }
         // SAFETY: owned HWNDs, show or hide their status controls, then invalidate the content.
         unsafe {
@@ -989,8 +1591,9 @@ impl Window<'_> {
                 if show_status { SW_SHOWNOACTIVATE } else { SW_HIDE },
             );
             let _ = ShowWindow(self.child(Retry), if retry { SW_SHOWNOACTIVATE } else { SW_HIDE });
-            let _ = RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
         }
+        self.sync_buttons();
+        self.invalidate(None);
     }
 
     fn refresh_folders(&self, init: bool) {
@@ -998,6 +1601,12 @@ impl Window<'_> {
             [(NotesPath, NotesFallback), (CapturesPath, CapturesFallback)].into_iter().enumerate()
         {
             let (path, used_default) = self.model.borrow().folders[index].clone();
+            {
+                let now = self.now();
+                let mut motion = self.motion.borrow_mut();
+                let duration = motion.duration(ROW_MS);
+                motion.folders[index].retarget(if used_default { 1.0 } else { 0.0 }, now, duration);
+            }
             let full = display_path(&path);
             let child = self.child(id);
             let width = scaled(Item::lookup(id as i32).expect("path control").rect, self.dpi.get());
@@ -1043,6 +1652,7 @@ impl Window<'_> {
             };
             self.tips.borrow_mut()[index] = text;
         }
+        self.update_animation();
     }
 
     fn save(&self) {
@@ -1360,8 +1970,15 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
         picking: Cell::new(false),
         close_pending: Cell::new(false),
         dpi: Cell::new(dpi),
-        dark: Cell::new(false),
-        large_client: Cell::new(false),
+        epoch: Instant::now(),
+        motion: RefCell::new(Motion::new(animation_effects())),
+        frame: Cell::new(Motion::new(false).frame(0.0)),
+        hover: Cell::new(None),
+        timer: Cell::new(false),
+        started: Cell::new(false),
+        frozen: Cell::new(None),
+        surface: RefCell::new(None),
+        error_label: RefCell::new(String::new()),
         fonts: RefCell::new(Fonts::new(dpi)),
         tooltip: Cell::new(HWND::default()),
         tips: RefCell::new(Default::default()),
@@ -1379,6 +1996,7 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
         window.relayout(dpi);
         window.refresh_folders(true);
         window.refresh();
+        window.change_ui_state(UIS_SET, UISF_HIDEFOCUS | UISF_HIDEACCEL);
         let mut bounds = RECT::default();
         window.adjust_size(None);
         // SAFETY: same-thread window and writable RECT.
@@ -1391,6 +2009,15 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
         )));
         lifetime.hwnd.store(hwnd.0 as isize, SeqCst);
         if !lifetime.stop.load(SeqCst) {
+            let now = window.now();
+            {
+                let mut motion = window.motion.borrow_mut();
+                let duration = motion.duration(OPEN_MS);
+                motion.intro.retarget(1.0, now, duration);
+            }
+            window.started.set(true);
+            window.update_animation();
+            window.invalidate(None);
             // SAFETY: this STA owns the window. Test mode leaves the foreground app alone.
             let _ = unsafe {
                 ShowWindow(
@@ -1422,6 +2049,16 @@ fn pump(window: &Window<'_>) -> Result<()> {
             -1 => return Err(Error::from_thread()),
             _ => {}
         }
+        if message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN {
+            window.change_ui_state(UIS_CLEAR, UISF_HIDEFOCUS);
+            if message.wParam.0 == VK_MENU.0 as usize {
+                window.change_ui_state(UIS_CLEAR, UISF_HIDEACCEL);
+            }
+        } else if matches!(message.message, WM_KEYUP | WM_SYSKEYUP)
+            && message.wParam.0 == VK_MENU.0 as usize
+        {
+            window.change_ui_state(UIS_SET, UISF_HIDEACCEL);
+        }
         // SAFETY: GetFocus is this STA's focused control. Only click our direct child.
         let enter = unsafe {
             let focused = GetFocus();
@@ -1446,30 +2083,173 @@ fn pump(window: &Window<'_>) -> Result<()> {
     }
 }
 
-fn fill(dc: HDC, rect: RECT, color: COLORREF) {
-    // SAFETY: a live paint DC and RECT. The brush is only borrowed, then deleted.
-    unsafe {
-        let brush = CreateSolidBrush(color);
-        FillRect(dc, &rect, brush);
-        let _ = DeleteObject(brush.into());
+struct Surface {
+    dc: HDC,
+    bitmap: HBITMAP,
+    old: HGDIOBJ,
+    bits: *mut u8,
+    width: u32,
+    height: u32,
+}
+
+impl Surface {
+    fn new(width: u32, height: u32) -> Result<Self> {
+        let mut bits = std::ptr::null_mut();
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // SAFETY: info describes a top-down, 32-bit DIB, and bits is a valid out pointer.
+        let bitmap = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0)? };
+        // SAFETY: the new memory DC is private to the STA.
+        let dc = unsafe { CreateCompatibleDC(None) };
+        if dc.is_invalid() {
+            // SAFETY: the bitmap was never selected.
+            let _ = unsafe { DeleteObject(bitmap.into()) };
+            return Err(Error::from_thread());
+        }
+        // SAFETY: bitmap and DC are live, owned here, and the selection is restored in Drop.
+        let old = unsafe { SelectObject(dc, bitmap.into()) };
+        Ok(Self { dc, bitmap, old, bits: bits.cast(), width, height })
+    }
+
+    fn canvas(&mut self, dirty: RECT) -> Canvas<'_> {
+        // SAFETY: GdiFlush finishes prior reads/writes to the selected DIB before CPU access.
+        let _ = unsafe { GdiFlush() };
+        // SAFETY: this owns the live DIB of the declared dimensions, borrowed for the canvas.
+        let bits = unsafe {
+            std::slice::from_raw_parts_mut(self.bits, (self.width * self.height * 4) as usize)
+        };
+        Canvas {
+            pixmap: tiny_skia::PixmapMut::from_bytes(bits, self.width, self.height)
+                .expect("valid DIB"),
+            labels: Vec::new(),
+            dc: self.dc,
+            dirty,
+        }
     }
 }
 
-fn rounded(dc: HDC, rect: RECT, diameter: i32, color: COLORREF, edge: COLORREF) {
-    // SAFETY: use two owned GDI objects in a live DC, restoring both selections before deletion.
-    unsafe {
-        let pen = CreatePen(PS_SOLID, 1, edge);
-        let brush = CreateSolidBrush(color);
-        let old_pen = SelectObject(dc, pen.into());
-        let old_brush = SelectObject(dc, brush.into());
-        let _ = RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, diameter, diameter);
-        SelectObject(dc, old_brush);
-        SelectObject(dc, old_pen);
-        let _ = DeleteObject(brush.into());
-        let _ = DeleteObject(pen.into());
+impl Drop for Surface {
+    fn drop(&mut self) {
+        // SAFETY: restore the original selection before releasing these owned GDI handles.
+        unsafe {
+            SelectObject(self.dc, self.old);
+            let _ = DeleteObject(self.bitmap.into());
+            let _ = DeleteDC(self.dc);
+        }
     }
 }
 
+struct Label {
+    rect: RECT,
+    text: String,
+    ink: COLORREF,
+    format: DRAW_TEXT_FORMAT,
+    font: HFONT,
+}
+
+struct Canvas<'a> {
+    pixmap: tiny_skia::PixmapMut<'a>,
+    labels: Vec<Label>,
+    dc: HDC,
+    dirty: RECT,
+}
+
+fn intersects(a: RECT, b: RECT) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+fn inset(rect: RECT, amount: i32) -> RECT {
+    RECT {
+        left: rect.left + amount,
+        top: rect.top + amount,
+        right: rect.right - amount,
+        bottom: rect.bottom - amount,
+    }
+}
+
+fn move_y(mut rect: RECT, amount: i32) -> RECT {
+    rect.top += amount;
+    rect.bottom += amount;
+    rect
+}
+
+fn rounded_path(rect: RECT, radius: f32) -> Option<tiny_skia::Path> {
+    let (l, t, r, b) = (rect.left as f32, rect.top as f32, rect.right as f32, rect.bottom as f32);
+    let d = radius.min((r - l) / 2.0).min((b - t) / 2.0);
+    if d <= 0.0 {
+        return tiny_skia::Rect::from_ltrb(l, t, r, b).map(tiny_skia::PathBuilder::from_rect);
+    }
+    let k = d * 0.552_284_8;
+    let mut path = tiny_skia::PathBuilder::new();
+    path.move_to(l + d, t);
+    path.line_to(r - d, t);
+    path.cubic_to(r - d + k, t, r, t + d - k, r, t + d);
+    path.line_to(r, b - d);
+    path.cubic_to(r, b - d + k, r - d + k, b, r - d, b);
+    path.line_to(l + d, b);
+    path.cubic_to(l + d - k, b, l, b - d + k, l, b - d);
+    path.line_to(l, t + d);
+    path.cubic_to(l, t + d - k, l + d - k, t, l + d, t);
+    path.close();
+    path.finish()
+}
+
+impl Canvas<'_> {
+    fn shape(&mut self, rect: RECT, radius: f32, color: COLORREF) {
+        if intersects(rect, self.dirty)
+            && let Some(path) = rounded_path(rect, radius)
+        {
+            let mut paint = tiny_skia::Paint::default();
+            // The DIB is BGRA. Swap red and blue when feeding tiny-skia's RGBA rasterizer.
+            paint.set_color_rgba8((color.0 >> 16) as u8, (color.0 >> 8) as u8, color.0 as u8, 255);
+            self.pixmap.fill_path(
+                &path,
+                &paint,
+                tiny_skia::FillRule::Winding,
+                tiny_skia::Transform::identity(),
+                None,
+            );
+        }
+    }
+
+    fn outlined(&mut self, rect: RECT, radius: f32, face: COLORREF, edge: COLORREF) {
+        self.shape(rect, radius, edge);
+        self.shape(inset(rect, 1), (radius - 1.0).max(0.0), face);
+    }
+
+    fn text(
+        &mut self,
+        rect: RECT,
+        text: impl Into<String>,
+        ink: COLORREF,
+        format: DRAW_TEXT_FORMAT,
+        font: HFONT,
+    ) {
+        if intersects(rect, self.dirty) {
+            self.labels.push(Label { rect, text: text.into(), ink, format, font });
+        }
+    }
+
+    fn width(&self, text: &str, font: HFONT) -> i32 {
+        // SAFETY: font and canvas DC are live, and the previous selection is restored.
+        unsafe {
+            let old = SelectObject(self.dc, font.into());
+            let width = text_width(self.dc, text);
+            SelectObject(self.dc, old);
+            width
+        }
+    }
+}
 fn text_width(dc: HDC, text: &str) -> i32 {
     let units: Vec<u16> = text.encode_utf16().collect();
     let mut size = windows::Win32::Foundation::SIZE::default();
@@ -1503,185 +2283,318 @@ fn with_paint(hwnd: HWND, draw: impl FnOnce(HDC)) {
 }
 
 impl Window<'_> {
-    fn paint_background(&self, dc: HDC) {
-        let mut area = RECT::default();
-        // SAFETY: writable output and the live parent HWND.
-        let _ = unsafe { GetClientRect(self.hwnd, &mut area) };
-        let palette = self.palette();
+    fn paint(&self, target: HDC) {
+        let mut client = RECT::default();
+        let mut dirty = RECT::default();
+        // SAFETY: the DC belongs to WM_PAINT or PrintWindow; both rectangles are writable.
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut client);
+            GetClipBox(target, &mut dirty);
+        }
+        let dirty = RECT {
+            left: dirty.left.max(client.left),
+            top: dirty.top.max(client.top),
+            right: dirty.right.min(client.right),
+            bottom: dirty.bottom.min(client.bottom),
+        };
+        if dirty.left >= dirty.right || dirty.top >= dirty.bottom {
+            return;
+        }
+        let frame = self.frame.get();
+        let hide_accel = self.ui_state() & UISF_HIDEACCEL != 0;
         let dpi = self.dpi.get();
-        fill(dc, area, palette.paper);
-        for patch in [KEEP_PATCH, CARD_PATCH] {
-            rounded(dc, scaled(patch, dpi), scale(16, dpi), palette.patch, palette.patch);
+        let width = client.right as u32;
+        let height = client.bottom.max(scale(HEIGHT + STATUS_HEIGHT + 30, dpi)) as u32;
+        let mut storage = self.surface.borrow_mut();
+        if storage.as_ref().is_none_or(|surface| surface.width != width || surface.height != height)
+        {
+            *storage = Surface::new(width, height).ok();
+        }
+        let Some(surface) = storage.as_mut() else { return };
+        let palette = Palette::at(frame.theme);
+        let mut canvas = surface.canvas(dirty);
+        canvas.shape(dirty, 0.0, palette.paper);
+        self.paint_content(&mut canvas, frame, palette, hide_accel);
+        let Canvas { labels, .. } = canvas;
+        // SAFETY: the selected DIB is live, and all font selections are restored after drawing.
+        unsafe {
+            let level = SaveDC(surface.dc);
+            if level > 0 {
+                IntersectClipRect(surface.dc, dirty.left, dirty.top, dirty.right, dirty.bottom);
+                for label in labels {
+                    SelectObject(surface.dc, label.font.into());
+                    draw_text(surface.dc, label.rect, &label.text, label.ink, label.format);
+                }
+                let _ = RestoreDC(surface.dc, level);
+            }
+            let _ = BitBlt(
+                target,
+                dirty.left,
+                dirty.top,
+                dirty.right - dirty.left,
+                dirty.bottom - dirty.top,
+                Some(surface.dc),
+                dirty.left,
+                dirty.top,
+                SRCCOPY,
+            );
         }
     }
 
-    fn paint_item(&self, item: &Item, dc: HDC, rect: RECT, state: ODS_FLAGS) {
-        let palette = self.palette();
+    fn paint_content(&self, canvas: &mut Canvas<'_>, frame: Frame, p: Palette, hide_accel: bool) {
         let dpi = self.dpi.get();
         let px = |size| scale(size, dpi);
-        let back = if matches!(
-            item.id,
-            Keep | KeepTitle | CardTitle | Small | Medium | Large | Preview | CardDimensions
-        ) {
-            palette.patch
-        } else {
-            palette.paper
+        let layout = frame.layout();
+        let fade = |color| mix(p.paper, color, frame.intro);
+        let mut card_patch = CARD_PATCH;
+        card_patch[1] += layout.offset(CardTitle);
+        for rect in [KEEP_PATCH, card_patch] {
+            canvas.shape(scaled(rect, dpi), px(8) as f32, fade(p.patch));
+        }
+        let radio =
+            |index| layout.rect(Item::lookup(Small as i32 + index).expect("size choice"), dpi);
+        let segment = inset(RECT { right: radio(2).right, ..radio(0) }, 1);
+        let segment_fill = mix(p.patch, p.chip, 0.55);
+        canvas.shape(segment, px(6) as f32, fade(segment_fill));
+        let highlight = RECT {
+            left: px(frame.selection[0].round() as i32),
+            right: px(frame.selection[1].round() as i32),
+            ..radio(0)
         };
-        fill(dc, rect, back);
-        let font = self.fonts.borrow().0[match item.kind {
-            Kind::Heading | Kind::Title => 0,
-            Kind::Keys => 2,
-            _ => 1,
-        }];
-        // SAFETY: the selected font belongs to this window and the DC is live for the draw.
-        let old_font = unsafe { SelectObject(dc, font.into()) };
-        let center = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
-        let has = |flag: ODS_FLAGS| state.0 & flag.0 != 0;
-        let disabled = has(ODS_DISABLED);
-        let focus = has(ODS_FOCUS) && !has(ODS_NOFOCUSRECT);
-        match item.kind {
-            Kind::Push(label) => {
-                let edge = if disabled {
-                    palette.disabled
-                } else if focus {
-                    palette.accent
-                } else {
-                    palette.outline
-                };
-                let face = if has(ODS_SELECTED) { palette.selected } else { palette.chip };
-                rounded(dc, rect, px(8), face, edge);
-                let flags = if has(ODS_NOACCEL) { center | DT_HIDEPREFIX } else { center };
-                draw_text(
-                    dc,
-                    rect,
-                    label,
-                    if disabled { palette.muted } else { palette.text },
-                    flags,
-                );
+        canvas.shape(inset(highlight, px(3)), px(4) as f32, fade(p.selected));
+
+        let fonts = self.fonts.borrow().0;
+        for item in ITEMS {
+            let mut rect = layout.rect(item, dpi);
+            let local = match item.id {
+                NotesFallback => frame.folders[0],
+                CapturesFallback => frame.folders[1],
+                Status => frame.status,
+                Retry => frame.retry,
+                _ => 1.0,
+            };
+            if local == 0.0 {
+                continue;
             }
-            Kind::Switch | Kind::Radio => {
-                // SAFETY: these native button styles implement BM_GETCHECK.
-                let on =
-                    unsafe { SendMessageW(self.child(item.id), BM_GETCHECK, None, None) }.0 != 0;
-                if matches!(item.kind, Kind::Switch) {
+            let slide = px((4.0 * (1.0 - local)).round() as i32);
+            rect = match item.id {
+                NotesFallback | CapturesFallback => {
+                    let next = if item.id == NotesFallback { CapturesFolder } else { CardTitle };
+                    let next =
+                        layout.rect(Item::lookup(next as i32).expect("row after fallback"), dpi);
+                    let mut rect = move_y(rect, slide);
+                    rect.bottom = rect.bottom.min(next.top - px(2));
+                    rect
+                }
+                _ => move_y(rect, -slide),
+            };
+            if rect.bottom <= rect.top {
+                continue;
+            }
+            if !intersects(rect, canvas.dirty) {
+                continue;
+            }
+            let font = fonts[match item.kind {
+                Kind::Heading | Kind::Title => 0,
+                Kind::Keys => 2,
+                _ => 1,
+            }];
+            let center = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
+            let state = frame.buttons[item.id.index()];
+            // SAFETY: an enabled-state query for a real child of this window.
+            let disabled =
+                item.button() && !unsafe { IsWindowEnabled(self.child(item.id)) }.as_bool();
+            let color = |background, ink| fade(mix(background, ink, local));
+            match item.kind {
+                Kind::Push(label) => {
+                    let face = mix(
+                        mix(p.chip, p.selected, state.hover * 0.60),
+                        p.outline,
+                        state.press * 0.27,
+                    );
+                    let face = if disabled { p.chip } else { face };
+                    let edge = if disabled { p.disabled } else { p.outline };
+                    let shape = inset(rect, px(3));
+                    paint_focus(
+                        canvas,
+                        shape,
+                        [px(4), px(1), px(2)],
+                        fade(p.paper),
+                        fade(p.accent),
+                        state.focus,
+                    );
+                    canvas.outlined(
+                        shape,
+                        px(4) as f32,
+                        color(p.paper, face),
+                        color(p.paper, edge),
+                    );
+                    let flags = if hide_accel { center | DT_HIDEPREFIX } else { center };
+                    canvas.text(
+                        rect,
+                        label,
+                        color(p.paper, if disabled { p.muted } else { p.text }),
+                        flags,
+                        font,
+                    );
+                }
+                Kind::Switch => {
                     let top = rect.top + (rect.bottom - rect.top - px(20)) / 2;
                     let rail = RECT {
-                        left: rect.right - px(39),
-                        right: rect.right - px(2),
+                        left: rect.right - px(44),
+                        right: rect.right - px(4),
                         top,
                         bottom: top + px(20),
                     };
-                    let color = if disabled {
-                        palette.disabled
-                    } else if on {
-                        palette.on
-                    } else {
-                        palette.outline
+                    let background = if item.id == Keep { p.patch } else { p.paper };
+                    let track = if disabled { p.disabled } else { mix(p.off, p.on, state.checked) };
+                    paint_focus(
+                        canvas,
+                        rail,
+                        [px(10), px(1), px(2)],
+                        fade(background),
+                        fade(p.accent),
+                        state.focus,
+                    );
+                    canvas.shape(rail, px(10) as f32, fade(track));
+                    let x = f64::from(rail.left + px(11))
+                        + state.checked * f64::from(rail.right - rail.left - 2 * px(11));
+                    let y = f64::from(rail.top + rail.bottom) / 2.0;
+                    let radius =
+                        f64::from(dpi) / 96.0 * (6.0 + state.hover * 0.8 + state.press * 1.2);
+                    let thumb = RECT {
+                        left: (x - radius).round() as i32,
+                        right: (x + radius).round() as i32,
+                        top: (y - radius).round() as i32,
+                        bottom: (y + radius).round() as i32,
                     };
-                    rounded(dc, rail, px(20), color, color);
-                    let left = if on { rail.right - px(17) } else { rail.left + px(3) };
-                    let thumb =
-                        RECT { left, right: left + px(14), top: top + px(3), bottom: top + px(17) };
-                    rounded(dc, thumb, px(14), palette.thumb, palette.thumb);
-                } else {
-                    let face = if on { palette.selected } else { back };
-                    let edge = if disabled {
-                        palette.disabled
-                    } else if on {
-                        palette.accent
-                    } else {
-                        palette.outline
-                    };
-                    rounded(dc, rect, px(8), face, edge);
-                    draw_text(dc, rect, item.text, palette.text, center);
+                    let ink = if disabled { mix(track, p.thumb, 0.5) } else { p.thumb };
+                    canvas.shape(thumb, radius as f32, fade(ink));
                 }
-            }
-            Kind::Keys => {
-                let mut x = rect.left;
-                let mut key = |label: &str, chip: bool| {
-                    let width = (text_width(dc, label) + px(10)).max(px(19));
-                    let bounds = RECT { left: x, right: x + width, ..rect };
-                    if chip {
-                        rounded(dc, bounds, px(7), palette.chip, palette.chip);
+                Kind::Radio => {
+                    let shape = inset(rect, px(3));
+                    // The segment is drawn below, so only the ring and its gap are needed here.
+                    paint_focus(
+                        canvas,
+                        shape,
+                        [px(4), px(1), px(2)],
+                        fade(segment_fill),
+                        fade(p.accent),
+                        state.focus,
+                    );
+                    if state.focus > 0.0 {
+                        canvas.shape(
+                            shape,
+                            px(4) as f32,
+                            fade(if frame.card.round() as i32 == item.id as i32 - Small as i32 {
+                                p.selected
+                            } else {
+                                segment_fill
+                            }),
+                        );
                     }
-                    draw_text(dc, bounds, label, palette.muted, center | DT_NOPREFIX);
-                    x += width + px(3);
-                };
-                for group in item.text.split('|') {
-                    if item.id == ScreenshotKeys || item.id == NotesKeys {
-                        for part in key_chips(group) {
-                            key(part, part != "or");
+                    canvas.text(
+                        rect,
+                        item.text,
+                        fade(if disabled { p.muted } else { p.text }),
+                        center,
+                        font,
+                    );
+                }
+                Kind::Keys => {
+                    let mut x = rect.left;
+                    let mut key = |label: &str, chip: bool| {
+                        let width = (canvas.width(label, font) + px(10)).max(px(19));
+                        let bounds = RECT { left: x, right: x + width, ..rect };
+                        if chip {
+                            canvas.shape(bounds, px(4) as f32, fade(p.chip));
                         }
-                    } else {
-                        key(group, true);
+                        canvas.text(bounds, label, fade(p.muted), center | DT_NOPREFIX, font);
+                        x += width + px(3);
+                    };
+                    for group in item.text.split('|') {
+                        if item.id == RecordingKeys {
+                            key(group, true);
+                        } else {
+                            for part in key_chips(group) {
+                                key(part, part != "or");
+                            }
+                        }
                     }
                 }
-            }
-            Kind::Preview => {
-                let size = self.model.borrow().settings.card_size.thumb_max();
-                let w = px((size.width * 0.65).round() as i32);
-                let h = px((size.height * 0.65).round() as i32);
-                let left = rect.left + (rect.right - rect.left - w) / 2;
-                let top = rect.top + (rect.bottom - rect.top - h) / 2;
-                let card = RECT { left, top, right: left + w, bottom: top + h };
-                rounded(dc, card, px(11), palette.paper, palette.outline);
-                let image = RECT {
-                    left: left + px(5),
-                    top: top + px(5),
-                    right: card.right - px(5),
-                    bottom: card.bottom - px(5),
-                };
-                rounded(dc, image, px(6), palette.selected, palette.selected);
-                let sun = RECT {
-                    left: image.right - px(15),
-                    right: image.right - px(8),
-                    top: image.top + px(6),
-                    bottom: image.top + px(13),
-                };
-                rounded(dc, sun, px(7), palette.accent, palette.accent);
-                fill(
-                    dc,
-                    RECT {
+                Kind::Preview => {
+                    let small = CardSize::Small.thumb_max();
+                    let large = CardSize::Large.thumb_max();
+                    let factor = 0.65 * f64::from(dpi) / 96.0;
+                    let w = ((small.width + (large.width - small.width) * frame.card / 2.0)
+                        * factor)
+                        .round() as i32;
+                    let h = ((small.height + (large.height - small.height) * frame.card / 2.0)
+                        * factor)
+                        .round() as i32;
+                    let left = rect.left + (rect.right - rect.left - w) / 2;
+                    let top = rect.top + (rect.bottom - rect.top - h) / 2;
+                    let card = RECT { left, top, right: left + w, bottom: top + h };
+                    canvas.outlined(card, px(6) as f32, fade(p.paper), fade(p.outline));
+                    let image = inset(card, px(5));
+                    canvas.shape(image, px(4) as f32, fade(p.selected));
+                    let sun = RECT {
+                        left: image.right - px(15),
+                        right: image.right - px(8),
+                        top: image.top + px(6),
+                        bottom: image.top + px(13),
+                    };
+                    canvas.shape(sun, px(4) as f32, fade(p.accent));
+                    let line = RECT {
                         left: image.left + px(6),
                         right: image.right - px(6),
                         top: image.bottom - px(7),
                         bottom: image.bottom - px(5),
-                    },
-                    palette.outline,
-                );
-            }
-            kind => {
-                let text = if item.text.is_empty() {
-                    window_text(self.child(item.id))
-                } else {
-                    item.text.to_owned()
-                };
-                let ink = match kind {
-                    Kind::Title => palette.text,
-                    Kind::Status => palette.error,
-                    _ => palette.muted,
-                };
-                let format = if matches!(kind, Kind::Status) {
-                    DT_WORDBREAK | DT_END_ELLIPSIS
-                } else {
-                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS
-                };
-                draw_text(dc, rect, &text, ink, format | DT_NOPREFIX);
+                    };
+                    canvas.shape(line, 0.0, fade(p.outline));
+                }
+                kind => {
+                    let text = match item.id {
+                        NotesFallback | CapturesFallback => {
+                            "The chosen folder is unavailable. Using the default.".to_owned()
+                        }
+                        Status => self.error_label.borrow().clone(),
+                        _ if item.text.is_empty() => window_text(self.child(item.id)),
+                        _ => item.text.to_owned(),
+                    };
+                    let ink = match kind {
+                        Kind::Title => p.text,
+                        Kind::Status => p.error,
+                        _ => p.muted,
+                    };
+                    let format = if matches!(kind, Kind::Status) {
+                        DT_WORDBREAK | DT_END_ELLIPSIS
+                    } else {
+                        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS
+                    };
+                    canvas.text(rect, text, color(p.paper, ink), format | DT_NOPREFIX, font);
+                }
             }
         }
-        if focus {
-            let inset = px(3);
-            let focus = RECT {
-                left: rect.left + inset,
-                top: rect.top + inset,
-                right: rect.right - inset,
-                bottom: rect.bottom - inset,
-            };
-            // SAFETY: same live DC, and DrawFocusRect only reads the rectangle.
-            let _ = unsafe { DrawFocusRect(dc, &focus) };
-        }
-        // SAFETY: restore the original font selection before the DC is reused.
-        unsafe { SelectObject(dc, old_font) };
+    }
+}
+
+/// The outer 2 dp ring surrounds a 1 dp gap painted in the surrounding surface color.
+fn paint_focus(
+    canvas: &mut Canvas<'_>,
+    shape: RECT,
+    [radius, gap, ring]: [i32; 3],
+    back: COLORREF,
+    ink: COLORREF,
+    opacity: f64,
+) {
+    if opacity > 0.0 {
+        canvas.shape(
+            inset(shape, -(gap + ring)),
+            (radius + gap + ring) as f32,
+            mix(back, ink, opacity),
+        );
+        canvas.shape(inset(shape, -gap), (radius + gap) as f32, back);
     }
 }
 
@@ -1694,9 +2607,9 @@ fn window_text(hwnd: HWND) -> String {
     String::from_utf16_lossy(&text[..len as usize])
 }
 
-/// Native BUTTON owns input, state, tab order and accessibility. Only replace its painting.
-/// This works with the v5 and v6 common controls, including development builds with no manifest.
-unsafe extern "system" fn check_proc(
+/// Keep native input, check state, tab order and accessibility. The parent paints all
+/// pixels in one pass, including the areas occupied by these real control HWNDs.
+unsafe extern "system" fn control_proc(
     hwnd: HWND,
     msg: u32,
     wp: WPARAM,
@@ -1704,43 +2617,58 @@ unsafe extern "system" fn check_proc(
     id: usize,
     data: usize,
 ) -> LRESULT {
-    // SAFETY: the owning STA attached the stable parent pointer, and the child dies first.
+    // SAFETY: the owning STA attached the stable parent pointer; its children die first.
     let window = unsafe { &*(data as *const Window<'_>) };
-    if msg == WM_PAINT || msg == WM_PRINTCLIENT {
-        // SAFETY: hwnd is our child, and rect is writable.
-        let (control, rect, state) = unsafe {
-            let mut rect = RECT::default();
-            let _ = GetClientRect(hwnd, &mut rect);
-            let mut state = ODS_FLAGS(0);
-            if !IsWindowEnabled(hwnd).as_bool() {
-                state.0 |= ODS_DISABLED.0;
-            }
-            if GetFocus() == hwnd {
-                state.0 |= ODS_FOCUS.0;
-            }
-            (GetDlgCtrlID(hwnd), rect, state)
-        };
-        if let Some(item) = Item::lookup(control) {
-            if msg == WM_PAINT {
-                with_paint(hwnd, |dc| window.paint_item(item, dc, rect, state));
-            } else {
-                window.paint_item(item, HDC(wp.0 as *mut c_void), rect, state);
-            }
+    match msg {
+        WM_PAINT => {
+            with_paint(hwnd, |_| {});
             return LRESULT(0);
         }
+        WM_PRINT | WM_PRINTCLIENT => return LRESULT(0),
+        WM_ERASEBKGND => return LRESULT(1),
+        WM_NCDESTROY => {
+            // SAFETY: remove this exact subclass on the child's final message.
+            let _ = unsafe { RemoveWindowSubclass(hwnd, Some(control_proc), id) };
+        }
+        _ => {}
     }
-    if msg == WM_ERASEBKGND {
-        return LRESULT(1);
+    // SAFETY: querying the ID of our native child uses only its HWND.
+    let item = Item::lookup(unsafe { GetDlgCtrlID(hwnd) }).filter(|item| item.button());
+    if let Some(item) = item {
+        if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+            window.change_ui_state(UIS_SET, UISF_HIDEFOCUS);
+        }
+        if matches!(item.kind, Kind::Push(_) | Kind::Switch)
+            && matches!(msg, WM_MOUSEMOVE | WM_MOUSELEAVE)
+        {
+            window.observe_hover(item, hwnd, msg, lp);
+        }
     }
-    if msg == WM_NCDESTROY {
-        // SAFETY: remove this exact subclass on the child's final message.
-        let _ = unsafe { RemoveWindowSubclass(hwnd, Some(check_proc), id) };
-    }
-    // SAFETY: forward the unchanged message to the native button procedure.
+    // SAFETY: forward the original native control message, including WM_GETOBJECT.
     let result = unsafe { DefSubclassProc(hwnd, msg, wp, lp) };
-    if matches!(msg, BM_SETCHECK | BM_SETSTATE | WM_ENABLE | WM_SETFOCUS | WM_KILLFOCUS) {
-        // SAFETY: redraw the child to reflect native state changes.
-        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    if let Some(item) = item
+        && matches!(
+            msg,
+            BM_SETSTATE
+                | WM_ENABLE
+                | WM_SETFOCUS
+                | WM_KILLFOCUS
+                | WM_MOUSEMOVE
+                | WM_MOUSELEAVE
+                | WM_LBUTTONUP
+                | WM_LBUTTONDOWN
+                | WM_CAPTURECHANGED
+                | WM_CANCELMODE
+        )
+    {
+        window.button_state(item, hwnd);
+        if msg == WM_KILLFOCUS {
+            window.motion.borrow_mut().buttons[item.id.index()].focus.retarget(0.0, 0.0, 0.0);
+        }
+        window.update_animation();
+        if msg == WM_ENABLE {
+            window.invalidate_item(item);
+        }
     }
     result
 }
@@ -1778,6 +2706,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
                 return LRESULT(0);
             }
+            TEST_SCENE if window.options.test.is_some() => {
+                window.test_scene(wp.0);
+                return LRESULT(0);
+            }
+            TEST_IDLE if window.options.test.is_some() => {
+                let idle = !window.timer.get() && !window.motion.borrow().active(window.now());
+                return LRESULT(isize::from(idle));
+            }
             OPEN => {
                 window.activate();
                 return LRESULT(0);
@@ -1794,7 +2730,56 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     PostQuitMessage(0);
                 }
             }
-            WM_SETTINGCHANGE | WM_THEMECHANGED => window.set_theme(),
+            WM_SETTINGCHANGE | WM_THEMECHANGED => {
+                let enabled = animation_effects();
+                {
+                    let mut motion = window.motion.borrow_mut();
+                    motion.enabled = enabled;
+                    if !enabled {
+                        motion.settle();
+                    }
+                }
+                window.set_theme();
+            }
+            WM_TIMER if wp.0 == TIMER => {
+                window.update_animation();
+                return LRESULT(0);
+            }
+            WM_UPDATEUISTATE => {
+                // SAFETY: let Win32 update and propagate the native UI cue bits first.
+                let result = unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+                window.sync_buttons();
+                if (wp.0 >> 16) as u32 & UISF_HIDEACCEL != 0 {
+                    for item in ITEMS.iter().filter(|item| matches!(item.kind, Kind::Push(_))) {
+                        window.invalidate_item(item);
+                    }
+                }
+                return result;
+            }
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+                window.change_ui_state(UIS_SET, UISF_HIDEFOCUS);
+            }
+            WM_CTLCOLORBTN | WM_CTLCOLORSTATIC if lp.0 != 0 => {
+                // The native button can paint immediately outside WM_PAINT on state changes.
+                // SAFETY: WM_CTLCOLOR passes a live child HWND and a borrowed painting DC.
+                let child = HWND(lp.0 as *mut c_void);
+                // SAFETY: scalar child ID query for the HWND supplied by WM_CTLCOLOR.
+                if Item::lookup(unsafe { GetDlgCtrlID(child) }).is_none() {
+                    return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
+                }
+                let mut rect = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(child, &mut rect);
+                    ExcludeClipRect(
+                        HDC(wp.0 as *mut c_void),
+                        rect.left,
+                        rect.top,
+                        rect.right,
+                        rect.bottom,
+                    );
+                    return LRESULT(GetStockObject(NULL_BRUSH).0 as isize);
+                }
+            }
             WM_DPICHANGED if window.options.test.is_none() && lp.0 != 0 => {
                 // SAFETY: lParam of WM_DPICHANGED points to the suggested RECT for this call.
                 let bounds = unsafe { *(lp.0 as *const RECT) };
@@ -1803,20 +2788,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 window.refresh_folders(false);
                 return LRESULT(0);
             }
-            WM_DRAWITEM if lp.0 != 0 => {
-                // SAFETY: Win32 supplies a DRAWITEMSTRUCT valid through this call.
-                let draw = unsafe { &*(lp.0 as *const DRAWITEMSTRUCT) };
-                if let Some(item) = Item::lookup(draw.CtlID as i32) {
-                    window.paint_item(item, draw.hDC, draw.rcItem, draw.itemState);
-                    return LRESULT(1);
-                }
-            }
+            WM_DRAWITEM => return LRESULT(1),
             WM_PAINT => {
-                with_paint(hwnd, |dc| window.paint_background(dc));
+                with_paint(hwnd, |dc| window.paint(dc));
                 return LRESULT(0);
             }
             WM_PRINTCLIENT => {
-                window.paint_background(HDC(wp.0 as *mut c_void));
+                window.paint(HDC(wp.0 as *mut c_void));
                 return LRESULT(0);
             }
             WM_ERASEBKGND => return LRESULT(1),
@@ -1843,32 +2821,82 @@ mod tests {
     #[test]
     fn controls_fit_without_overlap_at_supported_dpis() {
         for dpi in [96, 120, 144, 192] {
-            for (i, item) in ITEMS.iter().enumerate() {
-                let a = scaled(item.rect, dpi);
-                let height =
-                    if matches!(item.id, Status | Retry) { HEIGHT + STATUS_HEIGHT } else { HEIGHT };
-                assert!(
-                    a.left >= 0
-                        && a.top >= 0
-                        && a.right <= scale(WIDTH, dpi)
-                        && a.bottom <= scale(height, dpi),
-                    "{dpi}: {:?}",
-                    item.id
-                );
-                for other in &ITEMS[..i] {
-                    let b = scaled(other.rect, dpi);
-                    assert!(
-                        a.right <= b.left
-                            || b.right <= a.left
-                            || a.bottom <= b.top
-                            || b.bottom <= a.top,
-                        "{dpi}: {:?} overlaps {:?}",
-                        item.id,
-                        other.id
-                    );
+            for notes in [0, 15] {
+                for captures in [0, 15] {
+                    for status in [0, STATUS_HEIGHT] {
+                        let layout = Layout { notes, captures, status };
+                        let visible = ITEMS
+                            .iter()
+                            .filter(|item| match item.id {
+                                NotesFallback => notes != 0,
+                                CapturesFallback => captures != 0,
+                                Status | Retry => status != 0,
+                                _ => true,
+                            })
+                            .collect::<Vec<_>>();
+                        for (i, item) in visible.iter().enumerate() {
+                            let a = layout.rect(item, dpi);
+                            assert!(
+                                a.left >= 0
+                                    && a.top >= 0
+                                    && a.right <= scale(WIDTH, dpi)
+                                    && a.bottom <= scale(layout.height(), dpi),
+                                "{dpi}: {:?}",
+                                item.id
+                            );
+                            for other in &visible[..i] {
+                                assert!(
+                                    !intersects(a, layout.rect(other, dpi)),
+                                    "{dpi}: {:?} overlaps {:?}",
+                                    item.id,
+                                    other.id
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn ease_out_is_monotonic_with_exact_endpoints() {
+        assert_eq!(ease(0.0), 0.0);
+        assert_eq!(ease(1.0), 1.0);
+        assert_eq!(ease(0.125), 0.5);
+        for i in 0..100 {
+            assert!(ease(f64::from(i) / 100.0) < ease(f64::from(i + 1) / 100.0));
+        }
+    }
+
+    #[test]
+    fn retargeting_preserves_the_in_flight_value() {
+        let mut track = Transition::default();
+        track.retarget(1.0, 10.0, 160.0);
+        assert_eq!(track.value(0.0), 0.0);
+        assert_eq!(track.value(30.0), 0.5);
+        track.retarget(0.0, 30.0, 160.0);
+        assert_eq!(track.value(30.0), 0.5);
+        assert_eq!(track.value(50.0), 0.25);
+        assert_eq!(track.value(190.0), 0.0);
+    }
+
+    #[test]
+    fn clock_runs_until_the_last_transition_and_stops_in_reduced_motion() {
+        let mut motion = Motion::new(true);
+        let duration = motion.duration(OPEN_MS);
+        motion.intro.retarget(1.0, 0.0, duration);
+        motion.select_card(2, 0.0, CARD_MS);
+        assert!(motion.active(OPEN_MS));
+        assert!(!motion.active(CARD_MS));
+        motion.enabled = false;
+        motion.settle();
+        let duration = motion.duration(SWITCH_MS);
+        motion.buttons[Keep.index()].checked.retarget(1.0, 0.0, duration);
+        assert!(!motion.active(0.0));
+        assert_eq!(motion.frame(0.0).intro, 1.0);
+        assert_eq!(motion.frame(0.0).card, 2.0);
+        assert_eq!(motion.frame(0.0).buttons[Keep.index()].checked, 1.0);
     }
 
     #[test]
@@ -1917,7 +2945,12 @@ mod tests {
                 ("accent against patch", p.accent, p.patch, 3.0),
                 ("on switch against patch", p.on, p.patch, 3.0),
                 ("thumb against on switch", p.thumb, p.on, 3.0),
-                ("thumb against off switch", p.thumb, p.outline, 3.0),
+                ("thumb against off switch", p.thumb, p.off, 3.0),
+                ("focus against window", p.accent, p.paper, 3.0),
+                ("focus against button", p.accent, p.chip, 3.0),
+                ("focus against selection", p.accent, p.selected, 3.0),
+                ("focus against on switch", p.accent, p.on, 3.0),
+                ("focus against off switch", p.accent, p.off, 3.0),
             ] {
                 let a = luminance(foreground);
                 let b = luminance(background);
