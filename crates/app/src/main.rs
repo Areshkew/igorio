@@ -6,13 +6,15 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use igorio_app::draw::Renderer;
 use igorio_app::follower::Follower;
+use igorio_app::hook::{self, MouseEvent, MouseHook};
 use igorio_app::overlay::{self, Overlay};
 use igorio_app::state::FairyState;
 use igorio_app::tray::{MenuItem, Tray};
+use igorio_core::shake::{ShakeGate, ShakeResult};
 use igorio_kit::Image;
 use tiny_skia::Pixmap;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -29,15 +31,15 @@ const MENU_RESTORE: u32 = 1;
 const MENU_ADD_DEMO: u32 = 2;
 const MENU_QUIT: u32 = 3;
 
-/// Frame interval while something moves.
-const FRAME: Duration = Duration::from_millis(8);
-/// How often the cursor is checked while the pile is at rest. Until the mouse hook of
-/// milestone M4 exists, polling is the only way to notice that the cursor moved.
-const IDLE_POLL: Duration = Duration::from_millis(33);
+/// Frame interval while something moves, in seconds.
+const FRAME: f64 = 0.008;
+/// The longest sleep. The loop wakes at least this often to check that the mouse hook is
+/// still installed (Windows removes a slow hook without notice).
+const HEALTH_CHECK: f64 = 1.0;
 
 struct App {
-    started: Instant,
     state: FairyState,
+    shake: ShakeGate,
     follower: Follower,
     renderer: Renderer,
     overlay: Overlay,
@@ -53,37 +55,67 @@ struct App {
 }
 
 impl App {
-    fn now(&self) -> f64 {
-        self.started.elapsed().as_secs_f64()
-    }
-
     fn add_demo(&mut self) {
-        let now = self.now();
         let image = Arc::new(demo_image(self.demo_count));
         self.demo_count += 1;
-        self.state.hold(image, 1.0, SystemTime::now(), false, None, None, now);
+        self.state.hold(image, 1.0, SystemTime::now(), false, None, None, hook::now());
+        self.shake.captured();
         self.dirty = true;
     }
 
     fn restore_last(&mut self) {
-        let now = self.now();
-        self.state.restore_last(now);
+        self.state.restore_last(hook::now());
         self.dirty = true;
     }
 
-    /// Runs one frame and returns how long to sleep; `None` means "until a message arrives".
-    fn frame(&mut self) -> windows::core::Result<Option<Duration>> {
-        let now = self.now();
+    /// Feeds mouse events to the shake gesture. Returns true when the cursor moved.
+    fn mouse(&mut self, events: &[MouseEvent]) -> bool {
+        let mut moved = false;
+        // The shake thresholds are in logical pixels.
+        let scale = if self.scale > 0.0 { self.scale } else { 1.0 };
+        for event in events {
+            let MouseEvent::Move { x, y, time, injected: false } = *event else {
+                continue;
+            };
+            moved = true;
+            let holding = self.state.is_holding();
+            match self.shake.move_(x as f64 / scale, y as f64 / scale, time, holding) {
+                ShakeResult::DiscardTop => {
+                    self.state.dissolve(time);
+                    self.dirty = true;
+                }
+                ShakeResult::DiscardAll => {
+                    self.state.discard_all(time);
+                    self.dirty = true;
+                }
+                ShakeResult::None => {}
+            }
+        }
+        moved
+    }
+
+    /// True when a frame must run now, whatever the timer says.
+    fn needs_frame(&mut self) -> bool {
+        if self.overlay.take_display_changed() {
+            self.overlay.reassert();
+            self.dirty = true;
+        }
+        self.dirty
+    }
+
+    fn pile_visible(&self) -> bool {
+        !self.state.stack().is_empty()
+    }
+
+    /// Runs one frame and returns the time of the next one; `None` means "when something
+    /// happens" (a mouse move, a menu action).
+    fn frame(&mut self, now: f64) -> windows::core::Result<Option<f64>> {
         let dt = now - self.last_frame;
         self.last_frame = now;
 
         let deadline_before = self.state.next_deadline();
         self.state.tick(now);
         if deadline_before.is_some_and(|at| at <= now) {
-            self.dirty = true;
-        }
-        if self.overlay.take_display_changed() {
-            self.overlay.reassert();
             self.dirty = true;
         }
 
@@ -95,7 +127,7 @@ impl App {
             self.follower.reset();
             self.dirty = false;
             self.was_animating = false;
-            return Ok(self.until_deadline(now, None));
+            return Ok(self.state.next_deadline());
         }
 
         let mouse = overlay::cursor_pos();
@@ -135,20 +167,15 @@ impl App {
         let settled = self
             .follower
             .is_settled(mouse, monitor.work_area, monitor.scale);
-        let pace = if animating || !settled { FRAME } else { IDLE_POLL };
-        Ok(self.until_deadline(now, Some(pace)))
+        let next_frame = (animating || !settled).then_some(now + FRAME);
+        Ok(earlier(next_frame, self.state.next_deadline()))
     }
+}
 
-    /// The shorter of `pace` and the time to the state's next deadline.
-    fn until_deadline(&self, now: f64, pace: Option<Duration>) -> Option<Duration> {
-        let deadline = self
-            .state
-            .next_deadline()
-            .map(|at| Duration::from_secs_f64((at - now).max(0.0)));
-        match (pace, deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+fn earlier(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -198,19 +225,20 @@ impl Sleeper {
         Ok(Self(handle))
     }
 
-    /// Returns when `wait` has passed or a message is in the queue, whichever is first.
-    fn wait(&self, wait: Option<Duration>) -> windows::core::Result<()> {
-        let Some(wait) = wait else {
-            // SAFETY: no handles are passed; the call only blocks this thread.
-            unsafe { MsgWaitForMultipleObjectsEx(None, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
-            return Ok(());
-        };
+    /// Returns when `wait` has passed, a message is in the queue or `wake` is signalled,
+    /// whichever is first.
+    fn wait(&self, wait: Duration, wake: HANDLE) -> windows::core::Result<()> {
         // Negative means relative, in 100 ns units. At least one unit, so the timer fires.
         let due = -((wait.as_nanos() / 100).clamp(1, i64::MAX as u128) as i64);
-        // SAFETY: `self.0` is a live timer handle and `due` outlives the call.
+        // SAFETY: `self.0` and `wake` are live handles and `due` outlives the call.
         unsafe {
             SetWaitableTimer(self.0, &due, 0, None, None, false)?;
-            MsgWaitForMultipleObjectsEx(Some(&[self.0]), INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            MsgWaitForMultipleObjectsEx(
+                Some(&[self.0, wake]),
+                INFINITE,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            );
         }
         Ok(())
     }
@@ -259,15 +287,15 @@ fn main() -> windows::core::Result<()> {
         overlay.set_capturable(true)?;
     }
     let app = Rc::new(RefCell::new(App {
-        started: Instant::now(),
         state: FairyState::new(seed),
+        shake: ShakeGate::new(),
         follower: Follower::new(),
         renderer: Renderer::new(),
         overlay,
         pixmap: None,
         origin: (0, 0),
         scale: 0.0,
-        last_frame: 0.0,
+        last_frame: hook::now(),
         dirty: false,
         was_animating: false,
         demo_count: 0,
@@ -304,10 +332,40 @@ fn main() -> windows::core::Result<()> {
         }),
     )?;
 
+    let mut mouse_hook = MouseHook::start()?;
+    let mut events = Vec::new();
     let sleeper = Sleeper::new()?;
+    // When the next frame runs; `None` waits for a mouse move or a menu action.
+    let mut due = Some(hook::now());
+    let mut next_health_check = hook::now() + HEALTH_CHECK;
+
     while pump_messages() {
-        let wait = app.borrow_mut().frame()?;
-        sleeper.wait(wait)?;
+        mouse_hook.drain(&mut events);
+        let now = hook::now();
+        {
+            let mut app = app.borrow_mut();
+            let moved = app.mouse(&events);
+            events.clear();
+            if app.needs_frame() {
+                due = Some(now);
+            } else if moved && app.pile_visible() {
+                // The pile follows the cursor, but not faster than the frame rate.
+                due = earlier(due, Some((app.last_frame + FRAME).max(now)));
+            }
+            if due.is_some_and(|at| at <= now) {
+                due = app.frame(now)?;
+            }
+        }
+        if now >= next_health_check {
+            next_health_check = now + HEALTH_CHECK;
+            if !mouse_hook.is_alive() || mouse_hook.seems_stalled() {
+                // On failure the next check tries again.
+                let _ = mouse_hook.restart();
+            }
+        }
+        let until = earlier(due, Some(next_health_check)).unwrap_or(next_health_check);
+        let wait = Duration::from_secs_f64((until - hook::now()).max(0.0));
+        sleeper.wait(wait, mouse_hook.wake_handle())?;
     }
     Ok(())
 }
