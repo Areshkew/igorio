@@ -176,6 +176,20 @@ const CACHED_PROPERTIES: &[UIA_PROPERTY_ID] = &[
     UIA_ValueIsReadOnlyPropertyId,
     UIA_IsTextPatternAvailablePropertyId,
     UIA_IsTextEditPatternAvailablePropertyId,
+    UIA_AriaPropertiesPropertyId,
+];
+
+/// Class tokens of rich web text editors: each edits a contenteditable that takes several
+/// lines and inline images (a chat composer, a document editor), even when the page gives
+/// it `role=textbox` without `aria-multiline` and Chromium reports it as an `Edit`.
+/// ProseMirror (Tiptap is built on it), Quill, Draft.js, CKEditor 5, TinyMCE.
+pub const RICH_EDITOR_CLASSES: &[&str] = &[
+    "ProseMirror",
+    "tiptap",
+    "ql-editor",
+    "public-DraftEditor-content",
+    "ck-editor__editable",
+    "mce-content-body",
 ];
 
 // ---------------------------------------------------------------------------------------
@@ -361,6 +375,8 @@ pub struct ElementInfo {
     pub name: String,
     pub framework: String,
     pub aria_role: String,
+    /// `AriaProperties` ("multiline=true;required=false"), clipped to 200 characters.
+    pub aria_properties: String,
     /// Physical pixels. None when the element has no rectangle.
     pub frame: Option<Rect>,
     pub pid: u32,
@@ -717,6 +733,24 @@ pub fn is_editable_text_root(e: &ElementInfo) -> bool {
     ct == UIA_EditControlTypeId && e.focusable && !e.value_pattern
 }
 
+/// Is this web `Edit` a multi-line rich editor? `aria-multiline=true` (Chromium reports it in
+/// `AriaProperties`), or the class of a known rich editor ([`RICH_EDITOR_CLASSES`]). A plain
+/// `<input>` or search box has neither. The control type alone cannot tell: Chromium reports
+/// a `role=textbox` contenteditable as an `Edit`, like an `<input>`.
+pub fn is_multiline_web_editor(e: &ElementInfo) -> bool {
+    if !is_web(e) {
+        return false;
+    }
+    let multiline = e
+        .aria_properties
+        .split(';')
+        .any(|p| p.trim().eq_ignore_ascii_case("multiline=true"));
+    multiline
+        || e.class_name
+            .split_whitespace()
+            .any(|class| RICH_EDITOR_CLASSES.contains(&class))
+}
+
 /// The macOS role (and subrole) the core rules expect for a UI Automation element. Uses the
 /// input fields of `e`, not its derived ones.
 #[allow(non_upper_case_globals)] // The SDK's control type constants, matched by name.
@@ -738,6 +772,9 @@ pub fn map_role(e: &ElementInfo) -> (&'static str, Option<&'static str>) {
                 "AXStaticText"
             } else if aria == "searchbox" {
                 "AXSearchField"
+            } else if is_multiline_web_editor(e) {
+                // A rich web editor reported as an Edit: it takes lines and images.
+                "AXTextArea"
             } else {
                 // UI Automation has no multiline flag; both roles are editable to the core.
                 "AXTextField"
@@ -1938,6 +1975,10 @@ fn read_cached(element: &IUIAutomationElement) -> ElementInfo {
             name: text(element.CachedName()),
             framework: text(element.CachedFrameworkId()),
             aria_role: text(element.CachedAriaRole()),
+            aria_properties: element
+                .CachedAriaProperties()
+                .map(|s| clip(&s.to_string(), 200))
+                .unwrap_or_default(),
             frame,
             pid: element.CachedProcessId().map_or(0, |p| p as u32),
             hwnd: element
@@ -2211,6 +2252,33 @@ mod tests {
         assert!(is_editable_text_root(&rich));
         rich.class_name = "Button".into();
         assert!(!is_editable_text_root(&rich));
+    }
+
+    #[test]
+    fn rich_web_editors_are_text_areas_and_inputs_stay_fields() {
+        // The composer from the owner's log: an Edit, class "tiptap ProseMirror …".
+        let mut composer = el(UIA_EditControlTypeId).web().value(false).text_edit();
+        composer.class_name = "tiptap ProseMirror composer-tiptap".into();
+        composer.aria_role = "textbox".into();
+        assert_eq!(role(composer), ("AXTextArea", None));
+        // aria-multiline on any editor.
+        let mut multi = el(UIA_EditControlTypeId).web().value(false);
+        multi.aria_properties = "multiline=true;required=false".into();
+        assert_eq!(role(multi), ("AXTextArea", None));
+        // A plain input and a search box stay single-line.
+        let mut input = el(UIA_EditControlTypeId).web().value(false);
+        input.aria_role = "textbox".into();
+        input.aria_properties = "multiline=false".into();
+        assert_eq!(role(input), ("AXTextField", None));
+        let search = el(UIA_EditControlTypeId)
+            .web()
+            .value(false)
+            .aria("searchbox");
+        assert_eq!(role(search), ("AXSearchField", None));
+        // A native Edit with such a class is not web content: unchanged.
+        let mut native = el(UIA_EditControlTypeId).value(false);
+        native.class_name = "ProseMirror".into();
+        assert_eq!(role(native), ("AXTextField", None));
     }
 
     #[test]

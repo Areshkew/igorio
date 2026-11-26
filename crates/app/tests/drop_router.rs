@@ -213,6 +213,27 @@ struct Rig {
     /// ones (after the paste keys). None leaves them unanswered.
     focus: Option<Seen>,
     after: Option<Seen>,
+    /// When set, every probe (the focus check of each card and the probes after its keys)
+    /// sees a multi-line composer holding this many images.
+    images: Option<u32>,
+}
+
+/// The focused composer with `images` images, as a probe sees it.
+fn composer_with(images: u32) -> Seen {
+    let mut spot = nothing("T3 Code (Beta).exe");
+    spot.point = Some(AT);
+    spot.focused = Some(Focus {
+        pid: 100,
+        editable: true,
+        frame: Some(Rect::new(450.0, 380.0, 200.0, 40.0)),
+        single_line: false,
+        xterm: false,
+    });
+    spot.probe = Some(Probe {
+        value: Some(ValueSignature::of("hello")),
+        images: Some(images),
+    });
+    Seen::Spot(Box::new(spot))
 }
 
 /// The focused element a good paste sees: an editable field of pid 100 under `AT`.
@@ -271,6 +292,7 @@ impl Rig {
             now: 0.0,
             focus: Some(focused_field(false, "")),
             after: Some(focused_field(false, "")),
+            images: None,
         }
     }
 
@@ -323,7 +345,9 @@ impl Rig {
             self.e.answered.insert(id);
             let first = self.e.probes_answered == 0;
             self.e.probes_answered += 1;
-            let seen = if first {
+            let seen = if let Some(images) = self.images {
+                Some(composer_with(images))
+            } else if first {
                 self.focus.clone()
             } else {
                 self.after.clone()
@@ -1762,11 +1786,11 @@ fn reads_by_another_process_are_not_a_paste() {
     let sent = paste_into_field(&mut rig);
     rig.read_by(sent + 0.02, 2, Some(4242));
     // Its read may hide the target's: the probe looks, sees no change, and by the probe
-    // timeout the paste is not confirmed.
+    // timeout the paste is not confirmed: the card stays and the user is asked to check.
     rig.to(sent + 1.7);
     assert!(rig.s.card(id).is_some());
     rig.to(sent + 3.1);
-    assert_eq!(rig.s.hint(), Some(HINT_PASTE_FAILED));
+    assert_eq!(rig.s.hint(), Some(HINT_UNCERTAIN));
     assert!(rig.s.card(id).is_some());
     assert!(rig.e.logged("(copyq.exe), not the target → not counted"));
     // A later read by the same other process is not a late paste either.
@@ -1952,53 +1976,88 @@ fn a_probe_that_never_answers_falls_back_to_the_reads() {
     assert!(rig.s.card(id).is_none(), "{:#?}", rig.e.log);
 }
 
-/// The rule table of `paste_outcome`.
+/// The rule table of `verdict` (the outcome rule).
 #[test]
-fn paste_outcome_rules() {
-    use igorio_core::paste_policy::Outcome::*;
+fn the_outcome_rule() {
+    use Verdict::*;
+    let reads = |target, probable, other| Reads {
+        target,
+        probable,
+        other,
+    };
     let view = |verify, answered, changed| {
         Some(ProbeView {
             verify,
             answered,
+            can_tell: true,
             changed,
         })
     };
-    // No probe: reads by the target decide; others never count.
-    assert_eq!(paste_outcome(0.2, 1, 0, false, None), Accepted);
-    assert_eq!(paste_outcome(1.7, 0, 3, false, None), Failed);
+    // No probe: reads by the target, or probably the target, decide; others never count.
+    assert_eq!(verdict(0.2, reads(1, 0, 0), false, None, false), Accepted);
+    assert_eq!(verdict(0.2, reads(0, 1, 0), false, None, false), Accepted);
+    assert_eq!(verdict(1.7, reads(0, 0, 3), false, None, false), Uncertain);
+    assert_eq!(verdict(1.7, reads(0, 0, 0), false, None, false), Failed);
     // A change is acceptance.
     assert_eq!(
-        paste_outcome(0.3, 0, 1, false, view(false, true, true)),
+        verdict(0.3, reads(0, 0, 1), false, view(false, true, true), false),
         Accepted
     );
-    // Single-line, read, unchanged at 3 s: refused.
+    // Single-line, read by the target, unchanged at 3 s: refused; a read alone is not enough.
     assert_eq!(
-        paste_outcome(3.0, 1, 0, false, view(true, true, false)),
+        verdict(0.5, reads(1, 0, 0), false, view(true, true, false), false),
+        Pending
+    );
+    assert_eq!(
+        verdict(3.0, reads(1, 0, 0), false, view(true, true, false), false),
         Rejected
     );
     assert_eq!(
-        paste_outcome(2.0, 1, 0, false, view(true, true, false)),
+        verdict(3.0, reads(0, 1, 0), false, view(true, true, false), false),
+        Rejected
+    );
+    // ... read only by others: uncertain; not read at all: failed.
+    assert_eq!(
+        verdict(3.0, reads(0, 0, 2), false, view(true, true, false), false),
+        Uncertain
+    );
+    assert_eq!(
+        verdict(1.7, reads(0, 0, 0), false, view(true, true, false), false),
+        Failed
+    );
+    // Single-line with no probe answer by 3 s: the reads decide.
+    assert_eq!(
+        verdict(2.9, reads(0, 1, 0), false, view(true, false, false), false),
         Pending
     );
-    // Masked multi-line, unchanged: not confirmed.
     assert_eq!(
-        paste_outcome(3.0, 0, 1, false, view(false, true, false)),
-        Failed
-    );
-    // No probe answered: the reads decide.
-    assert_eq!(
-        paste_outcome(3.0, 1, 0, false, view(true, false, false)),
+        verdict(3.0, reads(0, 1, 0), false, view(true, false, false), false),
         Accepted
     );
+    // A probe that cannot tell (no value, no image count) leaves it to the reads at once.
+    let blind = Some(ProbeView {
+        verify: true,
+        answered: true,
+        can_tell: false,
+        changed: false,
+    });
+    assert_eq!(verdict(0.2, reads(0, 1, 0), false, blind, false), Accepted);
+    // Multi-line, read only by others: the probe may confirm until 3 s, then uncertain.
     assert_eq!(
-        paste_outcome(3.0, 0, 1, false, view(false, false, false)),
-        Failed
+        verdict(2.0, reads(0, 0, 2), false, view(false, true, false), false),
+        Pending
     );
-    // Nothing read at all.
     assert_eq!(
-        paste_outcome(1.7, 0, 0, false, view(true, true, false)),
-        Failed
+        verdict(3.0, reads(0, 0, 2), false, view(false, true, false), false),
+        Uncertain
     );
+    // Stopped by the user after the keys: never refused or failed, uncertain.
+    assert_eq!(
+        verdict(3.0, reads(1, 0, 0), false, view(true, true, false), true),
+        Uncertain
+    );
+    assert_eq!(verdict(1.7, reads(0, 0, 0), false, None, true), Uncertain);
+    assert_eq!(verdict(0.2, reads(1, 0, 0), false, None, true), Accepted);
 }
 
 /// Item 4: a clipboard manager read first and the target's read is invisible; the probe
@@ -2905,12 +2964,38 @@ fn only_target_reads_after_the_send_count() {
     rig.to(3.5);
     assert!(rig.s.card(id).is_some(), "{:#?}", rig.e.log);
 
-    // An unknown reader alone.
+    // A windowless reader that was already reading before the send (something polling the
+    // clipboard), in an app that is not Chromium-based: its reads are not the target's.
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.after = None;
+    rig.double_click();
+    rig.answer(0.17, field("notepad.exe"));
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.40);
+    let ticket = rig.e.stages[0].0;
+    let mut renders = [None; igorio_app::clipboard::RENDER_LOG];
+    renders[0] = Some((None, 0.405));
+    rig.e.facts.staged = Some(StagedFacts {
+        ticket,
+        reads: 1,
+        renders,
+        ..StagedFacts::default()
+    });
+    rig.reply(0.41, ticket, Ok(ClipDone::Staged { sequence: 6 }));
+    rig.read_by(0.43, 2, None);
+    rig.to(3.5);
+    assert!(rig.s.card(id).is_some(), "{:#?}", rig.e.log);
+    assert_eq!(rig.s.hint(), Some(HINT_UNCERTAIN));
+
+    // A windowless read while the target is not in front: not counted.
     let mut rig = Rig::new(1);
     let id = rig.ids()[0];
     rig.after = None;
     let sent = paste_into_field(&mut rig);
-    rig.read_by(sent + 0.02, 2, None);
+    rig.e.front = false;
+    rig.read_by(sent + 0.02, 1, None);
     rig.to(sent + 3.5);
     assert!(rig.s.card(id).is_some());
 }
@@ -2930,4 +3015,206 @@ fn aria_cells_options_and_tabs_are_activating() {
         let s = snapshot(target("chrome.exe", false), vec![cell, page], None);
         assert!(spot_from_snapshot(&s, AT).activating, "{aria}");
     }
+}
+
+// MARK: Round 5: piles in rich composers, windowless readers, uncertain outcomes
+
+/// The composer from the owner's log: T3 Code (Electron), a ProseMirror contenteditable.
+fn composer() -> Seen {
+    let mut spot = nothing("T3 Code (Beta).exe");
+    spot.role = "AXTextArea".into();
+    spot.editable_hit = true;
+    spot.editable = true;
+    spot.chromium = true;
+    spot.field_role = Some("AXTextArea".into());
+    Seen::Spot(Box::new(spot))
+}
+
+/// Double-click on the composer and run up to the first card's Ctrl+V.
+fn paste_pile_into_composer(rig: &mut Rig) -> f64 {
+    rig.double_click();
+    rig.answer(0.17, composer());
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.40);
+    rig.staged_reply(0.41);
+    assert_eq!(rig.e.sent, 1, "{:#?}", rig.e.log);
+    0.41
+}
+
+/// The reads of the owner's log after each Ctrl+V: CopyQ first, then a reader without a
+/// window (the Electron app itself).
+fn copyq_then_windowless(rig: &mut Rig, sent: f64, total_before: u32) {
+    rig.read_by(sent + 0.025, total_before + 1, Some(4242));
+    rig.read_by(sent + 0.05, total_before + 2, None);
+}
+
+/// Item 2: the owner's log. Both cards of the pile leave; the windowless read is logged as
+/// "probably the target".
+#[test]
+fn a_pile_of_two_into_the_composer_is_delivered() {
+    let mut rig = Rig::new(2);
+    let ids = rig.ids();
+    rig.images = Some(0);
+    let sent = paste_pile_into_composer(&mut rig);
+    rig.images = Some(1);
+    copyq_then_windowless(&mut rig, sent, 0);
+    rig.to(sent + 0.3);
+    assert!(rig.s.card(ids[0]).is_none(), "{:#?}", rig.e.log);
+    // Card 2: its own focus check and "before" fingerprint, then its keys.
+    rig.to(sent + 0.45 + 0.4);
+    assert_eq!(rig.e.stages.len(), 2, "{:#?}", rig.e.log);
+    let second = rig.now;
+    rig.staged_reply(second);
+    assert_eq!(rig.e.sent, 2);
+    rig.images = Some(2);
+    // The second staging starts a new render list.
+    copyq_then_windowless(&mut rig, second, 0);
+    rig.to(second + 0.3);
+    assert!(rig.s.card(ids[1]).is_none(), "{:#?}", rig.e.log);
+    assert_eq!(rig.s.hint(), Some("pasted 2"));
+    assert!(rig.e.logged("probably the target"));
+    // Two focus checks, one per card.
+    assert_eq!(
+        rig.e
+            .log
+            .iter()
+            .filter(|l| l.contains("checking the keyboard focus"))
+            .count(),
+        2
+    );
+}
+
+/// Item 1: only the probe proves these pastes (the target's own read is hidden): the second
+/// and the third image in the same field are each a change.
+#[test]
+fn a_second_and_third_image_in_one_field_are_each_a_change() {
+    let mut rig = Rig::new(3);
+    let ids = rig.ids();
+    rig.images = Some(0);
+    let mut sent = paste_pile_into_composer(&mut rig);
+    for (n, id) in ids.iter().enumerate() {
+        if n > 0 {
+            rig.to(sent + 0.45 + 0.4);
+            assert_eq!(rig.e.stages.len(), n + 1, "{:#?}", rig.e.log);
+            sent = rig.now;
+            rig.staged_reply(sent);
+        }
+        // The image lands; only CopyQ is seen reading.
+        rig.images = Some(n as u32 + 1);
+        rig.read_by(sent + 0.025, 1, Some(4242));
+        rig.to(sent + 0.5);
+        assert!(rig.s.card(*id).is_none(), "card {n}: {:#?}", rig.e.log);
+    }
+    assert_eq!(
+        rig.e
+            .log
+            .iter()
+            .filter(|l| l.contains("probe: the field changed"))
+            .count(),
+        3
+    );
+}
+
+/// Item 1: a field that already holds 64 images: the 65th is still a change (the count is
+/// exact).
+#[test]
+fn a_field_with_64_images_still_sees_the_next_one() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.images = Some(64);
+    let sent = paste_pile_into_composer(&mut rig);
+    rig.images = Some(65);
+    rig.read_by(sent + 0.025, 1, Some(4242));
+    rig.to(sent + 0.5);
+    assert!(rig.s.card(id).is_none(), "{:#?}", rig.e.log);
+}
+
+/// Item 2: no probe change, but the windowless read after the send in a Chromium app is
+/// probably the target: accepted, and logged as such.
+#[test]
+fn a_windowless_read_after_the_send_is_probably_the_target() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.images = Some(0);
+    let sent = paste_pile_into_composer(&mut rig);
+    copyq_then_windowless(&mut rig, sent, 0);
+    rig.to(sent + 0.3);
+    assert!(rig.s.card(id).is_none(), "{:#?}", rig.e.log);
+    assert!(rig.e.logged("probably the target 1"));
+}
+
+/// Item 3: an uncertain card keeps its card, says "check the paste" and stops the pile.
+#[test]
+fn an_uncertain_card_stops_the_pile() {
+    let mut rig = Rig::new(2);
+    let ids = rig.ids();
+    rig.images = Some(0);
+    let sent = paste_pile_into_composer(&mut rig);
+    rig.read_by(sent + 0.025, 1, Some(4242));
+    rig.to(sent + 3.2);
+    assert_eq!(rig.s.hint(), Some(HINT_UNCERTAIN));
+    assert!(rig.s.card(ids[0]).is_some() && rig.s.card(ids[1]).is_some());
+    rig.to(sent + 6.0);
+    assert_eq!(rig.e.stages.len(), 1, "the pile stops");
+}
+
+/// Item 5: the user's own press stops a delivery after its keys went out: the card ends
+/// uncertain, never "this field doesn't take images".
+#[test]
+fn a_stopped_delivery_never_reports_a_refusal() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    let sent = paste_into_single_line(&mut rig, "query");
+    rig.read(sent + 0.02, 1);
+    rig.down(sent + 0.5, 1);
+    rig.up(sent + 0.55);
+    rig.to(sent + 3.2);
+    assert_eq!(rig.s.hint(), Some(HINT_UNCERTAIN), "{:#?}", rig.e.log);
+    assert!(rig.s.card(id).is_some());
+    assert!(!rig.e.logged("this field doesn't take images"));
+}
+
+/// Item 4: the composer of the log is multi-line; a plain input stays single-line.
+#[test]
+fn a_prosemirror_composer_is_multi_line_and_an_input_single_line() {
+    let page = || ElementInfo {
+        framework: "Chrome".into(),
+        ..el(UIA_DocumentControlTypeId)
+    };
+    let composer = ElementInfo {
+        class_name: "tiptap ProseMirror composer-tiptap".into(),
+        name: "Message".into(),
+        aria_role: "textbox".into(),
+        framework: "Chrome".into(),
+        value_pattern: true,
+        value_read_only: Some(false),
+        text_edit_pattern: true,
+        ..el(UIA_EditControlTypeId)
+    };
+    let s = snapshot(
+        target("T3 Code (Beta).exe", false),
+        vec![composer, page()],
+        None,
+    );
+    let spot = spot_from_snapshot(&s, AT);
+    assert_eq!(spot.field_role.as_deref(), Some("AXTextArea"));
+    assert_eq!(lines(spot.field_role.as_deref()), "multi-line");
+    assert!(
+        spot.describe().contains("multi-line"),
+        "{}",
+        spot.describe()
+    );
+
+    let input = ElementInfo {
+        class_name: "search-input".into(),
+        aria_role: "textbox".into(),
+        framework: "Chrome".into(),
+        value_pattern: true,
+        value_read_only: Some(false),
+        ..el(UIA_EditControlTypeId)
+    };
+    let s = snapshot(target("chrome.exe", false), vec![input, page()], None);
+    let spot = spot_from_snapshot(&s, AT);
+    assert_eq!(lines(spot.field_role.as_deref()), "single-line");
 }

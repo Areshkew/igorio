@@ -223,6 +223,11 @@ pub const HINT_CLIPBOARD: &str = "can't save your clipboard · still holding it"
 pub const HINT_SLOW: &str = "this app didn't answer · still holding it";
 pub const HINT_FOLDERS_NEXT: &str = "saving to folders comes next";
 pub const HINT_RESTORE_FAILED: &str = "couldn't put your clipboard back";
+/// Something read the paste but nothing proves the target took it: the card stays (a lost
+/// card is worse than a second paste) and the user is asked to look.
+pub const HINT_UNCERTAIN: &str = "check the paste · still holding it";
+/// How long after the paste keys the probe may still confirm a paste (`OutcomeRules`).
+pub const PROBE_TIMEOUT: f64 = 3.0;
 /// The keyboard focus is not in the target field (Swift's canvas text, used for "the paste
 /// would go nowhere").
 pub const HINT_NOT_FOCUSED: &str = HINT_CANVAS_FAILED;
@@ -823,36 +828,101 @@ pub struct ProbeView {
     pub verify: bool,
     /// At least one probe after the paste answered.
     pub answered: bool,
+    /// The "before" fingerprint has something that can change (a value or an image count).
+    pub can_tell: bool,
     pub changed: bool,
 }
 
-/// The outcome of one paste. `target_reads`: formats the target process read;
-/// `foreign_reads`: formats another process read first (Windows keeps rendered data, so the
-/// target's read of the same format is then invisible). With a probe:
-/// - a change of the field is acceptance;
-/// - a single-line field that was read but did not change by the probe timeout refused it;
-/// - when reads were masked by another reader and the probe saw no change, the paste is
-///   not confirmed (failed, the card stays);
-/// - when no probe ever answered, the reads decide, as without a probe.
+/// Renders of the staged formats after the paste keys went out, by who read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Reads {
+    /// By the identified target process.
+    pub target: u32,
+    /// By a reader with no window (pid unknown) that is probably the target: Chromium and
+    /// Electron open the clipboard without a window. See [`verdict`].
+    pub probable: u32,
+    /// By another process, or by an unknown reader that cannot be the target's.
+    pub other: u32,
+}
+
+/// What happens to the card of one paste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Pending,
+    /// The card leaves the pile.
+    Accepted,
+    /// The target read it and showed no change: it refused it ("doesn't take images").
+    Rejected,
+    /// Nothing read it: the keys went nowhere ("couldn't paste").
+    Failed,
+    /// Something read it but nothing proves the target took it ("check the paste"); the
+    /// card stays and the pile stops.
+    Uncertain,
+}
+
+/// The outcome rule, in one place. Never lose a card on weak evidence: a card leaves only
+/// on proof, and when the proof is missing but the paste may have happened the user is told
+/// to check instead of being told it failed.
 ///
-/// An unrelated reader alone never makes a paste accepted.
-pub fn paste_outcome(
+/// - The probe saw the field change (its text, or its image count): accepted.
+/// - Reads: a render by the identified target counts. A render by a reader without a window
+///   counts as "probably the target" when it came after our successful send, while the
+///   target was in front, and the target is Chromium-based (it opens the clipboard without
+///   a window) or no windowless reader was seen before the send. Any other reader (a
+///   clipboard manager, the user pasting elsewhere) never counts.
+/// - Single-line field whose probe can tell: the probe is the judge. Changed: accepted.
+///   Read by the target (or probably the target) and unchanged by [`PROBE_TIMEOUT`]:
+///   refused. Read only by others: uncertain. Not read at all: failed. If no probe answers
+///   by then, or the probe cannot tell, the reads decide as below.
+/// - Otherwise (multi-line composers are trusted, as in Swift): a read by the target or
+///   probably the target is acceptance. Read only by others: the probe may still confirm
+///   until [`PROBE_TIMEOUT`], then uncertain. Not read at all: failed.
+/// - A delivery the user stopped (another press, a key) never ends as refused or failed
+///   after its keys went out: it ends uncertain unless evidence arrives.
+pub fn verdict(
     elapsed: f64,
-    target_reads: u32,
-    foreign_reads: u32,
+    reads: Reads,
     canvas: bool,
     probe: Option<ProbeView>,
-) -> PasteOutcome {
-    let by_reads = || OutcomeRules::new(false, canvas).evaluate(elapsed, target_reads, false);
-    let Some(probe) = probe else {
-        return by_reads();
-    };
-    let rules = OutcomeRules::new(true, canvas);
-    match rules.evaluate(elapsed, target_reads + foreign_reads, probe.changed) {
-        PasteOutcome::Rejected if !probe.answered => by_reads(),
-        PasteOutcome::Rejected if !probe.verify => PasteOutcome::Failed,
-        PasteOutcome::Failed if !probe.answered && target_reads > 0 => by_reads(),
+    cancelled: bool,
+) -> Verdict {
+    let found = judge(elapsed, reads, canvas, probe);
+    match found {
+        Verdict::Rejected | Verdict::Failed if cancelled => Verdict::Uncertain,
         other => other,
+    }
+}
+
+fn judge(elapsed: f64, reads: Reads, canvas: bool, probe: Option<ProbeView>) -> Verdict {
+    if probe.is_some_and(|p| p.changed) {
+        return Verdict::Accepted;
+    }
+    let evidence = reads.target + reads.probable;
+    if let Some(p) = probe
+        && p.verify
+        && p.can_tell
+    {
+        if p.answered {
+            let any = evidence + reads.other;
+            return match OutcomeRules::new(true, canvas).evaluate(elapsed, any, false) {
+                PasteOutcome::Pending => Verdict::Pending,
+                PasteOutcome::Accepted => Verdict::Accepted,
+                PasteOutcome::Rejected if evidence > 0 => Verdict::Rejected,
+                PasteOutcome::Rejected => Verdict::Uncertain,
+                PasteOutcome::Failed => Verdict::Failed,
+            };
+        }
+        if elapsed < PROBE_TIMEOUT {
+            // Wait for the judge: Chromium reads a single-line field and may drop the image.
+            return Verdict::Pending;
+        }
+    }
+    match OutcomeRules::new(false, canvas).evaluate(elapsed, evidence, false) {
+        PasteOutcome::Accepted => Verdict::Accepted,
+        PasteOutcome::Pending => Verdict::Pending,
+        _ if reads.other > 0 && probe.is_some() && elapsed < PROBE_TIMEOUT => Verdict::Pending,
+        _ if reads.other > 0 => Verdict::Uncertain,
+        _ => Verdict::Failed,
     }
 }
 
@@ -967,6 +1037,8 @@ struct Aim {
     keys: PasteKeys,
     /// The double-click point.
     point: (i32, i32),
+    /// Chromium-based (it reads the clipboard without a window).
+    chromium: bool,
 }
 
 impl Aim {
@@ -977,6 +1049,7 @@ impl Aim {
             element_pid,
             keys: paste_keys_for(target),
             point,
+            chromium: false,
         }
     }
 
@@ -1047,6 +1120,8 @@ struct ProbeState {
     before: Option<Probe>,
     /// Single-line field: every paste is verified.
     verify: bool,
+    /// The "before" fingerprint has something that can change.
+    can_tell: bool,
     after_req: Option<u64>,
     last_check: Option<f64>,
     answered: bool,
@@ -1109,8 +1184,11 @@ struct StageRec {
     sent_at: Option<f64>,
     terminal: bool,
     aim: Aim,
-    /// Foreign reads already logged.
+    /// Reads already logged, by kind (probably the target, others).
+    logged_probable: u32,
     logged_foreign: u32,
+    /// Windowless reads counted as probably the target while the target was in front.
+    probable_latched: u32,
     /// `last_change` and sequence number of the foreign write taken for the click's own
     /// copy-on-select.
     adopted: Option<f64>,
@@ -1129,7 +1207,9 @@ impl StageRec {
             sent_at: None,
             terminal,
             aim,
+            logged_probable: 0,
             logged_foreign: 0,
+            probable_latched: 0,
             adopted: None,
             adopted_seq: None,
             guarding: true,
@@ -1275,42 +1355,62 @@ fn restore_guard(stage: &StageRec, facts: &ClipFacts, partial: bool) -> Option<R
     })
 }
 
-/// Renders after the paste keys went out: (by the identified target, by anyone else or an
-/// unknown reader). Renders before a successful send never count.
-fn read_counts(stage: &StageRec, facts: &ClipFacts) -> (u32, u32) {
+/// Renders after the paste keys went out, by kind (see [`verdict`] for the rule). Renders
+/// before a successful send never count. `front`: the target is in front now; a windowless
+/// read counts as probably the target only while it is (latched in the stage record).
+fn read_counts(stage: &mut StageRec, facts: &ClipFacts, front: bool) -> Reads {
     let (Some(staged), Some(sent)) = (facts.staged_for(stage.ticket), stage.sent_at) else {
-        return (0, 0);
+        return Reads::default();
     };
-    let mut counts = (0, 0);
-    for &(reader, at) in staged.renders.iter().flatten() {
+    let renders = staged.renders.iter().flatten();
+    let unknown_before = renders
+        .clone()
+        .any(|&(reader, at)| reader.is_none() && at < sent);
+    let trusted = stage.aim.chromium || !unknown_before;
+    let mut reads = Reads::default();
+    let mut windowless = 0;
+    for &(reader, at) in renders {
         if at < sent {
             continue;
         }
         if stage.aim.is_target(reader) {
-            counts.0 += 1;
+            reads.target += 1;
+        } else if reader.is_none() && trusted {
+            windowless += 1;
         } else {
-            counts.1 += 1;
+            reads.other += 1;
         }
     }
-    counts
+    if front {
+        stage.probable_latched = stage.probable_latched.max(windowless);
+    }
+    reads.probable = stage.probable_latched.min(windowless);
+    reads.other += windowless - reads.probable;
+    reads
 }
 
-/// Logs foreign renders not logged yet, with the reader's exe name.
-fn log_foreign_reads<E: Env>(stage: &mut StageRec, facts: &ClipFacts, now: f64, env: &mut E) {
-    let foreign = read_counts(stage, facts).1;
-    if foreign <= stage.logged_foreign {
-        return;
+/// Logs reads not logged yet, by kind, with the reader's exe name.
+fn log_reads<E: Env>(stage: &mut StageRec, reads: Reads, facts: &ClipFacts, now: f64, env: &mut E) {
+    if reads.probable > stage.logged_probable {
+        let new = reads.probable - stage.logged_probable;
+        stage.logged_probable = reads.probable;
+        env.log(
+            now,
+            &format!("{new} read(s) by a reader without a window → probably the target"),
+        );
     }
-    let new = foreign - stage.logged_foreign;
-    stage.logged_foreign = foreign;
-    let reader = facts.staged_for(stage.ticket).and_then(|s| s.last_reader);
-    let name = reader
-        .and_then(|pid| env.process_name(pid))
-        .unwrap_or_else(|| "?".into());
-    env.log(
-        now,
-        &format!("{new} read(s) by pid {reader:?} ({name}), not the target → not counted"),
-    );
+    if reads.other > stage.logged_foreign {
+        let new = reads.other - stage.logged_foreign;
+        stage.logged_foreign = reads.other;
+        let reader = facts.staged_for(stage.ticket).and_then(|s| s.last_reader);
+        let name = reader
+            .and_then(|pid| env.process_name(pid))
+            .unwrap_or_else(|| "?".into());
+        env.log(
+            now,
+            &format!("{new} read(s) by pid {reader:?} ({name}), not the target → not counted"),
+        );
+    }
 }
 
 impl<S: Clone> Router<S> {
@@ -1900,7 +2000,10 @@ impl<S: Clone> Router<S> {
                 facts.finder_drop_spot = spot.drop_spot;
                 facts.editable_under_cursor = spot.editable_hit;
                 first = Some(First {
-                    aim: Aim::new(&spot.target, spot.pid, click.point),
+                    aim: Aim {
+                        chromium: spot.chromium,
+                        ..Aim::new(&spot.target, spot.pid, click.point)
+                    },
                     pid: Some(spot.pid),
                     before: spot.canvas,
                     chromium: spot.chromium,
@@ -2156,6 +2259,7 @@ impl<S: Clone> Router<S> {
         }
         let aim = Aim {
             element_pid: spot.pid,
+            chromium: first.aim.chromium || spot.chromium,
             ..first.aim
         };
         // The focus check after the release compares against this element's process too.
@@ -2178,10 +2282,21 @@ impl<S: Clone> Router<S> {
         let refusal: Option<(Option<&str>, String)> = match &seen {
             Seen::Spot(spot) => {
                 let pids = (d.aim.pid, d.aim.element_pid);
-                if focus_evidence(spot, pids, d.aim.window, d.aim.point, d.surface) {
+                // A later card of a pile: the first card's paste moved the layout (the
+                // composer grew), so the focus must still be in the target's text input, but
+                // not necessarily under the double-click point.
+                let surface = if d.job.first {
+                    d.surface
+                } else {
+                    Surface::Document
+                };
+                if focus_evidence(spot, pids, d.aim.window, d.aim.point, surface) {
                     d.probe.verify =
                         d.surface == Surface::Field && spot.focused.is_some_and(|f| f.single_line);
                     d.probe.before = spot.probe;
+                    d.probe.can_tell = spot
+                        .probe
+                        .is_some_and(|p| p.value.is_some() || p.images.is_some());
                     env.log(
                         now,
                         &format!(
@@ -2402,6 +2517,8 @@ impl<S: Clone> Router<S> {
                 }
             ),
         );
+        // Every card gets its own "before" fingerprint, right before its keys.
+        d.probe = ProbeState::default();
         d.job = Job {
             id,
             first,
@@ -2544,7 +2661,7 @@ impl<S: Clone> Router<S> {
                 if now < until {
                     return Flow::Wait(Some(until));
                 }
-                if d.job.first && matches!(d.surface, Surface::Field | Surface::Document) {
+                if matches!(d.surface, Surface::Field | Surface::Document) {
                     // Evidence that the target field has the keyboard focus, and the probe's
                     // fingerprint of it, in one lookup.
                     let probe = d.surface == Surface::Field;
@@ -2766,16 +2883,17 @@ impl<S: Clone> Router<S> {
             Step::Watch(sent_at) => {
                 let facts = env.clip_facts(now);
                 self.reconcile(&facts, now, env);
-                let (reads, foreign) = self
-                    .restore
-                    .as_ref()
-                    .and_then(|r| r.stage)
-                    .map_or((0, 0), |s| read_counts(&s, &facts));
+                let front = env.foreground_is(d.aim.window, d.aim.pid);
+                let mut reads = Reads::default();
+                if let Some(stage) = self.restore.as_mut().and_then(|r| r.stage.as_mut()) {
+                    reads = read_counts(stage, &facts, front);
+                    log_reads(stage, reads, &facts, now, env);
+                }
                 let canvas = matches!(d.surface, Surface::Canvas | Surface::Document);
-                // The probe verifies single-line fields, and any field whose target read
-                // another process may have hidden.
-                let masked = reads == 0 && foreign > 0;
-                let probing = d.job.first && d.probe.before.is_some() && (d.probe.verify || masked);
+                // The probe verifies single-line fields, and any field whose reads came only
+                // from others (they may hide the target's).
+                let masked = reads.target + reads.probable == 0 && reads.other > 0;
+                let probing = d.probe.before.is_some() && (d.probe.verify || masked);
                 if probing
                     && d.probe.after_req.is_none()
                     && d.probe.last_check.is_none_or(|t| now >= t + PROBE_INTERVAL)
@@ -2784,14 +2902,30 @@ impl<S: Clone> Router<S> {
                     d.probe.after_req = Some(id);
                     d.probe.last_check = Some(now);
                 }
-                let view = probing.then_some(ProbeView {
+                let view = d.probe.before.is_some().then_some(ProbeView {
                     verify: d.probe.verify,
                     answered: d.probe.answered,
+                    can_tell: d.probe.can_tell,
                     changed: d.probe.changed,
                 });
-                match paste_outcome(now - sent_at, reads, foreign, canvas, view) {
-                    PasteOutcome::Pending => Flow::Wait(Some(now + OUTCOME_POLL)),
-                    PasteOutcome::Accepted => {
+                let cancelled = d.cancelled.is_some() || env.key_presses() != d.click.keys;
+                let evidence = reads.target + reads.probable;
+                let summary = format!(
+                    "the target read {}, probably the target {}, others {}, probe {}",
+                    reads.target,
+                    reads.probable,
+                    reads.other,
+                    if d.probe.changed {
+                        "changed"
+                    } else if d.probe.answered {
+                        "unchanged"
+                    } else {
+                        "-"
+                    }
+                );
+                match verdict(now - sent_at, reads, canvas, view, cancelled) {
+                    Verdict::Pending => Flow::Wait(Some(now + OUTCOME_POLL)),
+                    Verdict::Accepted => {
                         let count = d.ids.len();
                         let hint = if count == 1 {
                             if d.job.is_path {
@@ -2802,14 +2936,7 @@ impl<S: Clone> Router<S> {
                         } else {
                             format!("pasted {count}")
                         };
-                        env.log(
-                            now,
-                            &format!(
-                                "card {}: the target read {reads} format(s), others {foreign}, probe {} → accepted",
-                                d.job.id.0,
-                                if d.probe.changed { "changed" } else { "-" }
-                            ),
-                        );
+                        env.log(now, &format!("card {}: {summary} → accepted", d.job.id.0));
                         state.deliver(&[d.job.id], &hint, now);
                         self.state_changed = true;
                         if d.cancelled.is_none()
@@ -2825,7 +2952,7 @@ impl<S: Clone> Router<S> {
                             Flow::Done
                         }
                     }
-                    PasteOutcome::Rejected => {
+                    Verdict::Rejected => {
                         let hint = if d.job.movie {
                             HINT_NO_VIDEOS
                         } else {
@@ -2834,17 +2961,31 @@ impl<S: Clone> Router<S> {
                         self.fail(
                             d,
                             hint,
-                            "read, but the field did not change (probe)",
+                            &format!("{summary}: read, but the field did not change"),
                             now,
                             state,
                             env,
                         )
                     }
-                    PasteOutcome::Failed => {
-                        if d.job.first
-                            && let Some(restore) = self.restore.as_mut()
-                        {
-                            restore.late = Some((d.job.id, reads));
+                    Verdict::Uncertain => {
+                        if let Some(restore) = self.restore.as_mut() {
+                            restore.late = Some((d.job.id, evidence));
+                        }
+                        self.fail(
+                            d,
+                            HINT_UNCERTAIN,
+                            &format!(
+                                "{summary}: nothing proves the target took it{} (still watching for a read; the pile stops)",
+                                if cancelled { ", and the user moved on" } else { "" }
+                            ),
+                            now,
+                            state,
+                            env,
+                        )
+                    }
+                    Verdict::Failed => {
+                        if let Some(restore) = self.restore.as_mut() {
+                            restore.late = Some((d.job.id, evidence));
                         }
                         let hint = if !d.job.first {
                             HINT_REST_FAILED
@@ -2856,7 +2997,7 @@ impl<S: Clone> Router<S> {
                         self.fail(
                             d,
                             hint,
-                            "the target read nothing (still watching for a late read)",
+                            &format!("{summary}: nothing read it (still watching for a late read)"),
                             now,
                             state,
                             env,
@@ -2944,7 +3085,6 @@ impl<S: Clone> Router<S> {
         let Some(stage) = restore.stage.as_mut() else {
             return;
         };
-        log_foreign_reads(stage, facts, now, env);
         if !stage.guarding || stage.restaging.is_some() || !stage.confirmed {
             return;
         }
@@ -2973,7 +3113,7 @@ impl<S: Clone> Router<S> {
             env.log(now, "the user copied something → leave the clipboard alone");
             return;
         }
-        let target_reads = read_counts(stage, facts).0;
+        let target_reads = read_counts(stage, facts, false).target;
         match paste_policy::overwrite_step(
             now - sent,
             target_reads,
@@ -3374,8 +3514,10 @@ impl<S: Clone> Router<S> {
             return;
         }
         // The app was busy and took the Ctrl+V after we had given up: the top card did land.
+        let mut probe_stage = stage;
+        let late_reads = read_counts(&mut probe_stage, &facts, false);
         if let Some((id, before)) = restore.late
-            && read_counts(&stage, &facts).0 > before
+            && late_reads.target + late_reads.probable > before
         {
             restore.late = None;
             if state.card(id).is_some() {
@@ -3999,8 +4141,12 @@ mod tests {
                 image: image.clone(),
                 scale: 1.0,
                 captured_at: std::time::SystemTime::now(),
-                settings: Settings { captures_folder: Some(folder.clone()), ..Settings::default() },
-            }).unwrap();
+                settings: Settings {
+                    captures_folder: Some(folder.clone()),
+                    ..Settings::default()
+                },
+            })
+            .unwrap();
             let (actual_id, saved) = results.recv_timeout(Duration::from_secs(3)).unwrap();
             assert_eq!(actual_id, id);
             let saved = saved.unwrap();
