@@ -929,10 +929,21 @@ pub fn touched_lines(lines: &[Line], sel: Range<usize>) -> Range<usize> {
 
 /// Where a collapsed caret must go so it never rests inside a list marker that is hidden: the
 /// start of the item's words. `None` when it can stay.
-pub fn snap_caret(lines: &[Line], caret: usize) -> Option<usize> {
+///
+/// The rule: the caret rests at the start of a block's words. A list, to-do or numbered marker
+/// is hidden, so the caret never rests in it. A heading or quote marker shows while the caret is
+/// on its line; on an empty line (nothing typed after the marker) a click, a new block or any
+/// other move snaps the caret after it, so typing goes after the marker and the caret has the
+/// block's size. Only a deliberate keyboard move into the marker (Left from the words, `editing`
+/// true) may leave it there, for editing the Markdown itself.
+pub fn snap_caret(lines: &[Line], caret: usize, editing: bool) -> Option<usize> {
     let line = &lines[line_at(lines, caret)];
-    (line.block.is_list() && caret < line.content && caret >= line.range.start)
-        .then_some(line.content)
+    if caret >= line.content || caret < line.range.start {
+        return None;
+    }
+    let empty = line.content == line.range.end;
+    let snaps = line.block.is_list() || (reveals_prefix(line.block) && empty && !editing);
+    snaps.then_some(line.content)
 }
 
 /// Does typing `ch` at `sel` complete a Markdown shortcut (the line's block or its inline marks
@@ -993,6 +1004,63 @@ pub struct EditorConfig {
 
 const SUBCLASS: usize = 0x4e07;
 const ANIM_TIMER: usize = 0x4e01;
+const WATCHDOG_TIMER: usize = 0x4e02;
+const RETRY_TIMER: usize = 0x4e03;
+
+/// `FAIRY_DEBUG=1`: the repaint watchdog is on (a one-shot timer per repaint asked for).
+pub fn debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match DEBUG_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => *ENABLED
+            .get_or_init(|| std::env::var_os("FAIRY_DEBUG").is_some_and(|value| value == "1")),
+    }
+}
+
+static DEBUG_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests: debug logging on or off regardless of `FAIRY_DEBUG` (`None` follows it again).
+#[doc(hidden)]
+pub fn test_set_debug(enabled: Option<bool>) {
+    let value = match enabled {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    DEBUG_OVERRIDE.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One line in the app's debug log (`%LOCALAPPDATA%\Igorio\debug.log`, or the file
+/// `IGORIO_DEBUG_LOG` names), only with `FAIRY_DEBUG=1`. Never fails.
+pub fn debug_line(text: &str) {
+    use std::io::Write as _;
+    if !debug_enabled() {
+        return;
+    }
+    let path = std::env::var_os("IGORIO_DEBUG_LOG").map(PathBuf::from).or_else(|| {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|base| PathBuf::from(base).join("Igorio").join("debug.log"))
+    });
+    let Some(path) = path else { return };
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{text}");
+    }
+}
+
+/// Starts the one-shot watchdog for a window, in debug runs only (no timer otherwise).
+fn arm_watchdog(hwnd: HWND) {
+    if debug_enabled() {
+        // SAFETY: a timer on our own window, killed when it fires.
+        unsafe { SetTimer(Some(hwnd), WATCHDOG_TIMER, 1200, None) };
+    }
+}
+
+/// Asks for another paint a little later (a paint that could not draw).
+fn retry_paint_later(hwnd: HWND) {
+    // SAFETY: a one-shot timer on our own window.
+    unsafe { SetTimer(Some(hwnd), RETRY_TIMER, 250, None) };
+}
 const RESYNC: u32 = WM_APP + 0x31;
 const BODY_FONT: &str = "Segoe UI Variable Text";
 const MONO_FONT: &str = "Consolas";
@@ -1081,6 +1149,18 @@ struct State {
     undo: RefCell<UndoStack>,
     /// A paint is running: layout and text updates wait for the next message.
     painting: Cell<bool>,
+    /// The control's text services for drawing (`None` inside when it has none).
+    services: RefCell<Option<Option<ITextServices>>>,
+    /// The user moved into a revealed marker with the keyboard to edit it (see `snap_caret`).
+    marker_edit: Cell<bool>,
+    /// When a repaint was asked for and has not happened yet (the watchdog reads it).
+    asked: Cell<Option<Instant>>,
+    /// When the last paint finished.
+    painted: Cell<Option<Instant>>,
+    /// Tests: paints are refused (to see the watchdog report a stuck note).
+    block_paint: Cell<bool>,
+    /// Tests: runs inside the next paint (to send updates while a paint is in progress).
+    during_paint: RefCell<Option<Box<dyn FnOnce()>>>,
     /// An eased wheel scroll: from, to (pixels) on the animation clock.
     scroll: Cell<Option<Transition>>,
     /// Dragging the drawn scroll thumb: the grab offset inside the thumb.
@@ -1220,6 +1300,12 @@ impl Editor {
             popup_shown: Cell::new(false),
             undo: RefCell::new(UndoStack::default()),
             painting: Cell::new(false),
+            services: RefCell::new(None),
+            marker_edit: Cell::new(false),
+            asked: Cell::new(None),
+            painted: Cell::new(None),
+            block_paint: Cell::new(false),
+            during_paint: RefCell::new(None),
             scroll: Cell::new(None),
             thumb_drag: Cell::new(None),
             map: RefCell::new(Utf16Map::new("")),
@@ -1553,6 +1639,46 @@ impl Editor {
         (y, s.hits.borrow().thumb.map(|(thumb, _)| thumb))
     }
 
+    /// The system caret's rectangle in the editor's client pixels, when this control shows
+    /// one (it needs keyboard focus), and the selection in bytes (tests).
+    pub fn caret_rect(&self) -> (Option<RECT>, Range<usize>) {
+        let s = &*self.state;
+        let mut info =
+            GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+        // SAFETY: a query about this thread's caret into a local struct.
+        let ok = unsafe {
+            GetGUIThreadInfo(windows::Win32::System::Threading::GetCurrentThreadId(), &mut info)
+        }
+        .is_ok();
+        let caret = (ok && info.hwndCaret == s.hwnd).then_some(info.rcCaret);
+        (caret, s.selection_bytes())
+    }
+
+    /// Tests: refuse paints (true) to see the watchdog report a stuck note, or paint again.
+    pub fn test_block_paint(&self, block: bool) {
+        self.state.block_paint.set(block);
+        self.state.invalidate();
+    }
+
+    /// Tests: run `hook` inside the next paint, while it is in progress.
+    pub fn test_during_paint(&self, hook: Box<dyn FnOnce()>) {
+        *self.state.during_paint.borrow_mut() = Some(hook);
+        self.state.invalidate();
+    }
+
+    /// A repaint is owed and how long ago it was asked for (tests and the watchdog).
+    pub fn paint_debt(&self) -> Option<Duration> {
+        self.state.asked.get().map(|at| at.elapsed())
+    }
+
+    /// The top-left of a line's first character, client pixels (tests).
+    pub fn line_point(&self, line: usize) -> (i32, i32) {
+        let s = &*self.state;
+        let start = s.lines.borrow().get(line).map_or(0, |line| line.range.start);
+        let unit = s.map.borrow().to16(start);
+        s.position(unit)
+    }
+
     /// Is the caret inside the editor's visible area (tests)?
     pub fn caret_visible(&self) -> bool {
         let s = &*self.state;
@@ -1619,6 +1745,14 @@ impl Editor {
     /// `WM_CHAR` for the given characters, then `WM_KEYUP`.
     pub fn send_key(&self, vk: u16, chars: &str) {
         let hwnd = self.state.hwnd;
+        NO_MODIFIERS.with(|flag| flag.set(true));
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                NO_MODIFIERS.with(|flag| flag.set(false));
+            }
+        }
+        let _restore = Restore;
         // SAFETY: messages to our own control on its own thread.
         unsafe {
             SendMessageW(hwnd, WM_KEYDOWN, Some(WPARAM(usize::from(vk))), Some(LPARAM(1)));
@@ -1727,8 +1861,52 @@ impl State {
     }
 
     fn invalidate(&self) {
+        if self.asked.get().is_none() {
+            self.asked.set(Some(Instant::now()));
+            arm_watchdog(self.hwnd);
+        }
         // SAFETY: same-thread window.
         let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+    }
+
+    /// One line of the editor's paint state, for the watchdog.
+    fn paint_state(&self) -> String {
+        format!(
+            "editor painting={} suppress={} composing={} timer={} frozen={} asked={:?} painted={:?} surface={} layout_decos={} blocked={}",
+            self.painting.get(),
+            self.suppress.get(),
+            self.composing.get(),
+            self.timer.get(),
+            self.frozen.get().is_some(),
+            self.asked.get().map(|at| at.elapsed()),
+            self.painted.get().map(|at| at.elapsed()),
+            self.surface
+                .try_borrow()
+                .map_or("busy".to_owned(), |surface| surface.is_some().to_string()),
+            self.layout.try_borrow().map_or(0, |layout| layout.decos.len()),
+            self.block_paint.get(),
+        )
+    }
+
+    /// The watchdog's check: a repaint asked for over a second ago on a visible control gets a
+    /// debug line, and a forced repaint either way.
+    fn watchdog(&self) {
+        let Some(asked) = self.asked.get() else { return };
+        // SAFETY: a plain query about our own window.
+        let visible = unsafe { IsWindowVisible(self.hwnd) }.as_bool();
+        if visible && asked.elapsed() > Duration::from_secs(1) {
+            debug_line(&format!(
+                "notes-paint: no paint for {:?} after asking: {}",
+                asked.elapsed(),
+                self.paint_state()
+            ));
+            // SAFETY: a synchronous repaint of our own control.
+            let _ = unsafe {
+                RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW)
+            };
+        } else if visible {
+            arm_watchdog(self.hwnd);
+        }
     }
 
     /// The control's text, read fresh.
@@ -1884,7 +2062,7 @@ impl State {
         }
         let sel = self.selection_bytes();
         if sel.is_empty() {
-            let target = snap_caret(&self.lines.borrow(), sel.start);
+            let target = snap_caret(&self.lines.borrow(), sel.start, self.marker_edit.get());
             if let Some(target) = target {
                 let map = self.map.borrow();
                 self.suppress.set(self.suppress.get() + 1);
@@ -1970,8 +2148,14 @@ impl State {
         let spans = markdown::style(&text);
         let now = self.now();
         let reveal = self.reveal.borrow();
-        let reveal_of =
-            |line: usize| reveal.get(&line).map_or(0.0, |track| track.value(now) as f32);
+        // A marker being revealed takes its room from the first frame (only its colour fades
+        // in), so the caret and the drawings are placed for the final layout at once.
+        let reveal_of = |line: usize| {
+            reveal.get(&line).map_or(0.0, |track| {
+                let value = track.value(now) as f32;
+                if track.to > 0.0 { value.max(f32::MIN_POSITIVE) } else { value }
+            })
+        };
         let fade = self.fade.get().map(|(line, track)| (line, track.value(now) as f32));
         let thumb = |path: &str| self.thumb_for(path);
         let input = LayoutInput {
@@ -2009,7 +2193,31 @@ impl State {
             *slot = layout.clone();
         }
         self.apply_layout(&layout);
+        self.refresh_caret();
         self.invalidate();
+    }
+
+    /// RichEdit places and sizes the caret when the selection changes, not when formats do: a
+    /// format pass that reveals a marker or changes the line's size leaves the caret where the
+    /// old layout had it. Setting the selection again puts it at the right place and size.
+    fn refresh_caret(&self) {
+        // SAFETY: focus query on this thread.
+        if unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() } != self.hwnd {
+            return;
+        }
+        let range = self.selection_units();
+        let total = self.units.borrow().len();
+        // Away and back: setting the same selection keeps RichEdit's cached insertion format
+        // (the caret's size); a real move makes it take the format at the caret again.
+        let away = if range.start > 0 { range.start - 1 } else { (range.end + 1).min(total) };
+        self.suppress.set(self.suppress.get() + 1);
+        self.send(EM_HIDESELECTION, 1, 0);
+        if away != range.start {
+            self.select_units(away..away);
+        }
+        self.select_units(range);
+        self.send(EM_HIDESELECTION, 0, 0);
+        self.suppress.set(self.suppress.get() - 1);
     }
 
     /// Runs the text and selection updates again after the current message (used when they
@@ -2697,14 +2905,16 @@ impl State {
         let run = self.frozen.get().is_none() && self.any_active(self.now());
         if run != self.timer.get() {
             // SAFETY: the control's own timer, dispatched on this thread.
-            unsafe {
+            // The flag follows what Windows did: a refused timer is tried again next time.
+            let running = unsafe {
                 if run {
-                    SetTimer(Some(self.hwnd), ANIM_TIMER, 10, None);
+                    SetTimer(Some(self.hwnd), ANIM_TIMER, 10, None) != 0
                 } else {
                     let _ = KillTimer(Some(self.hwnd), ANIM_TIMER);
+                    false
                 }
-            }
-            self.timer.set(run);
+            };
+            self.timer.set(running);
         }
     }
 
@@ -2758,6 +2968,9 @@ impl State {
         // SAFETY: same-thread window, writable local.
         let _ = unsafe { GetClientRect(self.hwnd, &mut client) };
         let (width, height) = (client.right.max(1) as u32, client.bottom.max(1) as u32);
+        if self.block_paint.get() {
+            return;
+        }
         // A paint never nests (RichEdit can paint while formats are applied): a nested one
         // only asks for another paint.
         if self.painting.get() {
@@ -2780,23 +2993,23 @@ impl State {
         {
             *storage = Surface::new(width, height).ok();
         }
-        let Some(surface) = storage.as_mut() else { return };
-        // SAFETY: RichEdit renders its client area into our memory DC (WM_PRINTCLIENT); the DC
-        // and its DIB are ours and live through the call.
-        unsafe {
-            DefSubclassProc(
-                self.hwnd,
-                WM_PRINTCLIENT,
-                WPARAM(surface.dc.0 as usize),
-                LPARAM((PRF_CLIENT | PRF_ERASEBKGND) as isize),
-            );
+        let Some(surface) = storage.as_mut() else {
+            // No bitmap (GDI refused one): try again shortly instead of leaving stale pixels.
+            retry_paint_later(self.hwnd);
+            return;
+        };
+        if let Some(hook) = self.during_paint.borrow_mut().take() {
+            hook();
         }
+        self.render_text(surface.dc, client, dirty);
         let fonts = self.gdi_fonts();
         {
             let mut canvas = surface.canvas();
             self.paint_decos(&mut canvas, fonts, client);
             canvas.finish_labels();
         }
+        self.asked.set(None);
+        self.painted.set(Some(Instant::now()));
         // SAFETY: both DCs are live; the copy covers the dirty part of the client area.
         unsafe {
             let _ = BitBlt(
@@ -2825,6 +3038,79 @@ impl State {
                 .ok()?;
         }
         Some((x, y))
+    }
+
+    /// Renders the control's text into our bitmap. Through the text services' `TxDraw` (the
+    /// call RichEdit's own WM_PAINT makes), not WM_PRINTCLIENT: once the control has had the
+    /// keyboard focus and lost it, WM_PRINTCLIENT renders nothing at all (measured: 574 dark
+    /// pixels before, 0 after, for good), so a note went blank on its next repaint (a hover,
+    /// another window uncovering it). WM_PRINTCLIENT stays as the fallback when the text
+    /// services cannot be had.
+    fn render_text(&self, dc: HDC, client: RECT, dirty: RECT) {
+        let services = self.text_services();
+        let drawn = services.as_ref().is_some_and(|services| {
+            let mut bounds = windows::Win32::Foundation::RECTL {
+                left: client.left,
+                top: client.top,
+                right: client.right,
+                bottom: client.bottom,
+            };
+            let mut update = dirty;
+            // SAFETY: a TOM text-services draw into our own memory DC and its DIB, which live
+            // through the call; the rectangles are locals.
+            unsafe {
+                let brush = CreateSolidBrush(self.palette.get().paper);
+                FillRect(dc, &client, brush);
+                let _ = DeleteObject(brush.into());
+                services
+                    .TxDraw(
+                        DVASPECT_CONTENT,
+                        0,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        dc,
+                        HDC::default(),
+                        &mut bounds,
+                        std::ptr::null_mut(),
+                        &mut update,
+                        0,
+                        0,
+                        TXTVIEW_ACTIVE.0,
+                    )
+                    .is_ok()
+            }
+        });
+        if !drawn {
+            // SAFETY: RichEdit renders its client area into our memory DC; the DC and its DIB
+            // are ours and live through the call.
+            unsafe {
+                DefSubclassProc(
+                    self.hwnd,
+                    WM_PRINTCLIENT,
+                    WPARAM(dc.0 as usize),
+                    LPARAM((PRF_CLIENT | PRF_ERASEBKGND) as isize),
+                );
+            }
+        }
+    }
+
+    /// The control's text services (`ITextServices`), asked for once by its IID (the windows
+    /// crate has no constant for it: Msftedit exports it as data).
+    fn text_services(&self) -> Option<ITextServices> {
+        if let Some(services) = self.services.borrow().as_ref() {
+            return services.clone();
+        }
+        const IID_ITEXTSERVICES: windows::core::GUID =
+            windows::core::GUID::from_u128(0x8d33f740_cf58_11ce_a89d_00aa006cadc5);
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: a plain QueryInterface on the control's own OLE object; on success `raw` is
+        // an owned ITextServices pointer that `from_raw` takes over.
+        let services = unsafe {
+            (self.ole.query(&IID_ITEXTSERVICES, &mut raw).is_ok() && !raw.is_null())
+                .then(|| ITextServices::from_raw(raw))
+        };
+        *self.services.borrow_mut() = Some(services.clone());
+        services
     }
 
     fn position(&self, unit: usize) -> (i32, i32) {
@@ -3021,6 +3307,25 @@ impl State {
             .iter()
             .find(|(rect, _)| x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom)
             .map(|(_, path)| path.clone())
+    }
+
+    /// A click in the left indent of a quote or list item (left of its text, where the bar,
+    /// bullet or box is drawn): the caret goes to the start of the item's words. RichEdit treats
+    /// that margin as a selection bar and selected the whole line, so typing replaced the
+    /// marker.
+    fn indent_click(&self, x: i32, y: i32) -> Option<usize> {
+        let point = windows::Win32::Foundation::POINTL { x, y };
+        let unit = self.send(EM_CHARFROMPOS, 0, &point as *const _ as isize).0.max(0) as usize;
+        let lines = self.lines.borrow();
+        let map = self.map.borrow();
+        let line = &lines[line_at(&lines, map.to8(unit))];
+        if !(line.block.is_list() || line.block == Block::Quote) {
+            return None;
+        }
+        let first = if line.block.is_list() { line.content } else { line.range.start };
+        let (text_x, top) = self.position(map.to16(first));
+        let height = px(f64::from(block_size(line.block)) * 1.6, self.dpi.get());
+        (x < text_x && y >= top && y < top + height).then_some(line.content)
     }
 
     fn link_at_point(&self, x: i32, y: i32) -> Option<String> {
@@ -3227,7 +3532,16 @@ fn load_thumb(path: &Path) -> Option<Thumb> {
 // The control's window procedure
 // ---------------------------------------------------------------------------
 
+thread_local! {
+    /// Tests: keys sent with `Editor::send_key` carry no modifiers, whatever the real keyboard
+    /// of the person using the desktop holds at that moment.
+    static NO_MODIFIERS: Cell<bool> = const { Cell::new(false) };
+}
+
 fn key_down(vk: VIRTUAL_KEY) -> bool {
+    if NO_MODIFIERS.with(Cell::get) {
+        return false;
+    }
     // SAFETY: plain key state query for this thread.
     unsafe { GetKeyState(i32::from(vk.0)) < 0 }
 }
@@ -3265,6 +3579,16 @@ unsafe extern "system" fn editor_proc(
             s.tick();
             return LRESULT(0);
         }
+        WM_TIMER if wp.0 == WATCHDOG_TIMER || wp.0 == RETRY_TIMER => {
+            // SAFETY: one-shot timers of our own control.
+            let _ = unsafe { KillTimer(Some(hwnd), wp.0) };
+            if wp.0 == RETRY_TIMER {
+                s.invalidate();
+            } else {
+                s.watchdog();
+            }
+            return LRESULT(0);
+        }
         RESYNC => {
             s.text_changed();
             s.selection_changed();
@@ -3280,6 +3604,10 @@ unsafe extern "system" fn editor_proc(
         WM_KILLFOCUS => {
             s.focused.set(false);
             s.show_reveal.set(false);
+            // Focus left: any composition is over (cancelled or committed).
+            if s.composing.replace(false) {
+                s.post_resync();
+            }
             let result = default();
             s.close_slash();
             s.selection_changed();
@@ -3309,6 +3637,11 @@ unsafe extern "system" fn editor_proc(
         EM_CANUNDO => return LRESULT(isize::from(s.undo.borrow().can_undo())),
         EM_CANREDO => return LRESULT(isize::from(s.undo.borrow().can_redo())),
         WM_KEYDOWN | WM_SYSKEYDOWN => {
+            // A key that is not for an IME (VK_PROCESSKEY) means no composition is going on:
+            // a composition flag left over (an IME that never sent its end) is cleared here.
+            if wp.0 != 0xE5 && s.composing.replace(false) {
+                s.post_resync();
+            }
             if let Some(result) = s.key(VIRTUAL_KEY(wp.0 as u16), msg) {
                 return result;
             }
@@ -3325,6 +3658,7 @@ unsafe extern "system" fn editor_proc(
             return LRESULT(0);
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            s.marker_edit.set(false);
             let (x, y) = (i32::from(lp.0 as i16), i32::from((lp.0 >> 16) as i16));
             if let Some(line) = s.check_at(x, y) {
                 // SAFETY: keyboard focus to our own control, as a click would.
@@ -3336,6 +3670,15 @@ unsafe extern "system" fn editor_proc(
                 && let Some(path) = s.image_at(x, y).and_then(|path| s.resolve(&path))
             {
                 (s.sink)(EditorEvent::OpenImage(path));
+                return LRESULT(0);
+            }
+            if msg == WM_LBUTTONDOWN
+                && !key_down(VK_SHIFT)
+                && let Some(target) = s.indent_click(x, y)
+            {
+                // SAFETY: keyboard focus to our own control, as a click would.
+                let _ = unsafe { SetFocus(Some(hwnd)) };
+                s.select_bytes(target..target);
                 return LRESULT(0);
             }
             if key_down(VK_CONTROL)
@@ -3544,6 +3887,26 @@ impl State {
                     let target = lines[index - 1].range.end;
                     drop(lines);
                     self.select_bytes(target..target);
+                    return handled;
+                }
+                // Left from a heading's or quote's words goes into its marker on purpose.
+                let into_marker = reveals_prefix(line.block)
+                    && sel.start == line.content
+                    && line.content > line.range.start;
+                drop(lines);
+                self.marker_edit.set(into_marker);
+            }
+            VK_HOME if !shift && !ctrl && sel.is_empty() => {
+                // Home goes to the start of the block's words, after its marker.
+                let content = {
+                    let lines = self.lines.borrow();
+                    let line = &lines[line_at(&lines, sel.start)];
+                    (line.content > line.range.start && sel.start != line.content)
+                        .then_some(line.content)
+                };
+                if let Some(content) = content {
+                    self.marker_edit.set(false);
+                    self.select_bytes(content..content);
                     return handled;
                 }
             }
@@ -3898,8 +4261,35 @@ pub struct GdiFonts {
     pub h3: HFONT,
 }
 
+/// The fonts made so far, one set per DPI for the life of the process (GDI fonts are process
+/// wide). Every note window and editor used to make its own set and never free it: 12 GDI
+/// objects lost per note opened, against the process's 10,000-object quota.
+static FONT_SETS: std::sync::Mutex<Vec<(u32, [isize; 6])>> = std::sync::Mutex::new(Vec::new());
+
 impl GdiFonts {
+    /// The fonts for a DPI, made once and then shared.
     pub fn new(dpi: u32) -> Self {
+        let mut sets = FONT_SETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, handles)) = sets.iter().find(|(made_for, _)| *made_for == dpi) {
+            return Self::from_handles(*handles);
+        }
+        let fonts = Self::make(dpi);
+        sets.push((dpi, fonts.handles()));
+        fonts
+    }
+
+    fn handles(&self) -> [isize; 6] {
+        [self.body, self.small, self.semibold, self.h1, self.h2, self.h3]
+            .map(|font| font.0 as isize)
+    }
+
+    fn from_handles(handles: [isize; 6]) -> Self {
+        let [body, small, semibold, h1, h2, h3] =
+            handles.map(|handle| HFONT(handle as *mut c_void));
+        Self { body, small, semibold, h1, h2, h3 }
+    }
+
+    fn make(dpi: u32) -> Self {
         let make = |size: f64, weight: i32| {
             // SAFETY: a static family name; the font is owned by the process for its lifetime
             // (a handful per DPI, kept like the settings window's fonts).
@@ -4589,10 +4979,26 @@ mod tests {
         assert_eq!(touched_lines(&lines, 1..1), 0..1);
         assert_eq!(touched_lines(&lines, 1..6), 0..2);
         assert_eq!(touched_lines(&lines, 0..4), 0..1, "a selection ending at a line start");
-        assert_eq!(snap_caret(&lines, 4), Some(6));
-        assert_eq!(snap_caret(&lines, 5), Some(6));
-        assert_eq!(snap_caret(&lines, 6), None);
-        assert_eq!(snap_caret(&lines, 1), None);
+        assert_eq!(snap_caret(&lines, 4, false), Some(6));
+        assert_eq!(snap_caret(&lines, 5, false), Some(6));
+        assert_eq!(snap_caret(&lines, 6, false), None);
+        assert_eq!(snap_caret(&lines, 1, false), None);
+        // An empty heading or quote: after the marker, unless the user moved in to edit it.
+        let lines = blocks(
+            "# 
+> 
+## Title",
+        );
+        assert_eq!(snap_caret(&lines, 0, false), Some(2));
+        assert_eq!(snap_caret(&lines, 1, false), Some(2));
+        assert_eq!(snap_caret(&lines, 1, true), None);
+        assert_eq!(snap_caret(&lines, 3, false), Some(5));
+        assert_eq!(
+            snap_caret(&lines, 6, false),
+            None,
+            "a heading with words keeps a caret in its marker"
+        );
+        assert_eq!(snap_caret(&lines, 2, false), None);
     }
 
     #[test]
