@@ -29,7 +29,7 @@ use igorio_app::saver;
 use igorio_app::settings::{self, DefaultFolders, Settings};
 use igorio_app::settings_window::{LiveSettings, SettingsWindow, ShortcutService};
 use igorio_app::shortcuts::{Action, Hotkeys, Registration, display_for_layout};
-use igorio_app::snip::{Snip, SnipEvent};
+use igorio_app::snip::{Snip, SnipEvent, Source};
 use igorio_app::state::{IgorioState, Hidden};
 use igorio_app::tray::{EndRequest, MenuItem, Tray};
 use igorio_app::uia::Requester;
@@ -198,11 +198,12 @@ impl App {
                     image,
                     scale,
                     captured_at,
+                    source,
                     saved_file,
-                    ..
                 } => {
                     let kept = saved_file.is_some();
-                    if !kept && settings.keep_every_screenshot {
+                    // A copied image is not a screenshot, so it is not kept.
+                    if !kept && settings.keep_every_screenshot && source != Source::Copied {
                         let image = Arc::clone(&image);
                         let settings = settings.clone();
                         // Folder selection can itself hit the filesystem and the Shell.
@@ -1602,6 +1603,7 @@ fn main() -> windows::core::Result<()> {
         notes.borrow().feed(&events);
         recording.borrow().feed(&events);
         if let Some(snip) = &detector.active {
+            snip.set_carry_copies(settings.snapshot.carry_copied_images);
             snip.drain(&mut snip_events);
         }
         let recorded = recording.borrow_mut().pass(settings.recording, &settings.snapshot, now);

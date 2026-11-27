@@ -122,6 +122,7 @@ fn tab_order(hwnd: HWND) -> bool {
             GeneralTab,
             Screenshots,
             Keep,
+            Carry,
             Notes,
             Recording,
             ChooseNotes,
@@ -164,6 +165,7 @@ fn verify_controls(
     for (id, name, state, available) in [
         (Screenshots, "Screenshots", expected.is_enabled("igorio.screenshots"), true),
         (Keep, "Keep every screenshot", expected.keep_every_screenshot, true),
+        (Carry, "Also carry copied images", expected.carry_copied_images, true),
         (Notes, "Notes", expected.is_enabled("igorio.notes"), true),
         (Recording, "Screen recording", expected.is_enabled("igorio.screen-recording"), true),
         (Small, "Small", false, true),
@@ -206,6 +208,8 @@ fn verify_controls(
                 (ScreenshotKeys, "Windows plus Shift plus S, or Print Screen"),
                 (ScreenshotDetail, "Use Win+Shift+S or PrtScn and your cursor carries the shot."),
                 (KeepTitle, "Keep every screenshot"),
+                (CarryTitle, "Also carry copied images"),
+                (CarryDetail, "Not saved by Keep every screenshot."),
                 (NotesTitle, "Notes"),
                 (NotesKeys, "Hold Alt and click"),
                 (NotesDetail, "A sticky note opens where you click, saved as Markdown."),
@@ -254,6 +258,14 @@ fn verify_controls(
         "Keep every screenshot saves and publishes",
         disk(controller, path, &expected) && !checked(child(hwnd, Keep)),
     );
+    for on in [true, false] {
+        click(hwnd, Carry);
+        expected.carry_copied_images = on;
+        checks.check(
+            &format!("Also carry copied images {on} saves and publishes"),
+            disk(controller, path, &expected) && checked(child(hwnd, Carry)) == on,
+        );
+    }
     for _ in 0..2 {
         let on = !expected.is_enabled("igorio.notes");
         click(hwnd, Notes);
@@ -589,7 +601,7 @@ fn tab_cycle(hwnd: HWND) -> Vec<HWND> {
 const PROMPT: &str = "Press the keys · Esc cancels · Backspace clears";
 
 fn verify_pages(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: HWND) {
-    let general = [Capabilities, Screenshots, Keep, ChooseNotes, Small, Medium, Launch, WindowsShortcutNote];
+    let general = [Capabilities, Screenshots, Keep, Carry, ChooseNotes, Small, Medium, Launch, WindowsShortcutNote];
     let shortcut_parts = Action::ALL.iter().flat_map(|&action| {
         [ShortcutPart::Label, ShortcutPart::Recorder, ShortcutPart::Status].map(|part| Control::shortcut(action, part))
     });
@@ -1330,6 +1342,7 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
         [
             Screenshots,
             Keep,
+            Carry,
             Notes,
             Recording,
             ChooseNotes,

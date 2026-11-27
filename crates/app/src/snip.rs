@@ -15,7 +15,7 @@ use std::io::{Cursor, Read, Write};
 use std::os::windows::{ffi::OsStringExt, fs::OpenOptionsExt, io::AsRawHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -101,6 +101,9 @@ pub enum Source {
     PrintScreen,
     WindowPrintScreen,
     FullScreenFile,
+    /// An image copied in another app, carried when "Also carry copied images" is on. It is
+    /// not a screenshot, so it is never kept.
+    Copied,
 }
 
 pub enum SnipEvent {
@@ -126,6 +129,7 @@ pub struct Snip {
     clipboard: ScreenshotClipboard,
     folder: Option<PathBuf>,
     output: Arc<Output>,
+    copies: Arc<AtomicBool>,
     run: Option<Run>,
     stall: StallCheck,
 }
@@ -156,11 +160,18 @@ impl Snip {
                 wake: Event::new(false)?,
                 queue: Mutex::new(VecDeque::with_capacity(OUTPUT_CAP)),
             }),
+            copies: Arc::default(),
             run: None,
             stall: StallCheck::default(),
         };
         detector.restart()?;
         Ok(detector)
+    }
+
+    /// "Also carry copied images": carry an image copied in another app too. Off at start,
+    /// kept across restart, read at each clipboard update.
+    pub fn set_carry_copies(&self, on: bool) {
+        self.copies.store(on, Relaxed);
     }
 
     /// Auto-reset event. It stays open and has the same handle across restart.
@@ -239,6 +250,7 @@ impl Snip {
             self.clipboard.clone(),
             self.folder.clone(),
             self.output.clone(),
+            self.copies.clone(),
         )?);
         Ok(())
     }
@@ -347,6 +359,7 @@ impl Run {
         clipboard: ScreenshotClipboard,
         folder: Option<PathBuf>,
         output: Arc<Output>,
+        copies: Arc<AtomicBool>,
     ) -> Result<Self> {
         // A writer can create the first file before the new worker is scheduled.
         // Establish the recovery scan cutoff before starting any workers.
@@ -383,7 +396,9 @@ impl Run {
             folder_thread(&stop, &tx, folder.as_deref(), started)
         })?;
         run.spawn("snip-controller", move |stop| {
-            Controller::new(output, test_folder).run(&stop, rx, &clipboard, last_change);
+            let mut controller = Controller::new(output, test_folder);
+            controller.copies = copies;
+            controller.run(&stop, rx, &clipboard, last_change);
         })?;
         Ok(run)
     }
@@ -1322,7 +1337,10 @@ enum Input {
         own: bool,
         image: bool,
         files: bool,
+        /// HTML, rich text or plain text.
         rich: bool,
+        /// Plain text, a part of `rich`.
+        text: bool,
         capture_owner: bool,
     },
     File {
@@ -1389,6 +1407,7 @@ fn classify(signals: &Signals) -> Verdict {
         files,
         rich,
         capture_owner,
+        ..
     } = input
     else {
         if recent_key.is_some_and(|key| {
@@ -1489,12 +1508,34 @@ fn classify(signals: &Signals) -> Verdict {
     })
 }
 
-fn image_flags(formats: &[(u32, Option<String>)]) -> (bool, bool) {
+/// Whether an update the screenshot rules ignored is an image the user copied in another
+/// app, carried when "Also carry copied images" is on. Image data with HTML counts (a
+/// browser's "Copy image"); image data with plain text does not (a cell range, a slide or
+/// a document selection), nor files, our own writes or an update a screenshot handled.
+fn copied_image(enabled: bool, input: &Input, verdict: Verdict) -> bool {
+    enabled
+        && matches!(verdict, Verdict::Ignore(_))
+        && matches!(
+            *input,
+            Input::Clipboard {
+                own: false,
+                image: true,
+                files: false,
+                text: false,
+                ..
+            }
+        )
+}
+
+/// (files, rich, text): file-transfer formats, HTML or any text, plain text.
+fn image_flags(formats: &[(u32, Option<String>)]) -> (bool, bool, bool) {
     let mut files = false;
     let mut rich = false;
+    let mut text = false;
     for (id, name) in formats {
         files |= *id == 15; // CF_HDROP
-        rich |= matches!(id, 1 | 7 | 13); // CF_TEXT, CF_OEMTEXT, CF_UNICODETEXT
+        text |= matches!(id, 1 | 7 | 13); // CF_TEXT, CF_OEMTEXT, CF_UNICODETEXT
+        rich |= text;
         if let Some(name) = name {
             files |= [
                 "Shell IDList Array",
@@ -1517,7 +1558,7 @@ fn image_flags(formats: &[(u32, Option<String>)]) -> (bool, bool) {
             .any(|known| name.eq_ignore_ascii_case(known));
         }
     }
-    (files, rich)
+    (files, rich, text)
 }
 
 struct Capture {
@@ -1609,6 +1650,7 @@ struct Controller {
     pairs: VecDeque<PairRecord>,
     own_pid: u32,
     test_folder: bool,
+    copies: Arc<AtomicBool>,
 }
 
 impl Controller {
@@ -1626,6 +1668,7 @@ impl Controller {
             // SAFETY: no arguments.
             own_pid: unsafe { GetCurrentProcessId() },
             test_folder,
+            copies: Arc::default(),
         }
     }
 
@@ -1904,7 +1947,7 @@ impl Controller {
         metadata: &ImageMetadata,
     ) -> Option<ClipboardStage> {
         let time = job.change.time;
-        let (files, rich) = image_flags(&metadata.formats);
+        let (files, rich, text) = image_flags(&metadata.formats);
         let format = ImageFormat::preferred(&metadata.formats);
         let owner = process_name(metadata.owner_pid);
         let signals = self.evidence(
@@ -1914,10 +1957,18 @@ impl Controller {
                 image: format.is_some(),
                 files,
                 rich,
+                text,
                 capture_owner: capture_process(&owner),
             },
         );
-        let verdict = classify(&signals);
+        let mut verdict = classify(&signals);
+        if copied_image(self.copies.load(Relaxed), &signals.input, verdict) {
+            verdict = Verdict::Carry {
+                source: Source::Copied,
+                reason: "image copied in another app",
+                overlay: false,
+            };
+        }
         self.record(time, format_args!("CLASSIFY seq={} owner={owner:?} pid={} formats={:?} {signals:?} verdict={verdict:?}",
             job.change.sequence, metadata.owner_pid, metadata.formats));
         let (source, use_overlay, follow_up) = match verdict {
@@ -1945,10 +1996,14 @@ impl Controller {
         };
         let format = format?;
         let overlay = signals.overlay.filter(|_| use_overlay);
-        let key = signals.key.filter(|key| {
-            source != Source::Snip
-                || (time - key.time <= OWNER_SHORTCUT
-                    && matches!(key.shortcut, Shortcut::Snip | Shortcut::Print))
+        // A copied image owes nothing to a shortcut and leaves it unused.
+        let key = signals.key.filter(|key| match source {
+            Source::Snip => {
+                time - key.time <= OWNER_SHORTCUT
+                    && matches!(key.shortcut, Shortcut::Snip | Shortcut::Print)
+            }
+            Source::Copied => false,
+            _ => true,
         });
         let scale = overlay
             .map(|o| o.scale)
@@ -2072,6 +2127,9 @@ impl Controller {
                 self.emit(capture);
             }
             self.snip_receipt = Some(receipt);
+        } else if capture.source == Source::Copied {
+            // Never paired with a screenshot file of the same size.
+            self.emit(capture);
         } else {
             self.deliver(capture, candidate.wait_for_file);
         }
@@ -2395,6 +2453,7 @@ mod tests {
                 image: true,
                 files: false,
                 rich: false,
+                text: false,
                 capture_owner: false,
             },
             time: 6.0,
@@ -2515,13 +2574,14 @@ mod tests {
                 image,
                 files,
                 rich,
+                text: false,
                 capture_owner: false,
             };
             assert_eq!(classify(&signals), Verdict::Ignore(expected));
         }
         assert_eq!(
             image_flags(&[(15, None), (0xc001, Some("HTML Format".into()))]),
-            (true, true)
+            (true, true, false)
         );
     }
 
@@ -2566,12 +2626,13 @@ mod tests {
     }
 
     fn observed_input(owner: &str, formats: &[(u32, Option<String>)]) -> Input {
-        let (files, rich) = image_flags(formats);
+        let (files, rich, text) = image_flags(formats);
         Input::Clipboard {
             own: false,
             image: ImageFormat::preferred(formats).is_some(),
             files,
             rich,
+            text,
             capture_owner: capture_process(owner),
         }
     }
@@ -2643,6 +2704,62 @@ mod tests {
             classify(&signals),
             Verdict::Ignore("no supported image format")
         );
+    }
+
+    #[test]
+    fn copied_images_carry_only_image_data_without_text_files_own_writes_or_snips() {
+        let copied = |enabled, signals: &Signals| {
+            copied_image(enabled, &signals.input, classify(signals))
+        };
+        let mut signals = clipboard_signals();
+        for (owner, formats, expected) in [
+            ("mspaint.exe", observed_formats(&[2, 8, 17], &[]), true), // image only
+            ("chrome.exe", observed_formats(&[2, 8, 17], &["HTML Format"]), true), // image + HTML
+            (
+                "vivaldi.exe",
+                observed_formats(&[17], &["PNG", "HTML Format", "UniformResourceLocatorW"]),
+                true,
+            ),
+            (
+                "EXCEL.EXE",
+                observed_formats(&[2, 8, 17, 13, 1, 7], &["PNG", "HTML Format", "Rich Text Format"]),
+                false,
+            ), // image + text
+            (
+                "explorer.exe",
+                observed_formats(&[15], &["Shell IDList Array", "FileNameW"]),
+                false,
+            ), // file drop
+            ("svchost.exe", snip_formats(false), false), // snip data, even without evidence
+            ("notepad.exe", observed_formats(&[13, 1, 7], &[]), false), // text only
+        ] {
+            signals.input = observed_input(owner, &formats);
+            assert_eq!(copied(true, &signals), expected, "{owner}");
+            assert!(!copied(false, &signals), "{owner} with the setting off");
+        }
+
+        // Our own staging and restore.
+        signals.input = observed_input("", &observed_formats(&[2, 8, 17], &[]));
+        assert!(copied(true, &signals));
+        let Input::Clipboard { ref mut own, .. } = signals.input else { unreachable!() };
+        *own = true;
+        assert!(!copied(true, &signals));
+
+        // An image the screenshot rules carried, or a later update of that snip.
+        let mut signals = Signals {
+            input: observed_input("", &observed_formats(&[2, 8, 17], &[])),
+            key: key(Shortcut::AltPrint, 5.8),
+            ..clipboard_signals()
+        };
+        assert_eq!(source(&signals), Some(Source::WindowPrintScreen));
+        assert!(!copied(true, &signals));
+        signals.key = key(Shortcut::Snip, 2.6);
+        signals.overlay = Some(OverlayEvidence {
+            used: true,
+            ..overlay(3.5, Some(5.9)).unwrap()
+        });
+        assert_eq!(classify(&signals), Verdict::SnipFollowUp);
+        assert!(!copied(true, &signals));
     }
 
     fn snip_controller() -> (Arc<Output>, Controller) {

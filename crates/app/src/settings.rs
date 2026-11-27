@@ -44,6 +44,9 @@ pub struct Settings {
     pub captures_folder: Option<PathBuf>,
     /// Save every screenshot to the captures folder as it is taken. Default false.
     pub keep_every_screenshot: bool,
+    /// Also carry images copied in other apps, such as a browser's "Copy image". They are
+    /// not screenshots, so they are never kept. Default false.
+    pub carry_copied_images: bool,
     pub launch_at_login: bool,
     /// Size of the screenshot cards. An unknown value is ignored and gives the default.
     #[serde(default, deserialize_with = "card_size_or_default")]
