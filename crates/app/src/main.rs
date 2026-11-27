@@ -1514,6 +1514,9 @@ fn main() -> windows::core::Result<()> {
         }
         let recorded = recording.borrow_mut().pass(settings.recording, &settings.snapshot, now);
         let recording_due = recorded.due;
+        if recorded.start_hint_shown {
+            settings_window.note_recording_hint_shown();
+        }
         let facts = {
             let mut recording = recording.borrow_mut();
             let pen_keys = recording.pen_keys();

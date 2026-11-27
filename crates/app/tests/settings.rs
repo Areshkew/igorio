@@ -452,3 +452,51 @@ fn the_recording_hint_count_defaults_to_zero_and_round_trips() {
     settings.save(&path).unwrap();
     assert_eq!(Settings::load(&path).unwrap().recording_hints_shown, 2);
 }
+
+#[test]
+fn counting_the_recording_hint_goes_one_two_three_and_keeps_the_rest() {
+    let scratch = Scratch::new("hint-count");
+    let path = scratch.path("settings.json");
+    Settings {
+        launch_at_login: true,
+        ..Settings::default()
+    }
+    .save(&path)
+    .unwrap();
+    for expected in 1..=3 {
+        let saved = Settings::note_recording_hint_shown(&path).unwrap();
+        assert_eq!(saved.recording_hints_shown, expected);
+        let loaded = Settings::load(&path).unwrap();
+        assert_eq!(loaded.recording_hints_shown, expected);
+        assert!(loaded.launch_at_login);
+    }
+    // No file yet: it starts from the defaults.
+    let fresh = scratch.path("fresh.json");
+    assert_eq!(Settings::note_recording_hint_shown(&fresh).unwrap().recording_hints_shown, 1);
+}
+
+#[test]
+fn counting_the_recording_hint_on_a_locked_file_loses_nothing() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let scratch = Scratch::new("hint-locked");
+    let path = scratch.path("settings.json");
+    Settings {
+        launch_at_login: true,
+        recording_hints_shown: 1,
+        ..Settings::default()
+    }
+    .save(&path)
+    .unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+    assert!(Settings::note_recording_hint_shown(&path).is_err());
+    drop(lock);
+    let loaded = Settings::load(&path).unwrap();
+    assert!(loaded.launch_at_login, "the other settings are still there");
+    assert_eq!(loaded.recording_hints_shown, 1);
+    assert!(!scratch.path("settings.json.bad").exists());
+}

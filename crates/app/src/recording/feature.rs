@@ -61,10 +61,14 @@ use crate::overlay::{cursor_pos, monitor_bounds_at};
 use crate::settings::{DefaultFolders, Settings};
 use crate::shortcuts::{Action, Shortcuts, display_for_layout};
 
-/// The zoom hint shows at the start of this many recordings. Nothing counts them up yet:
-/// the settings are written by the settings window's thread, which has no path for the app
-/// to change a value, so `recording_hints_shown` stays 0 and the hint shows every time.
+/// The zoom hint shows at the start of this many recordings: [`Pass::start_hint_shown`]
+/// tells the app to count one (`SettingsWindow::note_recording_hint_shown`).
 pub const START_HINT_RECORDINGS: u32 = 3;
+
+/// Whether a recording shows the zoom hint, given how many already did.
+pub fn show_start_hint(shown: u32) -> bool {
+    shown < START_HINT_RECORDINGS
+}
 /// The capability's id in `settings.json` (`RecordingCapability.manifest.id`).
 pub const CAPABILITY: &str = "fairy.screen-recording";
 /// The drawn cursor's size: `CursorScale.enlarge` turns the usual size 1 into
@@ -250,6 +254,9 @@ pub struct Pass {
     /// When the loop must run again at the latest (the viewport moves, a thread is in
     /// flight, a fade bound).
     pub due: Option<f64>,
+    /// A recording UI came up with the zoom hint: count it in the settings (once per
+    /// recording).
+    pub start_hint_shown: bool,
 }
 
 /// The viewport while a recording runs.
@@ -299,6 +306,8 @@ pub struct RecordingFeature {
     ui_events: Vec<UiEvent>,
     /// The strip's stop button was clicked, for this pass.
     stop_requested: bool,
+    /// The UI shown in this pass carries the zoom hint.
+    hint_shown: bool,
 }
 
 impl RecordingFeature {
@@ -326,6 +335,7 @@ impl RecordingFeature {
             recorder_events: Vec::new(),
             ui_events: Vec::new(),
             stop_requested: false,
+            hint_shown: false,
         }
     }
 
@@ -461,6 +471,7 @@ impl RecordingFeature {
         if self.launch.is_some() || self.ending.is_some() {
             out.due = earlier(out.due, Some(now + self.frame));
         }
+        out.start_hint_shown = std::mem::take(&mut self.hint_shown);
         out
     }
 
@@ -639,13 +650,14 @@ impl RecordingFeature {
         }
         let config = RecordingUiConfig {
             labels: labels(&settings.shortcuts),
-            show_start_hint: settings.recording_hints_shown < START_HINT_RECORDINGS,
+            show_start_hint: show_start_hint(settings.recording_hints_shown),
             capturable: std::env::var_os("FAIRY_CAPTURABLE").is_some_and(|v| v == "1"),
             debug: self.log.enabled(),
             ..RecordingUiConfig::default()
         };
         match RecordingUi::start(monitor, config) {
             Ok(ui) => {
+                self.hint_shown = show_start_hint(settings.recording_hints_shown);
                 ui.set_elapsed(0.0);
                 ui.set_area(screen);
                 self.ui = Some(ui);
@@ -957,6 +969,22 @@ mod tests {
                 assert!(table.iter().any(|row| row.0 == state && row.1 == input));
             }
         }
+    }
+
+    #[test]
+    fn the_start_hint_shows_for_the_first_three_recordings() {
+        let mut settings = Settings::default();
+        let mut shown = Vec::new();
+        for _ in 0..5 {
+            let show = show_start_hint(settings.recording_hints_shown);
+            shown.push((settings.recording_hints_shown, show));
+            if show {
+                settings.recording_hints_shown += 1;
+            }
+        }
+        assert_eq!(shown, vec![(0, true), (1, true), (2, true), (3, false), (3, false)]);
+        // Set back to 0 (or deleted) in settings.json: it shows again.
+        assert!(show_start_hint(Settings::default().recording_hints_shown));
     }
 
     #[test]

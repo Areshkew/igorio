@@ -7,8 +7,15 @@
 //! real mouse messages take. To stay out of the way of a person using the desktop:
 //! - the "monitor" of the main run is a small region of the real one, so the ink window, the
 //!   outline and the strip only cover that region, for a few seconds;
-//! - an opaque backdrop window of our own (not topmost) lies under that region, so the
-//!   screen captures compare our own pixels and not whatever the desktop shows there;
+//! - an opaque backdrop window of our own lies under that region, so the screen captures
+//!   compare our own pixels and not whatever the desktop shows there. It is topmost, directly
+//!   under the test's windows: before every capture and every probe the order backdrop, ink,
+//!   outline, tip, strip is set again at the top of the topmost band and then checked by
+//!   walking the z-order (`GetTopWindow`/`GetWindow`). If a visible, uncloaked, capturable
+//!   window of another program is above the backdrop inside the region (it re-topped itself),
+//!   the check is reported as SKIP with that window's class and program, never as FAIL. The
+//!   region itself is first moved to a place no topmost window of another program covers;
+//!   `--stay` keeps it at the first place;
 //! - a tool is in hand (the region takes the mouse, Esc, Backspace, Delete and Ctrl+Z are
 //!   swallowed) for about two seconds;
 //! - the mask key is off; the wheel gate is armed while the UI runs (Alt + wheel does not
@@ -45,7 +52,7 @@ use tiny_skia::{Color, Paint, Pixmap, PixmapPaint, Transform};
 use windows::Win32::Foundation::{
     COLORREF, FILETIME, HINSTANCE, HWND, LPARAM, POINT, RECT, WPARAM,
 };
-use windows::Win32::Graphics::Dwm::DwmFlush;
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmFlush, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection,
     CreateSolidBrush, DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, HBITMAP, HBRUSH,
@@ -53,17 +60,20 @@ use windows::Win32::Graphics::Gdi::{
     SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_SYSTEM_FOREGROUND,
-    GA_ROOT, GW_HWNDNEXT, GWL_EXSTYLE, GetAncestor, GetForegroundWindow, GetWindow,
-    GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOP,
-    IsWindow, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos, WDA_EXCLUDEFROMCAPTURE,
-    WDA_NONE, WINEVENT_OUTOFCONTEXT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
-    WindowFromPoint,
+    GA_ROOT, GW_HWNDNEXT, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetForegroundWindow,
+    GetTopWindow, GetWindow, GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, HWND_TOPMOST, IsWindow, IsWindowVisible, MSG, PM_REMOVE,
+    PeekMessageW, PostMessageW, RegisterClassW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SetWindowPos, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WINEVENT_OUTOFCONTEXT,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WindowFromPoint,
 };
 use windows::core::w;
 
@@ -80,7 +90,8 @@ fn main() -> ExitCode {
     let result = match args.as_slice() {
         [flag, x, y] if flag == "--probe" => probe(x, y).map(|()| true),
         [flag] if flag == "--pngs" => pngs().map(|()| true),
-        [] => run(),
+        [] => run(false),
+        [flag] if flag == "--stay" => run(true),
         _ => Err("usage: recording_ui_selftest [--probe X Y | --pngs]".into()),
     };
     match result {
@@ -98,6 +109,7 @@ fn main() -> ExitCode {
 
 struct Report {
     pass: bool,
+    skipped: u32,
 }
 
 impl Report {
@@ -110,32 +122,332 @@ impl Report {
     fn info(&self, text: impl Display) {
         println!("INFO {text}");
     }
+
+    /// A check that could not be made (another program's window covered the test region).
+    /// Not a failure.
+    fn skip(&mut self, text: impl Display) {
+        println!("SKIP {text}");
+        self.skipped += 1;
+    }
+
+    /// A check that needs the z-order to be right: skipped when `guarded` says it is not.
+    fn check_or_skip(
+        &mut self,
+        guarded: &std::result::Result<(), String>,
+        ok: bool,
+        text: impl Display,
+    ) {
+        match guarded {
+            Ok(()) => {
+                self.check(ok, text);
+            }
+            Err(why) => self.skip(format_args!("{text}: {why}")),
+        }
+    }
+
+    /// A pixel check of a capture against the baseline; skipped when either capture could
+    /// not be taken. `f` returns the verdict and the detail.
+    fn compare(
+        &mut self,
+        baseline: &Shot,
+        shot: &Shot,
+        name: &str,
+        f: impl FnOnce(&[u8], &[u8]) -> (bool, String),
+    ) {
+        match (baseline, shot) {
+            (Ok(a), Ok(b)) => {
+                let (ok, detail) = f(a, b);
+                self.check(ok, format_args!("{name}{detail}"));
+            }
+            (Err(why), _) | (_, Err(why)) => self.skip(format_args!("{name}: {why}")),
+        }
+    }
 }
 
-/// The physical-pixel rectangle of the main run: a region of the monitor under the cursor.
-fn region(monitor: &MonitorBounds) -> MonitorBounds {
+// MARK: - The z-order
+
+/// A screen capture, or why it was not taken (a foreign window over the region).
+type Shot = std::result::Result<Vec<u8>, String>;
+
+/// The windows of the test, bottom to top: the backdrop, then the ink window, the outline
+/// strips, the tip and the strip. All are topmost; `enforce` puts them in this order at the top
+/// of the topmost band, `verify` walks the real z-order to check it.
+struct Order {
+    backdrop: HWND,
+    /// Ours above the backdrop, bottom to top.
+    ours: Vec<HWND>,
+    region: (i32, i32, i32, i32),
+}
+
+impl Order {
+    fn enforce(&self) {
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        // SAFETY: windows of this process; topmost re-insertion without activation. Each goes
+        // to the top of the topmost band, so the last one ends on top.
+        unsafe {
+            let _ = SetWindowPos(self.backdrop, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+            for &hwnd in &self.ours {
+                let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags);
+            }
+            let _ = RedrawWindow(
+                Some(self.backdrop),
+                None,
+                None,
+                RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW,
+            );
+        }
+        pump();
+        flush();
+    }
+
+    /// Walks the z-order from the top down to the backdrop: every visible window of ours must
+    /// be above it, and no visible, uncloaked, capturable window of another process may be
+    /// above it inside the region. `Err` names what is wrong.
+    fn verify(&self) -> std::result::Result<(), String> {
+        let own = std::process::id();
+        let mut seen = Vec::new();
+        // SAFETY: walks the z-order; a stale handle just ends the walk.
+        let mut next = unsafe { GetTopWindow(None) }.ok();
+        while let Some(hwnd) = next.filter(|h| !h.is_invalid()) {
+            if hwnd == self.backdrop {
+                let missing = self
+                    .ours
+                    .iter()
+                    .filter(|h| visible_window(**h) && !seen.contains(*h))
+                    .count();
+                return if missing == 0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{missing} window(s) of the test are below the backdrop"
+                    ))
+                };
+            }
+            if self.ours.contains(&hwnd) {
+                seen.push(hwnd);
+            } else if let Some(what) = covering(hwnd, own, self.region) {
+                return Err(format!(
+                    "a window of another program covers the test region: {what}"
+                ));
+            }
+            // SAFETY: as above.
+            next = unsafe { GetWindow(hwnd, GW_HWNDNEXT) }.ok();
+        }
+        Err("the backdrop is not in the z-order".into())
+    }
+
+    /// Every visible window of ours is above the backdrop (whatever else is in between).
+    fn ours_above(&self) -> bool {
+        let mut seen = Vec::new();
+        // SAFETY: walks the z-order; a stale handle just ends the walk.
+        let mut next = unsafe { GetTopWindow(None) }.ok();
+        while let Some(hwnd) = next.filter(|h| !h.is_invalid()) {
+            if hwnd == self.backdrop {
+                return self
+                    .ours
+                    .iter()
+                    .all(|h| !visible_window(*h) || seen.contains(h));
+            }
+            if self.ours.contains(&hwnd) {
+                seen.push(hwnd);
+            }
+            // SAFETY: as above.
+            next = unsafe { GetWindow(hwnd, GW_HWNDNEXT) }.ok();
+        }
+        false
+    }
+
+    /// Puts the order right and checks it, a few times if another program is re-topping its
+    /// window at the same moment.
+    fn guard(&self) -> std::result::Result<(), String> {
+        let mut last = String::new();
+        for _ in 0..3 {
+            self.enforce();
+            match self.verify() {
+                Ok(()) => return Ok(()),
+                Err(why) => last = why,
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        Err(last)
+    }
+
+    /// A capture of the region with the order checked first.
+    fn shot(&self, capture: &mut Capture) -> Shot {
+        self.guard()?;
+        capture
+            .grab(self.region)
+            .map(<[u8]>::to_vec)
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn visible_window(hwnd: HWND) -> bool {
+    // SAFETY: reads a flag of a window handle.
+    unsafe { IsWindowVisible(hwnd) }.as_bool()
+}
+
+/// If `hwnd` is a window of another process that would show in a capture of `region`: its
+/// class and program.
+fn covering(hwnd: HWND, own: u32, region: (i32, i32, i32, i32)) -> Option<String> {
+    let mut pid = 0;
+    // SAFETY: writes into a local.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid == own || !visible_window(hwnd) {
+        return None;
+    }
+    let mut cloaked = 0u32;
+    // SAFETY: DWMWA_CLOAKED writes one DWORD into a local.
+    let got = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast(),
+            size_of::<u32>() as u32,
+        )
+    };
+    if got.is_ok() && cloaked != 0 {
+        return None;
+    }
+    // Excluded from capture (like this app's own overlays): not in a capture.
+    if affinity(hwnd) == WDA_EXCLUDEFROMCAPTURE.0 {
+        return None;
+    }
+    let (x, y, w, h) = window_rect(hwnd);
+    let (rx, ry, rw, rh) = region;
+    if w <= 0 || h <= 0 || x >= rx + rw || x + w <= rx || y >= ry + rh || y + h <= ry {
+        return None;
+    }
+    Some(format!("class {}, {}", class_name(hwnd), process_name(pid)))
+}
+
+fn class_name(hwnd: HWND) -> String {
+    let mut buffer = [0u16; 256];
+    // SAFETY: writes into a local buffer of the given length.
+    let n = unsafe { GetClassNameW(hwnd, &mut buffer) };
+    String::from_utf16_lossy(&buffer[..n.max(0) as usize])
+}
+
+fn process_name(pid: u32) -> String {
+    // SAFETY: a query-only handle, closed below; the name goes into a local buffer.
+    unsafe {
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return format!("pid {pid}");
+        };
+        let mut buffer = [0u16; 512];
+        let mut len = buffer.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(process);
+        if !ok {
+            return format!("pid {pid}");
+        }
+        let path = String::from_utf16_lossy(&buffer[..len as usize]);
+        path.rsplit('\\').next().unwrap_or(&path).to_string()
+    }
+}
+
+/// Topmost windows of other processes that would cover `region` (they stay in the topmost
+/// band and may come above the backdrop again): the first one, if any.
+fn topmost_over(region: (i32, i32, i32, i32)) -> Option<String> {
+    let own = std::process::id();
+    // SAFETY: walks the z-order; a stale handle just ends the walk.
+    let mut next = unsafe { GetTopWindow(None) }.ok();
+    while let Some(hwnd) = next.filter(|h| !h.is_invalid()) {
+        if ex_style(hwnd) & WS_EX_TOPMOST.0 == 0 {
+            // The topmost band is over.
+            return None;
+        }
+        if let Some(what) = covering(hwnd, own, region) {
+            return Some(what);
+        }
+        // SAFETY: as above.
+        next = unsafe { GetWindow(hwnd, GW_HWNDNEXT) }.ok();
+    }
+    None
+}
+
+/// The first place for the test region and what covers it, if anything.
+fn first_region(monitor: &MonitorBounds) -> (MonitorBounds, Option<String>, bool) {
+    let s = monitor.scale;
+    let work = monitor.work_area;
+    let bounds = Rect::new(
+        (work.x + 80.0 * s).round(),
+        (work.y + 120.0 * s).round(),
+        (720.0 * s).round().min(work.width - 80.0 * s),
+        (400.0 * s).round().min(work.height - 160.0 * s),
+    );
+    let covered = topmost_over((
+        bounds.x as i32,
+        bounds.y as i32,
+        bounds.width as i32,
+        bounds.height as i32,
+    ));
+    let first = MonitorBounds {
+        bounds,
+        work_area: bounds,
+        scale: s,
+    };
+    (first, covered, false)
+}
+
+/// The test region: the first of a few places on the monitor that no topmost window of
+/// another program covers, or the first place and what covers it.
+fn free_region(monitor: &MonitorBounds) -> (MonitorBounds, Option<String>, bool) {
     let s = monitor.scale;
     let work = monitor.work_area;
     let width = (720.0 * s).round().min(work.width - 80.0 * s);
     let height = (400.0 * s).round().min(work.height - 160.0 * s);
-    let bounds = Rect::new(
-        (work.x + 80.0 * s).round(),
-        (work.y + 120.0 * s).round(),
-        width,
-        height,
-    );
-    MonitorBounds {
-        bounds,
-        work_area: bounds,
-        scale: s,
+    let left = work.x + 80.0 * s;
+    let right = work.x + work.width - width - 80.0 * s;
+    let top = work.y + 120.0 * s;
+    let bottom = work.y + work.height - height - 40.0 * s;
+    let places = [
+        (left, top),
+        (right, top),
+        (left, bottom),
+        (right, bottom),
+        ((left + right) / 2.0, (top + bottom) / 2.0),
+    ];
+    let make = |(x, y): (f64, f64)| {
+        let bounds = Rect::new(x.round(), y.round(), width, height);
+        MonitorBounds {
+            bounds,
+            work_area: bounds,
+            scale: s,
+        }
+    };
+    let rect = |m: &MonitorBounds| {
+        (
+            m.bounds.x as i32,
+            m.bounds.y as i32,
+            m.bounds.width as i32,
+            m.bounds.height as i32,
+        )
+    };
+    let mut first_problem = None;
+    for place in places {
+        let candidate = make(place);
+        match topmost_over(rect(&candidate)) {
+            None => return (candidate, first_problem, true),
+            Some(what) => {
+                first_problem.get_or_insert(what);
+            }
+        }
     }
+    (make(places[0]), first_problem, false)
 }
 
 // MARK: - The backdrop
 
 /// An opaque window of our own under the test region: what the captures see behind our
-/// windows. Not topmost, never activated; raised to the top of the normal band before each
-/// capture.
+/// windows. Topmost (so windows of other programs, topmost ones included, go below it), never
+/// activated; [`Order`] keeps it directly under the test's windows.
 struct Backdrop {
     hwnd: HWND,
 }
@@ -158,7 +470,7 @@ impl Backdrop {
             };
             RegisterClassW(&class);
             let hwnd = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
                 w!("IgorioSelftestBackdrop"),
                 w!("recording_ui_selftest backdrop"),
                 WS_POPUP,
@@ -173,7 +485,7 @@ impl Backdrop {
             )?;
             let _ = SetWindowPos(
                 hwnd,
-                Some(HWND_TOP),
+                Some(HWND_TOPMOST),
                 0,
                 0,
                 0,
@@ -188,31 +500,6 @@ impl Backdrop {
             );
             Ok(Backdrop { hwnd })
         }
-    }
-
-    /// Back to the top of the normal band (a window the person activated may have covered
-    /// it); our test windows are topmost and stay above it.
-    fn raise(&self) {
-        // SAFETY: our own window; no activation.
-        unsafe {
-            let _ = SetWindowPos(
-                self.hwnd,
-                Some(HWND_TOP),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-            let _ = RedrawWindow(
-                Some(self.hwnd),
-                None,
-                None,
-                RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW,
-            );
-        }
-        pump();
-        flush();
     }
 }
 
@@ -269,11 +556,20 @@ fn above(upper: HWND, lower: HWND) -> bool {
     false
 }
 
-fn run() -> Result<bool> {
+/// `stay`: keep the test region at its first place even when a window of another program
+/// covers it (to exercise the z-order rules).
+fn run(stay: bool) -> Result<bool> {
     ensure_dpi_awareness();
-    let mut report = Report { pass: true };
+    let mut report = Report {
+        pass: true,
+        skipped: 0,
+    };
     let monitor = monitor_bounds_at(cursor_pos());
-    let fake = region(&monitor);
+    let (fake, covered, free) = if stay {
+        first_region(&monitor)
+    } else {
+        free_region(&monitor)
+    };
     let scale = fake.scale;
     let r = fake.bounds;
     report.info(format_args!(
@@ -295,6 +591,15 @@ fn run() -> Result<bool> {
             "off (reduced motion)"
         }
     ));
+    match (&covered, free) {
+        (Some(what), true) => report.info(format_args!(
+            "test region moved: the first place is covered by {what}"
+        )),
+        (Some(what), false) => report.info(format_args!(
+            "the test region is covered by {what}; it stays there, under the topmost backdrop"
+        )),
+        _ => {}
+    }
     let rect = (r.x as i32, r.y as i32, r.width as i32, r.height as i32);
     let backdrop = Backdrop::new(rect)?;
     settle_plain(150);
@@ -326,6 +631,21 @@ fn run() -> Result<bool> {
     let ink = HWND(windows.ink as *mut c_void);
     let pill_hwnd = HWND(windows.frame[4] as *mut c_void);
     let tip_hwnd = HWND(windows.frame[5] as *mut c_void);
+    // Bottom to top above the backdrop: ink, outline strips, tip, strip.
+    let order = Order {
+        backdrop: backdrop.hwnd,
+        ours: std::iter::once(windows.ink)
+            .chain(windows.frame[..4].iter().copied())
+            .chain([windows.frame[5], windows.frame[4]])
+            .map(|h| HWND(h as *mut c_void))
+            .collect(),
+        region: rect,
+    };
+    order.enforce();
+    report.check(
+        order.ours_above(),
+        "z-order, walked with GetTopWindow/GetWindow: the topmost backdrop is under every window of the test",
+    );
     let ink_style = ex_style(ink);
     let base = WS_EX_LAYERED.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0;
     report.check(
@@ -397,16 +717,22 @@ fn run() -> Result<bool> {
 
     // 3. Baseline capture of the region: our backdrop under excluded windows.
     let mut capture = Capture::new(rect.2, rect.3)?;
-    backdrop.raise();
-    let baseline = capture.grab(rect)?.to_vec();
-    let backdrop_share = share_of(&baseline, BACKDROP);
-    report.check(
-        backdrop_share > 0.99,
-        format_args!(
-            "the capture of the region shows only our backdrop ({:.2}% of its pixels)",
-            backdrop_share * 100.0
-        ),
-    );
+    let baseline = order.shot(&mut capture);
+    match &baseline {
+        Ok(pixels) => {
+            let share = share_of(pixels, BACKDROP);
+            report.check(
+                share > 0.99,
+                format_args!(
+                    "the capture of the region shows only our backdrop ({:.2}% of its pixels)",
+                    share * 100.0
+                ),
+            );
+        }
+        Err(why) => report.skip(format_args!(
+            "the capture of the region shows only our backdrop: {why}"
+        )),
+    }
 
     // 4. Who takes the mouse, seen from a second process.
     let spot = POINT {
@@ -414,8 +740,10 @@ fn run() -> Result<bool> {
         y: rect.1 + rect.3 * 3 / 4,
     };
     let own_pid = std::process::id();
+    let guarded = order.guard();
     let before = run_probe(spot, &ui, &mut events)?;
-    report.check(
+    report.check_or_skip(
+        &guarded,
         before.0 == backdrop.hwnd.0 as isize,
         format_args!("no tool: a second process finds the window below at {},{} (our backdrop 0x{:X}), not the ink window", spot.x, spot.y, before.0),
     );
@@ -431,8 +759,10 @@ fn run() -> Result<bool> {
         x: outline.x + outline.w / 2,
         y: outline.y,
     };
+    let guarded = order.guard();
     let through = run_probe(on_line, &ui, &mut events)?;
-    report.check(
+    report.check_or_skip(
+        &guarded,
         through.0 != windows.frame[0] && through.0 == backdrop.hwnd.0 as isize,
         format_args!("the outline is click-through (a second process at {},{} on the line finds the backdrop; strip {top:?})", on_line.x, on_line.y),
     );
@@ -456,13 +786,17 @@ fn run() -> Result<bool> {
         "picking a tool up shows its keys under the strip",
     );
     let style = ex_style(ink);
+    let guarded = order.guard();
     let after = run_probe(spot, &ui, &mut events)?;
-    report.check(
+    report.check_or_skip(
+        &guarded,
         style & WS_EX_TRANSPARENT.0 == 0 && after.0 == windows.ink && after.1 == own_pid,
         format_args!("pen in hand: the second process finds the ink window at {},{} (window 0x{:X}, ours 0x{:X}), with no ink there", spot.x, spot.y, after.0, windows.ink),
     );
+    let guarded = order.guard();
     let on_pen = run_probe(pen_screen, &ui, &mut events)?;
-    report.check(
+    report.check_or_skip(
+        &guarded,
         above(pill_hwnd, ink) && on_pen.0 == windows.frame[4],
         "pen in hand: the strip stays above the ink window and still takes its clicks",
     );
@@ -499,13 +833,19 @@ fn run() -> Result<bool> {
     let line = stroke((mid.0 - rect.2 / 6, mid.1), (mid.0 + rect.2 / 6, mid.1));
     draw(ink, &line);
     let drawn = wait_state(&ui, &mut events, 1000, |s| s.strokes == 1);
-    backdrop.raise();
-    let with_ink = capture.grab(rect)?.to_vec();
+    let with_ink = order.shot(&mut capture);
     let ink_box = bbox(&line, (20.0 * scale) as i32);
-    let ink_pixels = count_diff(&baseline, &with_ink, rect, Some(ink_box), None, 40);
-    report.check(
-        drawn && ink_pixels > (100.0 * scale) as usize,
-        format_args!("the stroke is on screen and in a screen capture ({ink_pixels} pixels changed around it)"),
+    report.compare(
+        &baseline,
+        &with_ink,
+        "the stroke is on screen and in a screen capture",
+        |a, b| {
+            let ink_pixels = count_diff(a, b, rect, Some(ink_box), None, 40);
+            (
+                drawn && ink_pixels > (100.0 * scale) as usize,
+                format!(" ({ink_pixels} pixels changed around it)"),
+            )
+        },
     );
 
     // 7. The outline, the strip and the tip are not in the capture; the control run shows
@@ -527,34 +867,49 @@ fn run() -> Result<bool> {
         .map(|b| (b.2.max(0) * b.3.max(0)) as usize)
         .sum();
     let tolerance = frame_area / 1000 + 4;
-    let hidden = frame_boxes
-        .iter()
-        .map(|b| count_diff(&baseline, &with_ink, rect, Some(*b), Some(ink_box), 3))
-        .sum::<usize>();
     ui.test_set_capturable(true);
     settle(&ui, &mut events, 60);
-    backdrop.raise();
-    let control = capture.grab(rect)?.to_vec();
+    let control = order.shot(&mut capture);
     ui.test_set_capturable(false);
-    let shown = frame_boxes
-        .iter()
-        .map(|b| count_diff(&baseline, &control, rect, Some(*b), Some(ink_box), 3))
-        .sum::<usize>();
-    report.check(
-        hidden <= tolerance && shown > tolerance * 4,
-        format_args!("outline, strip and tip not in the capture: {hidden} pixels differ under them (tolerance {tolerance}); control with the exclusion off: {shown}"),
-    );
+    let pair = match (&with_ink, &control) {
+        (Ok(a), Ok(b)) => Ok((a.clone(), b.clone())),
+        (Err(why), _) | (_, Err(why)) => Err(why.clone()),
+    };
+    match (&baseline, &pair) {
+        (Ok(base), Ok((with_ink, control))) => {
+            let differ = |shot: &[u8]| {
+                frame_boxes
+                    .iter()
+                    .map(|b| count_diff(base, shot, rect, Some(*b), Some(ink_box), 3))
+                    .sum::<usize>()
+            };
+            let (hidden, shown) = (differ(with_ink), differ(control));
+            report.check(
+                hidden <= tolerance && shown > tolerance * 4,
+                format_args!("outline, strip and tip not in the capture: {hidden} pixels differ under them (tolerance {tolerance}); control with the exclusion off: {shown}"),
+            );
+        }
+        (Err(why), _) | (_, Err(why)) => report.skip(format_args!(
+            "outline, strip and tip not in the capture: {why}"
+        )),
+    }
     settle(&ui, &mut events, 60);
 
     // 8. Undo, clear, put down.
     ui.ink_key(InkKey::Undo);
     let undone = wait_state(&ui, &mut events, 1000, |s| s.strokes == 0 && !s.content);
-    backdrop.raise();
-    let after_undo = capture.grab(rect)?.to_vec();
-    let left = count_diff(&baseline, &after_undo, rect, Some(ink_box), None, 3);
-    report.check(
-        undone && left <= 4,
-        format_args!("undo takes the stroke back ({left} pixels still differ)"),
+    let after_undo = order.shot(&mut capture);
+    report.compare(
+        &baseline,
+        &after_undo,
+        "undo takes the stroke back",
+        |a, b| {
+            let left = count_diff(a, b, rect, Some(ink_box), None, 3);
+            (
+                undone && left <= 4,
+                format!(" ({left} pixels still differ)"),
+            )
+        },
     );
 
     let second = stroke(
@@ -566,17 +921,23 @@ fn run() -> Result<bool> {
     let two = wait_state(&ui, &mut events, 1000, |s| s.strokes == 2);
     ui.ink_key(InkKey::Clear);
     let cleared = wait_state(&ui, &mut events, 1000, |s| s.strokes == 0 && !s.content);
-    backdrop.raise();
-    let after_clear = capture.grab(rect)?.to_vec();
+    let after_clear = order.shot(&mut capture);
     let both = bbox(
         &[line.clone(), second.clone()].concat(),
         (20.0 * scale) as i32,
     );
-    let left = count_diff(&baseline, &after_clear, rect, Some(both), None, 3);
     let state = ui.ink_state();
-    report.check(
-        two && cleared && left <= 4 && state.tool == Some(InkTool::Pen),
-        format_args!("clear wipes both strokes and keeps the pen ({left} pixels still differ)"),
+    report.compare(
+        &baseline,
+        &after_clear,
+        "clear wipes both strokes and keeps the pen",
+        |a, b| {
+            let left = count_diff(a, b, rect, Some(both), None, 3);
+            (
+                two && cleared && left <= 4 && state.tool == Some(InkTool::Pen),
+                format!(" ({left} pixels still differ)"),
+            )
+        },
     );
 
     draw(ink, &line);
@@ -603,19 +964,27 @@ fn run() -> Result<bool> {
         style & WS_EX_TRANSPARENT.0 != 0 && !DRAW_KEYS.load(Relaxed),
         "put down: click-through again and the drawing keys are free",
     );
-    backdrop.raise();
-    let after_fade = capture.grab(rect)?.to_vec();
-    let left = count_diff(&baseline, &after_fade, rect, None, None, 3);
+    let after_fade = order.shot(&mut capture);
     let animated = frame::animation_effects();
-    report.check(
-        faded && left <= 4 && (!animated || lowest < 200),
-        format_args!(
-            "the ink fades (lowest alpha seen {lowest}) and ends fully transparent and hidden after {:.0} ms ({left} pixels of the region differ from before)",
+    report.compare(
+        &baseline,
+        &after_fade,
+        &format!(
+            "the ink fades (lowest alpha seen {lowest}) and ends fully transparent and hidden after {:.0} ms",
             fade_time * 1000.0
         ),
+        |a, b| {
+            let left = count_diff(a, b, rect, None, None, 3);
+            (
+                faded && left <= 4 && (!animated || lowest < 200),
+                format!(" ({left} pixels of the region differ from before)"),
+            )
+        },
     );
+    let guarded = order.guard();
     let gone = run_probe(spot, &ui, &mut events)?;
-    report.check(
+    report.check_or_skip(
+        &guarded,
         gone.0 != windows.ink,
         "after put-down a second process no longer finds the ink window",
     );
@@ -747,6 +1116,7 @@ fn run() -> Result<bool> {
     for scale in [1.0, 2.0] {
         timing(&mut report, &monitor, scale)?;
     }
+    report.info(format_args!("{} checks skipped", report.skipped));
     Ok(report.pass)
 }
 

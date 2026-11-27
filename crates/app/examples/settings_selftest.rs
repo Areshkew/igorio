@@ -956,6 +956,51 @@ fn capture(hwnd: HWND, path: &Path, dpi: u32) -> Result<bool> {
     Ok(rendered && varied && (w, h) == test_client_size(dpi))
 }
 
+/// Waits up to two seconds for a saved snapshot with `count` recording hints.
+fn saved_count(window: &mut SettingsWindow, shortcuts: &Shortcuts, count: u32) -> bool {
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until {
+        if window
+            .saved(None, shortcuts)
+            .iter()
+            .any(|settings| settings.recording_hints_shown == count)
+        {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// The recording hint counter, with the window closed (a short-lived thread counts) and open
+/// (the window counts and saves), and a window opened right after a count while closed.
+fn verify_hint_counter(checks: &mut Checks, path: &Path, defaults: &TestMode) -> Result<()> {
+    let before = Settings::load(path)?;
+    let start = before.recording_hints_shown;
+    let expect = |count: u32| Settings { recording_hints_shown: count, ..before.clone() };
+    let mut window = SettingsWindow::for_test(path.to_path_buf(), defaults.clone())?;
+    window.note_recording_hint_shown();
+    let saved = saved_count(&mut window, &before.shortcuts, start + 1);
+    checks.check(
+        "hint counter, window closed: a short thread counts it, the rest of settings.json unchanged",
+        saved && Settings::load(path)? == expect(start + 1),
+    );
+    // Counted while closed, then opened at once: the window loads after the count.
+    window.note_recording_hint_shown();
+    let hwnd = open(&mut window)?;
+    let first = saved_count(&mut window, &before.shortcuts, start + 2);
+    window.note_recording_hint_shown();
+    let second = saved_count(&mut window, &before.shortcuts, start + 3);
+    checks.check(
+        "hint counter, window open: the window sees the count made before it opened and saves the next one",
+        first && second && Settings::load(path)? == expect(start + 3),
+    );
+    checks.check("hint counter: the window closes", close(&mut window, hwnd));
+    // Back to what the other checks expect.
+    before.save(path)?;
+    Ok(())
+}
+
 fn run(cycles_done: &AtomicBool) -> Result<bool> {
     let mut checks = Checks { ok: true };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1043,6 +1088,8 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
     cycles_done.store(true, Relaxed);
     thread::sleep(Duration::from_millis(250));
     report_memory("after third close")?;
+
+    verify_hint_counter(&mut checks, &path, &defaults)?;
 
     {
         let mut window = SettingsWindow::for_test(path.clone(), defaults.clone())?;

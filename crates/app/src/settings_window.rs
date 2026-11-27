@@ -6,7 +6,7 @@ use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering::SeqCst};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -60,6 +60,8 @@ const OPEN: u32 = WM_APP + 1;
 const PICK: u32 = WM_APP + 2;
 const SHORTCUT_STATUS: u32 = WM_APP + 6;
 const TEST_DIE: u32 = WM_APP + 7;
+/// A recording showed the zoom hint: count it (`Lifetime::hint_bumps`) and save.
+const HINT_SHOWN: u32 = WM_APP + 8;
 /// Tags the window's registration checks. Tag 0 is the untagged status after a save or resume.
 static NEXT_TAG: AtomicUsize = AtomicUsize::new(1);
 const WORKER_EXITED: isize = -1;
@@ -117,6 +119,8 @@ struct Lifetime {
     muted: AtomicBool,
     test_modifiers: Mutex<Held>,
     test_choice: Mutex<Option<(Folder, PathBuf)>>,
+    /// Recordings that showed the zoom hint, not yet counted in the window's settings.
+    hint_bumps: AtomicU32,
 }
 
 impl Lifetime {
@@ -233,6 +237,9 @@ pub struct SettingsWindow {
     requests_rx: Receiver<Request>,
     worker: Option<(Arc<Lifetime>, JoinHandle<()>)>,
     session: Option<Arc<Lifetime>>,
+    /// The last short-lived thread that counted a hint while the window was closed. The next
+    /// one, and a window that opens, wait for it first: one writer at a time.
+    counter: Option<JoinHandle<()>>,
 }
 
 impl SettingsWindow {
@@ -249,7 +256,57 @@ impl SettingsWindow {
         // SAFETY: unnamed auto-reset event; the result is owned by Wake.
         let wake = Arc::new(Wake(unsafe { CreateEventW(None, false, false, None)? }));
         let (requests_tx, requests_rx) = mpsc::channel();
-        Ok(Self { options, wake, requests_tx, requests_rx, worker: None, session: None })
+        Ok(Self {
+            options,
+            wake,
+            requests_tx,
+            requests_rx,
+            worker: None,
+            session: None,
+            counter: None,
+        })
+    }
+
+    /// A recording showed the "Hold Alt and scroll to zoom" hint: count it in settings.json
+    /// (`recording_hints_shown`). Never blocks. The new settings arrive through
+    /// [`saved`](Self::saved) like any other save.
+    ///
+    /// The settings window is the one writer of the file while it is open, so an open window
+    /// does the counting and saving itself. When it is closed, a short-lived thread loads,
+    /// counts and saves (`Settings::note_recording_hint_shown`); a window opened meanwhile
+    /// waits for that thread before it loads the file, and so does the next such thread.
+    pub fn note_recording_hint_shown(&mut self) {
+        if let Some((life, thread)) = &self.worker
+            && !thread.is_finished()
+            && !life.exited()
+        {
+            // Counted first: a window still starting picks it up once it has loaded.
+            life.hint_bumps.fetch_add(1, SeqCst);
+            life.post(HINT_SHOWN);
+            return;
+        }
+        let before = self.counter.take();
+        let path = self.options.path.clone();
+        let requests = self.requests_tx.clone();
+        let wake = Arc::clone(&self.wake);
+        let spawned = thread::Builder::new().name("settings-hint".into()).spawn(move || {
+            if let Some(before) = before {
+                let _ = before.join();
+            }
+            match Settings::note_recording_hint_shown(&path) {
+                Ok(settings) => {
+                    if requests.send(Request::Saved(settings)).is_ok() {
+                        // SAFETY: the Arc keeps the auto-reset event live during this call.
+                        let _ = unsafe { SetEvent(wake.0) };
+                    }
+                }
+                Err(error) => eprintln!("the recording hint count was not saved: {error}"),
+            }
+        });
+        match spawned {
+            Ok(thread) => self.counter = Some(thread),
+            Err(error) => eprintln!("the recording hint count was not saved: {error}"),
+        }
     }
 
     pub fn wake_handle(&self) -> HANDLE {
@@ -396,10 +453,16 @@ impl SettingsWindow {
             muted: AtomicBool::new(false),
             test_modifiers: Mutex::new(Held::default()),
             test_choice: Mutex::new(None),
+            hint_bumps: AtomicU32::new(0),
         });
         let options = self.options.clone();
         let worker_life = Arc::clone(&life);
+        let counter = self.counter.take();
         let thread = thread::Builder::new().name("settings".into()).spawn(move || {
+            // A hint counted while the window was closed is saved before the window loads.
+            if let Some(counter) = counter {
+                let _ = counter.join();
+            }
             /// Marks the worker gone and wakes the UI loop on every way out, unwinding included.
             struct Exit(Arc<Lifetime>);
             impl Drop for Exit {
@@ -421,6 +484,13 @@ impl SettingsWindow {
     /// Requests closure, including from within the picker's modal loop, and bounds the
     /// wait on quit even if a filesystem or Shell provider is unresponsive.
     pub fn close(&mut self) -> bool {
+        if let Some(counter) = self.counter.take() {
+            // SAFETY: JoinHandle keeps the borrowed thread handle live throughout the wait.
+            let done = unsafe { WaitForSingleObject(HANDLE(counter.as_raw_handle()), 950) };
+            if done == WAIT_OBJECT_0 {
+                let _ = counter.join();
+            }
+        }
         let Some((life, thread)) = self.worker.take() else {
             return true;
         };
@@ -2595,6 +2665,21 @@ impl Window<'_> {
         self.update_animation();
     }
 
+    /// Adds the recordings that showed the zoom hint to the settings and saves. Not when the
+    /// file could not be loaded: then nothing is saved (the counts are dropped).
+    fn count_hints(&self) {
+        let count = self.lifetime.hint_bumps.swap(0, SeqCst);
+        if count == 0 || self.model.borrow().load_error.is_some() {
+            return;
+        }
+        {
+            let mut model = self.model.borrow_mut();
+            model.settings.recording_hints_shown =
+                model.settings.recording_hints_shown.saturating_add(count);
+        }
+        self.save();
+    }
+
     fn save(&self) -> bool {
         let settings = self.model.borrow().settings.clone();
         let result = settings.save(&self.options.path);
@@ -2985,6 +3070,7 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
             (at.y + ((at.height - height) / 2.0).max(0.0)) as i32,
         )));
         lifetime.hwnd.store(hwnd.0 as isize, SeqCst);
+        window.count_hints();
         lifetime.emit(Request::Status);
         if !lifetime.stop.load(SeqCst) {
             let now = window.now();
@@ -3926,6 +4012,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             SHORTCUT_STATUS => {
                 window.receive_registration();
+                return LRESULT(0);
+            }
+            HINT_SHOWN => {
+                window.count_hints();
                 return LRESULT(0);
             }
             WM_INPUTLANGCHANGE => window.refresh_shortcuts(),
