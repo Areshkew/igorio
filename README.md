@@ -12,6 +12,7 @@ Take a screenshot and it follows your cursor. Double-click to paste or save it, 
 - **Double-click** a text box to paste it, or a folder or the desktop to save it as PNG.
 - **Shake** the cursor to drop the top card. Keep shaking to drop them all.
 - **Hold Alt** anywhere except a text box to open the tool menu: New note or Record screen.
+- With a card in hand, **Pin to screen** in the tool menu leaves it on the screen as a picture. Drag it to move it, scroll to resize it, double-click to carry it again.
 - Notes are sticky notes with Markdown. Hide one with its hide button. **Notes…** in the tray lists them all.
 - **Ctrl+Shift+6** records the screen under the cursor to MP4. Press it again to stop, and the video is carried like a screenshot.
 - While recording: **Alt + scroll** zooms, **Ctrl+Shift+7** is the pen, **Ctrl+Shift+8** the highlighter.

@@ -219,6 +219,7 @@ settings window. Stored as `shortcuts` in `settings.json`; a change applies at o
 | Restore last screenshot | none | now |
 | Discard top card (same as one shake) | none | now |
 | Discard all cards | none | now |
+| Pin top card | none | now |
 | Open settings | none | now |
 | New note at the cursor | none (the gesture is hold Alt and click) | with M7 |
 | Start or stop recording | Ctrl+Shift+6 | with M8 |
@@ -247,7 +248,7 @@ cursor, so users do not have to guess what the gesture does.
 - The menu opens anywhere except over a text field, a password field or a terminal (they
   take typed text). The first version opened it only over empty space, as in Swift; that
   proved hard to find (holding Alt over a button or text did nothing), so it changed.
-- The menu lists tools only: **New note** and **Record screen** today. Everything else
+- The menu lists tools only: **New note**, **Record screen** and **Pin to screen** today. Everything else
   (restore, discard, settings, recent notes) stays in the tray menu.
 - Each row shows the tool's keyboard shortcut, so users learn the direct way.
 - The first tool sits under the cursor, so "hold Alt, click" still makes a note in one
@@ -261,7 +262,8 @@ cursor, so users do not have to guess what the gesture does.
   the menu (the tool and its shortcut keep working). The first shown tool is the one under
   the cursor. With every tool hidden the menu never opens, and the page says so. A tool
   whose capability is off stays in the list, dimmed with a note. Stored as `tool_menu` in
-  `settings.json`, `[{"id": "note", "shown": true}, {"id": "record", "shown": true}]`;
+  `settings.json`, `[{"id": "note", "shown": true}, {"id": "record", "shown": true},
+  {"id": "pin", "shown": true}]`;
   read leniently (unknown ids dropped, missing ones added at the end, shown). A change
   applies at once.
 
@@ -269,6 +271,28 @@ Ideas for later, not planned yet:
 
 - Tools offered from context, for example a grammar review when the user is typing in a
   text field.
+
+## Pinned cards
+
+Decided for v0.1.0. A carried card can be left on the screen as a picture, for example to
+compare it with what the user is working on.
+
+- **Pin to screen** in the tool menu (offered only while the user carries a card) or the "Pin
+  top card" shortcut pins the top card where the menu opened (or at the cursor). It leaves
+  the pile like a delivered card; "Restore last screenshot" can still bring it back.
+- A pin is a borderless, topmost tool window on its own thread (`pins.rs`), with DWM rounded
+  corners and shadow like a note. It shows at the card's natural size, made smaller to fit 40%
+  of the work area, with a short grow-in (none with reduced motion), and never takes the
+  foreground when it appears.
+- Drag moves it, the wheel resizes it around the cursor (64 DIPs to the monitor), Ctrl+wheel
+  changes its opacity (30% to 100%). Hovered, it shows a close button; Esc closes it while
+  hovered or focused. A right-click opens a native menu: Carry again, Copy, Save as PNG…
+  (starts in the captures folder), Close.
+- A double-click carries it again (back on top of the pile). With cards in hand it is refused
+  with the usual wobble: a pin takes no cards.
+- A recording pins as its first frame with the length badge; no playback.
+- Pins are in screenshots and recordings, are not restored after a restart, and own their
+  picture: closing one frees it. At most 20 at once.
 
 ## Notes editor: Notion-like writing
 

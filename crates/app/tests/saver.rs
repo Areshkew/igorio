@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use igorio_app::saver::{
-    SaveError, copy_movie, encode_png, format_name, free_path, save_screenshot,
+    SaveError, copy_movie, encode_png, format_name, free_path, save_png_as, save_screenshot,
     save_screenshot_in_background, screenshot_file_name,
 };
 use igorio_kit::Image;
@@ -429,4 +429,21 @@ fn text_like(x: u32, y: u32) -> bool {
         return false;
     }
     x > 24 && x < 900 && !(x / (6 + band)).is_multiple_of(7)
+}
+
+#[test]
+fn save_as_writes_the_chosen_name_and_replaces_it() {
+    let scratch = Scratch::new("save-as");
+    let path = scratch.path("pinned.png");
+    fs::write(&path, b"old").unwrap();
+    let image = opaque(5, 4);
+    assert_eq!(save_png_as(&image, 1.25, &path).unwrap(), path);
+    assert_eq!(fs::read(&path).unwrap(), encode_png(&image, 1.25).unwrap());
+    // Only the PNG is left: the temp file was renamed over it.
+    assert_eq!(fs::read_dir(&scratch.dir).unwrap().count(), 1);
+    // A folder that does not exist is an error and leaves nothing behind.
+    assert!(matches!(
+        save_png_as(&image, 1.0, &scratch.path("missing").join("x.png")),
+        Err(SaveError::Io(_))
+    ));
 }

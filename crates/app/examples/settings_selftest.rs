@@ -841,7 +841,7 @@ fn verify_shortcuts(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: 
     Ok(())
 }
 
-const TOOL_CONTROLS: [Control; 4] = [ToolRow0, ToolSwitch0, ToolRow1, ToolSwitch1];
+const TOOL_CONTROLS: [Control; 6] = [ToolRow0, ToolSwitch0, ToolRow1, ToolSwitch1, ToolRow2, ToolSwitch2];
 const VK_UP: u16 = 0x26;
 const VK_DOWN: u16 = 0x28;
 /// The tool list's row pitch, logical px.
@@ -872,7 +872,7 @@ fn tool_order(path: &Path) -> Vec<(ToolId, bool)> {
 }
 
 fn row_name(label: &str, place: usize) -> String {
-    format!("{label}, {place} of 2, Alt+Up or Alt+Down moves it")
+    format!("{label}, {place} of 3, Alt+Up or Alt+Down moves it")
 }
 
 /// The Tool menu page: names, tab stops, switches, Alt+Up and Alt+Down, and drags, each saved
@@ -881,6 +881,7 @@ fn verify_tool_menu(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: 
     let mut expected = Settings::load(path)?;
     let note = ToolId::NewNote;
     let record = ToolId::RecordScreen;
+    let pin = ToolId::PinCard;
     click(hwnd, ToolMenuTab);
     checks.check(
         "Tool menu page: rows and switches show and are named; the General page's are hidden",
@@ -890,13 +891,17 @@ fn verify_tool_menu(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: 
             && !visible(child(hwnd, ToolMenuEmpty))
             && text(child(hwnd, ToolRow0)) == row_name("New note", 1)
             && text(child(hwnd, ToolRow1)) == row_name("Record screen", 2)
+            && text(child(hwnd, ToolRow2)) == row_name("Pin to screen", 3)
             && text(child(hwnd, ToolSwitch0)) == "Show New note in the tool menu"
             && text(child(hwnd, ToolSwitch1)) == "Show Record screen in the tool menu"
+            && text(child(hwnd, ToolSwitch2)) == "Show Pin to screen in the tool menu"
             && checked(child(hwnd, ToolSwitch0))
             && checked(child(hwnd, ToolSwitch1))
+            && checked(child(hwnd, ToolSwitch2))
             && text(child(hwnd, ToolMenuEmpty)) == "Every tool is hidden, so holding Alt opens no menu.",
     );
-    let stops: Vec<HWND> = [ToolMenuTab, ToolRow0, ToolSwitch0, ToolRow1, ToolSwitch1].iter().map(|&id| child(hwnd, id)).collect();
+    let stops: Vec<HWND> =
+        [ToolMenuTab, ToolRow0, ToolSwitch0, ToolRow1, ToolSwitch1, ToolRow2, ToolSwitch2].iter().map(|&id| child(hwnd, id)).collect();
     checks.check("Tool menu page: Tab visits the tab, then each row and its switch", tab_cycle(hwnd) == stops);
 
     // The switches hide and show a tool; with both hidden, the page says so.
@@ -906,6 +911,9 @@ fn verify_tool_menu(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: 
         "hiding Record screen saves, publishes and unchecks its switch",
         disk(controller, path, &expected) && !checked(child(hwnd, ToolSwitch1)) && !visible(child(hwnd, ToolMenuEmpty)),
     );
+    click(hwnd, ToolSwitch2);
+    expected.tool_menu.set_shown(pin, false);
+    checks.check("hiding Pin to screen saves", disk(controller, path, &expected) && !visible(child(hwnd, ToolMenuEmpty)));
     click(hwnd, ToolSwitch0);
     expected.tool_menu.set_shown(note, false);
     checks.check(
@@ -924,7 +932,7 @@ fn verify_tool_menu(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: 
     checks.check(
         "Alt+Down moves New note below Record screen; saved; names and switches follow",
         disk(controller, path, &expected)
-            && tool_order(path) == [(record, false), (note, true)]
+            && tool_order(path) == [(record, false), (note, true), (pin, false)]
             && text(child(hwnd, ToolRow0)) == row_name("Record screen", 1)
             && text(child(hwnd, ToolRow1)) == row_name("New note", 2)
             && !checked(child(hwnd, ToolSwitch0))
@@ -932,7 +940,7 @@ fn verify_tool_menu(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: 
     );
     // Nothing moves past the ends, and arrows without Alt do nothing.
     key(controller, child(hwnd, ToolRow0), VK_UP, alt, true, false);
-    key(controller, child(hwnd, ToolRow1), VK_DOWN, alt, true, false);
+    key(controller, child(hwnd, ToolRow2), VK_DOWN, alt, true, false);
     key(controller, child(hwnd, ToolRow1), VK_UP, Held::default(), true, false);
     controller.test_modifiers(Held::default());
     checks.check(
@@ -944,7 +952,7 @@ fn verify_tool_menu(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: 
     expected.tool_menu = expected.tool_menu.moved(1, 0);
     checks.check(
         "Alt+Up moves New note back to the top",
-        disk(controller, path, &expected) && tool_order(path) == [(note, true), (record, false)],
+        disk(controller, path, &expected) && tool_order(path) == [(note, true), (record, false), (pin, false)],
     );
 
     // Drags: past half a row swaps the two; less leaves them; upward works too.
@@ -959,16 +967,19 @@ fn verify_tool_menu(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: 
     checks.check(
         "dragging New note down past half a row drops it second; saved",
         disk(controller, path, &expected)
-            && tool_order(path) == [(record, false), (note, true)]
+            && tool_order(path) == [(record, false), (note, true), (pin, false)]
             && text(child(hwnd, ToolRow1)) == row_name("New note", 2),
     );
     drag(hwnd, ToolRow1, -3 * pitch);
     expected.tool_menu = expected.tool_menu.moved(1, 0);
     checks.check(
         "dragging it far up drops it first",
-        disk(controller, path, &expected) && tool_order(path) == [(note, true), (record, false)],
+        disk(controller, path, &expected) && tool_order(path) == [(note, true), (record, false), (pin, false)],
     );
     // Back to every tool shown, as the other checks expect.
+    click(hwnd, ToolSwitch2);
+    expected.tool_menu.set_shown(pin, true);
+    checks.check("showing Pin to screen again saves", disk(controller, path, &expected));
     click(hwnd, ToolSwitch1);
     expected.tool_menu.set_shown(record, true);
     checks.check("showing Record screen again saves", disk(controller, path, &expected) && expected.tool_menu == ToolMenu::default());
@@ -981,7 +992,7 @@ fn verify_tool_menu(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: 
 fn tool_rows_where_painted(checks: &mut Checks, hwnd: HWND, shot: &Shot, dpi: u32, label: &str) {
     let px = |v: i32| (v * dpi as i32 + 48) / 96;
     let paper = shot.at(2, 2);
-    for (row, switch) in [(ToolRow0, ToolSwitch0), (ToolRow1, ToolSwitch1)] {
+    for (row, switch) in [(ToolRow0, ToolSwitch0), (ToolRow1, ToolSwitch1), (ToolRow2, ToolSwitch2)] {
         let (Some(r), Some(s)) = (child_rect(hwnd, row), child_rect(hwnd, switch)) else {
             checks.check(&format!("{label}: {row:?} and {switch:?} are visible"), false);
             continue;
@@ -1451,6 +1462,7 @@ fn capture_tools(checks: &mut Checks, window: &SettingsWindow, hwnd: HWND, folde
     click(hwnd, ToolMenuTab);
     shot(checks, "settings-toolmenu-hidden.png")?;
     click(hwnd, ToolSwitch1);
+    click(hwnd, ToolSwitch2);
     shot(checks, "settings-toolmenu-empty.png")?;
     Ok(())
 }

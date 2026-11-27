@@ -666,3 +666,22 @@ fn hidden_reasons_combine() {
     assert!(state.hidden_for_capture());
     assert!(state.set_hidden(Hidden::CaptureUi, false, 6.0));
 }
+
+#[test]
+fn pinning_takes_the_top_card_without_counting_a_delivery() {
+    let mut state = FairyState::new(1);
+    assert!(state.take_top("pinned", 0.0).is_none(), "nothing to pin");
+    hold(&mut state, 0.0);
+    hold(&mut state, 0.1);
+    let before = ids(&state);
+    let pinned = state.take_top("pinned", 1.0).expect("the top card");
+    assert_eq!(pinned.id, before[1]);
+    assert_eq!(state.leave_style(pinned.id), Some(LeaveStyle::Drop));
+    assert_eq!(state.hint(), Some("pinned"));
+    assert_eq!(state.top().map(|card| card.id), Some(before[0]));
+    assert_eq!(state.deliveries(), 0);
+    state.tick(2.0);
+    assert_eq!(ids(&state), vec![before[0]]);
+    // Like any card that left, Restore brings it back.
+    assert!(state.can_restore());
+}

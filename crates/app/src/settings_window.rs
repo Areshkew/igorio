@@ -936,6 +936,10 @@ pub enum Control {
     DiscardAllRecorder,
     DiscardAllReset,
     DiscardAllStatus,
+    PinTopLabel,
+    PinTopRecorder,
+    PinTopReset,
+    PinTopStatus,
     OpenSettingsLabel,
     OpenSettingsRecorder,
     OpenSettingsReset,
@@ -965,6 +969,8 @@ pub enum Control {
     ToolSwitch0,
     ToolRow1,
     ToolSwitch1,
+    ToolRow2,
+    ToolSwitch2,
 }
 
 use Control::*;
@@ -1088,7 +1094,7 @@ pub enum ShortcutPart {
 const PARTS: usize = 4;
 const ROWS: usize = Action::ALL.len();
 const ROW_TOP: i32 = 60;
-const ROW_PITCH: i32 = 64;
+const ROW_PITCH: i32 = 60;
 
 const fn row_y(index: usize) -> i32 {
     ROW_TOP + index as i32 * ROW_PITCH
@@ -1103,6 +1109,7 @@ const SHORTCUT_IDS: [Control; ROWS * PARTS] = [
     RestoreLastLabel, RestoreLastRecorder, RestoreLastReset, RestoreLastStatus,
     DiscardTopLabel, DiscardTopRecorder, DiscardTopReset, DiscardTopStatus,
     DiscardAllLabel, DiscardAllRecorder, DiscardAllReset, DiscardAllStatus,
+    PinTopLabel, PinTopRecorder, PinTopReset, PinTopStatus,
     OpenSettingsLabel, OpenSettingsRecorder, OpenSettingsReset, OpenSettingsStatus,
     NewNoteLabel, NewNoteRecorder, NewNoteReset, NewNoteStatus,
     ToggleRecordingLabel, ToggleRecordingRecorder, ToggleRecordingReset, ToggleRecordingStatus,
@@ -1133,8 +1140,8 @@ const SHORTCUT_ITEMS: [Item; ROWS * PARTS] = {
 const TOOL_TOP: i32 = 128;
 const TOOL_PITCH: i32 = 52;
 const TOOL_HEIGHT: i32 = 44;
-const TOOL_ROWS: [Control; TOOL_COUNT] = [ToolRow0, ToolRow1];
-const TOOL_SWITCHES: [Control; TOOL_COUNT] = [ToolSwitch0, ToolSwitch1];
+const TOOL_ROWS: [Control; TOOL_COUNT] = [ToolRow0, ToolRow1, ToolRow2];
+const TOOL_SWITCHES: [Control; TOOL_COUNT] = [ToolSwitch0, ToolSwitch1, ToolSwitch2];
 /// The list with room for the focus ring, repainted while rows move.
 const TOOL_LIST: [i32; 4] = [0, TOOL_TOP - 8, WIDTH, TOOL_COUNT as i32 * TOOL_PITCH + 16];
 
@@ -1193,6 +1200,7 @@ fn tool_off_note(tool: ToolId, settings: &Settings) -> Option<&'static str> {
         ToolId::NewNote => (!settings.is_enabled(NOTES)).then_some("Notes are off"),
         ToolId::RecordScreen if !Action::ToggleRecording.available() => Some("Not available yet"),
         ToolId::RecordScreen => (!settings.is_enabled(RECORDING)).then_some("Recording is off"),
+        ToolId::PinCard => None,
     }
 }
 
@@ -1226,7 +1234,7 @@ impl Control {
 
     /// A control of the Tool menu page (not its tab).
     fn tool_item(self) -> bool {
-        (ToolMenuTitle as i32..=ToolSwitch1 as i32).contains(&(self as i32))
+        (ToolMenuTitle as i32..=ToolSwitch2 as i32).contains(&(self as i32))
     }
 
     /// The place in the tool list of a row or a switch, and whether it is the switch.
@@ -1442,7 +1450,7 @@ impl ButtonMotion {
     }
 }
 
-const CONTROLS: usize = ToolSwitch1 as usize - Capabilities as usize + 1;
+const CONTROLS: usize = ToolSwitch2 as usize - Capabilities as usize + 1;
 
 impl Control {
     fn index(self) -> usize {
@@ -3932,7 +3940,7 @@ impl Window<'_> {
                 canvas.text(bounds, view.note.text.as_str(), fade(mix(p.paper, ink, opacity)), line, fonts[1]);
             }
             if index + 1 < ROWS {
-                let rule = scaled([24, row_y(index) + 57, 496, 1], dpi);
+                let rule = scaled([24, row_y(index) + ROW_PITCH - 5, 496, 1], dpi);
                 canvas.shape(rule, 0.0, fade(mix(p.patch, p.chip, 0.5)));
             }
         }
@@ -4700,7 +4708,7 @@ mod tests {
         assert_eq!(Retry.shortcut_row(), None);
         assert_eq!(ShortcutsTab.shortcut_row(), None);
         assert_eq!(ToolMenuTab.shortcut_row(), None);
-        assert_eq!(ToolSwitch1.shortcut_row(), None);
+        assert_eq!(ToolSwitch2.shortcut_row(), None);
     }
 
     #[test]

@@ -80,6 +80,7 @@ pub enum Action {
     RestoreLast,
     DiscardTop,
     DiscardAll,
+    PinTop,
     OpenSettings,
     NewNote,
     ToggleRecording,
@@ -94,6 +95,7 @@ impl Action {
         Action::RestoreLast,
         Action::DiscardTop,
         Action::DiscardAll,
+        Action::PinTop,
         Action::OpenSettings,
         Action::NewNote,
         Action::ToggleRecording,
@@ -111,6 +113,7 @@ impl Action {
             Action::RestoreLast => "restore_last",
             Action::DiscardTop => "discard_top",
             Action::DiscardAll => "discard_all",
+            Action::PinTop => "pin_top",
             Action::OpenSettings => "open_settings",
             Action::NewNote => "new_note",
             Action::ToggleRecording => "toggle_recording",
@@ -129,6 +132,7 @@ impl Action {
             Action::RestoreLast => "Restore last screenshot",
             Action::DiscardTop => "Discard top card",
             Action::DiscardAll => "Discard all cards",
+            Action::PinTop => "Pin top card",
             Action::OpenSettings => "Open settings",
             Action::NewNote => "New note at the cursor",
             Action::ToggleRecording => "Start or stop recording",
@@ -663,7 +667,7 @@ pub fn held_for_message() -> Held {
 /// [`Chord::validate`] and no two actions share one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shortcuts {
-    chords: [Option<Chord>; 8],
+    chords: [Option<Chord>; Action::ALL.len()],
 }
 
 /// Why [`Shortcuts::set`] refused a chord.
@@ -693,7 +697,7 @@ impl Default for Shortcuts {
 
 impl Shortcuts {
     pub fn defaults() -> Shortcuts {
-        let mut chords = [None; 8];
+        let mut chords = [None; Action::ALL.len()];
         for action in Action::ALL {
             chords[action.index()] = action.default_chord();
         }
@@ -702,7 +706,7 @@ impl Shortcuts {
 
     /// No shortcut for any action.
     pub fn none() -> Shortcuts {
-        Shortcuts { chords: [None; 8] }
+        Shortcuts { chords: [None; Action::ALL.len()] }
     }
 
     pub fn get(&self, action: Action) -> Option<Chord> {
@@ -1049,7 +1053,7 @@ impl Drop for Hotkeys {
     }
 }
 
-/// Hotkey ids: one per action, 1 to 8 (ids up to 0xBFFF are for applications).
+/// Hotkey ids: one per action, 1 to 9 (ids up to 0xBFFF are for applications).
 fn hotkey_id(action: Action) -> i32 {
     action.index() as i32 + 1
 }
@@ -1062,7 +1066,7 @@ fn action_for_id(id: usize) -> Option<Action> {
 struct Registrar {
     window: HWND,
     /// What is registered now, per action.
-    registered: [Option<Chord>; 8],
+    registered: [Option<Chord>; Action::ALL.len()],
 }
 
 impl Registrar {
@@ -1148,7 +1152,7 @@ fn run(shared: Arc<Shared>, initial: Shortcuts, ready: mpsc::Sender<windows::cor
     };
     let mut registrar = Registrar {
         window,
-        registered: [None; 8],
+        registered: [None; Action::ALL.len()],
     };
     let mut desired = initial;
     *lock(&shared.status) = registrar.sync(Some(&desired), shared.recording.load(Relaxed));

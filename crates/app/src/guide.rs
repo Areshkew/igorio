@@ -237,9 +237,9 @@ pub fn view(page: Page, features: Features, shortcuts: &Shortcuts) -> PageView {
         Page::ToolMenu => {
             view.keys = vec![word("hold"), chip("Alt")];
             view.line = if features.recording {
-                "Hold Alt anywhere except a text box. Pick New note or Record screen."
+                "Hold Alt anywhere except a text box. Pick New note or Record screen, or Pin to screen with a card in hand."
             } else {
-                "Hold Alt anywhere except a text box. Pick New note."
+                "Hold Alt anywhere except a text box. Pick New note, or Pin to screen with a card in hand."
             }
             .into();
             view.aside = Some("Hide a note with its hide button. Notes… in the tray lists them all.");

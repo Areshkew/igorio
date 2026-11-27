@@ -387,6 +387,21 @@ impl FairyState {
         }
     }
 
+    /// The top card leaves the pile to be pinned to the screen: it drops away like a delivered
+    /// card, with `hint`, but does not count as a delivery. Like any card that left, "Restore
+    /// last screenshot" brings it back (the pin stays). Returns the card.
+    pub fn take_top(&mut self, hint: &str, now: f64) -> Option<HeldCard> {
+        let card = self.pile.top()?.clone();
+        let taken =
+            self.pile
+                .begin_leaving(&[card.id], LeaveStyle::Queued, ReleaseReason::Delivered, now);
+        if taken.is_empty() {
+            return None;
+        }
+        self.start_drop(card.id, hint.to_string(), now);
+        Some(card)
+    }
+
     /// The target refused the screenshot: wobble, explain, keep holding.
     pub fn reject(&mut self, hint: &str, now: f64) {
         if !self.pile.is_holding() {

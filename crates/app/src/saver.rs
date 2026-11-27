@@ -222,6 +222,31 @@ pub fn save_screenshot(
     write_and_publish(folder, OsStr::new(&name), |file| file.write_all(&bytes))
 }
 
+/// Encodes and writes the image at `path`, a name the user chose in a Save dialog (which asked
+/// before replacing a file). Writes to a temp file in the same folder first and renames it over
+/// `path`, so a half-written PNG never appears under that name.
+pub fn save_png_as(image: &Image, scale: f64, path: &Path) -> Result<PathBuf, SaveError> {
+    let (folder, name) = match (path.parent(), path.file_name()) {
+        (Some(folder), Some(name)) => (folder, name),
+        _ => {
+            return Err(SaveError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a file path", path.display()),
+            )));
+        }
+    };
+    let bytes = encode_png(image, scale)?;
+    let (temp, mut file) = create_temp(folder, name)?;
+    let written = file.write_all(&bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let result = written.and_then(|()| fs::rename(&temp, path));
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp);
+        return Err(SaveError::Io(error));
+    }
+    Ok(path.to_path_buf())
+}
+
 /// Copies a recording file into `folder` under a free name based on its own file name.
 pub fn copy_movie(movie: &Path, folder: &Path) -> Result<PathBuf, SaveError> {
     fs::create_dir_all(folder)?;
