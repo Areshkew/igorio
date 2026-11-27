@@ -128,7 +128,7 @@ pub fn format_name(year: u16, month: u16, day: u16, hour: u16, minute: u16, seco
 
 /// Local wall-clock parts of an instant, through Windows' own time zone rules. Falls back to
 /// UTC if the local conversion fails, and to the epoch if the instant cannot be represented.
-fn local_parts(captured_at: SystemTime) -> (u16, u16, u16, u16, u16, u16) {
+pub(crate) fn local_parts(captured_at: SystemTime) -> (u16, u16, u16, u16, u16, u16) {
     // SAFETY: both calls only read the FILETIME/SYSTEMTIME values behind the pointers (all
     // live for the whole block) and write into `mut` locals that also live across the call;
     // no pointer escapes. `None` asks for the machine's current time zone.
