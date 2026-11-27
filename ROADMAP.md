@@ -236,6 +236,24 @@ settings window. Stored as `shortcuts` in `settings.json`; a change applies at o
   loop. The keys used while drawing (undo, clear, put the pen down) are only active
   during a recording and are not global.
 
+## Tool menu at the cursor
+
+Holding Alt over empty space does not open a note directly. It opens a small menu of
+tools under the cursor, so users do not have to guess what the gesture does.
+
+- The menu lists tools only: **New note** and **Record screen** today. Everything else
+  (restore, discard, settings, recent notes) stays in the tray menu.
+- Each row shows the tool's keyboard shortcut, so users learn the direct way.
+- The first tool sits under the cursor, so "hold Alt, click" still makes a note in one
+  click. Moving to another row picks that tool. Releasing Alt closes the menu.
+- A tool is listed only when it can run (Record screen appears when recording is built
+  and switched on).
+- Tools are entries in one list, each with a condition for when it is offered. This is
+  where later, context-aware tools go.
+
+Ideas for later, not planned yet: tools offered from context, for example a grammar
+review when the user is typing in a text field.
+
 ## Notes editor: Notion-like writing
 
 The macOS app shows Markdown markers dimmed. This port goes further, as its owner asked:
