@@ -4233,14 +4233,16 @@ mod tests {
         assert_eq!(tool(ToolId::RecordScreen).action, Shortcut::ToggleRecording);
         assert_eq!(ToolId::parse("record"), Some(ToolId::RecordScreen));
         assert_eq!(ToolId::NewNote.id(), "note");
-        // In the app today recording is not built, so the menu has one row.
+        // Recording is built (M8): switched on and idle, the menu offers both tools.
         let app = ToolContext {
             notes: true,
             recording_available: Shortcut::ToggleRecording.available(),
             recording_enabled: true,
             ..ToolContext::default()
         };
-        assert_eq!(offered(&app), vec![ToolId::NewNote]);
+        assert_eq!(offered(&app), vec![ToolId::NewNote, ToolId::RecordScreen]);
+        let running = ToolContext { recording: true, ..app };
+        assert_eq!(offered(&running), vec![ToolId::NewNote]);
     }
 
     // --- Motion and drawing ---

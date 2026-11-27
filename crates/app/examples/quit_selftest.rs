@@ -39,12 +39,14 @@ const NOTE_TEXT: &str = "quit selftest note text";
 /// How long the child may take to start and to exit by itself.
 const START_WAIT: Duration = Duration::from_secs(20);
 const EXIT_WAIT: Duration = Duration::from_secs(20);
-/// The session-end steps are bounded to 4.0 s; a little margin for the message round trip.
+/// The session-end steps are bounded to 4.0 s; a little margin for the message round trip. (No
+/// recording runs here: one in progress adds up to 5 s, under its shutdown block reason.)
 const END_SESSION_BOUND: Duration = Duration::from_millis(4500);
 
 const NORMAL_LINES: &[&str] = &[
     "quit: start",
     "quit: settings window closed",
+    "quit: recording stopped",
     "quit: shortcuts stopped",
     "quit: notes stopped",
     "quit: screenshot detection stopped",
@@ -57,6 +59,7 @@ const SESSION_END_LINES: &[&str] = &[
     "quit: clipboard checked",
     "quit: notes stopped",
     "quit: clipboard thread stopped",
+    "quit: recording stopped",
     "quit: done in",
 ];
 

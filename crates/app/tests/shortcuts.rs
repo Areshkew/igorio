@@ -1,7 +1,7 @@
 use igorio_app::input::Held;
 use igorio_app::shortcuts::{
     Action, Chord, ChordError, Hotkeys, Key, RecorderInput, Registration, SetError, Shortcuts,
-    chord_from_key_event,
+    chord_from_key_event, registration_plan,
 };
 
 fn chord(text: &str) -> Chord {
@@ -54,32 +54,75 @@ fn defaults_follow_the_roadmap() {
             assert_eq!(chord.validate(), Ok(()), "{action:?}");
         }
     }
-    assert!(Action::RestoreLast.available() && Action::OpenSettings.available());
-    assert!(Action::NewNote.available() && !Action::Highlighter.available());
+    // Every feature is built (recording since M8).
+    assert!(Action::ALL.iter().all(|action| action.available()));
+}
+
+fn status_of(hotkeys: &Hotkeys, action: Action) -> Registration {
+    let status = hotkeys.status();
+    status.into_iter().find(|(a, _)| *a == action).map(|(_, s)| s).expect("every action")
+}
+
+/// Waits (bounded) until the hotkey thread has applied a change.
+fn wait_for(mut done: impl FnMut() -> bool) -> bool {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < until {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    done()
 }
 
 /// The note editor uses Ctrl+Shift+7 (numbered list) and Ctrl+Shift+8 (bulleted list), the
-/// default chords of Pen and Highlighter. A registered hotkey would take those keys from every
-/// note. While the actions are unavailable nothing registers them; whoever makes them available
-/// (the recording milestone) must decide the clash and change this test.
+/// default chords of Pen and Highlighter. The decision (M8): Pen and Highlighter are
+/// recording-only. Their hotkeys are registered only while a recording runs, so while none
+/// runs those keys reach the note editor (and every other program).
 #[test]
 fn pen_and_highlighter_keys_stay_free_for_the_note_editor() {
     let defaults = Shortcuts::defaults();
-    assert_eq!(defaults.get(Action::Pen), Some(chord("Ctrl+Shift+7")));
-    assert_eq!(defaults.get(Action::Highlighter), Some(chord("Ctrl+Shift+8")));
-    assert!(!Action::Pen.available() && !Action::Highlighter.available());
-    // The rule itself: an unavailable action is never registered, whatever its chord.
-    let hotkeys = Hotkeys::start(&defaults).expect("hotkey thread");
-    let status = hotkeys.status();
-    assert!(hotkeys.shutdown());
-    for action in Action::ALL {
-        let state = status.iter().find(|(a, _)| a == action).map(|(_, s)| s.clone());
-        if action.available() {
-            assert_ne!(state, Some(Registration::Unavailable), "{action:?}");
-        } else {
-            assert_eq!(state, Some(Registration::Unavailable), "{action:?}");
-        }
+    let pen = chord("Ctrl+Shift+7");
+    let highlighter = chord("Ctrl+Shift+8");
+    assert_eq!(defaults.get(Action::Pen), Some(pen));
+    assert_eq!(defaults.get(Action::Highlighter), Some(highlighter));
+    assert!(Action::Pen.recording_only() && Action::Highlighter.recording_only());
+    assert!(Action::ALL.iter().filter(|a| a.recording_only()).count() == 2);
+
+    // The rule: not registered while no recording runs, registered while one runs.
+    for (action, chord) in [(Action::Pen, pen), (Action::Highlighter, highlighter)] {
+        assert_eq!(registration_plan(action, Some(chord), false), Err(Registration::WhileRecording));
+        assert_eq!(registration_plan(action, Some(chord), true), Ok(chord));
+        assert_eq!(registration_plan(action, None, true), Err(Registration::NotSet));
     }
+    // Everything else is registered whatever the recording does.
+    let toggle = chord("Ctrl+Shift+6");
+    for recording in [false, true] {
+        assert_eq!(registration_plan(Action::ToggleRecording, Some(toggle), recording), Ok(toggle));
+    }
+
+    // The hotkey thread follows it. Ctrl+Shift+6 is left out: a person may press it while
+    // the tests run. With no recording, the editor's chords are not registered at all.
+    let mut idle = defaults.clone();
+    idle.set(Action::ToggleRecording, None).unwrap();
+    let hotkeys = Hotkeys::start(&idle).expect("hotkey thread");
+    assert_eq!(status_of(&hotkeys, Action::Pen), Registration::WhileRecording);
+    assert_eq!(status_of(&hotkeys, Action::Highlighter), Registration::WhileRecording);
+    // A recording starts: to keep the editor's keys untouched here, the two actions move to
+    // chords no person presses first. Taken means another program holds them, but the thread
+    // did try to register them.
+    let mut unusual = idle.clone();
+    unusual.set(Action::Pen, Some(chord("Ctrl+Alt+Shift+Win+F22"))).unwrap();
+    unusual.set(Action::Highlighter, Some(chord("Ctrl+Alt+Shift+Win+F23"))).unwrap();
+    hotkeys.apply(&unusual);
+    hotkeys.set_recording(true);
+    let tried = |state: Registration| matches!(state, Registration::Active | Registration::Taken);
+    assert!(wait_for(|| tried(status_of(&hotkeys, Action::Pen))
+        && tried(status_of(&hotkeys, Action::Highlighter))));
+    hotkeys.set_recording(false);
+    assert!(wait_for(|| status_of(&hotkeys, Action::Pen) == Registration::WhileRecording
+        && status_of(&hotkeys, Action::Highlighter) == Registration::WhileRecording));
+    assert!(hotkeys.shutdown());
 }
 
 #[test]

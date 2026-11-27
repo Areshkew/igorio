@@ -140,8 +140,8 @@ fn main() -> ExitCode {
     set.set(Action::DiscardAll, Some(chord(&names[2]))).unwrap();
     set.set(Action::OpenSettings, Some(chord(&names[3])))
         .unwrap();
-    // Not built yet: must not be registered.
-    set.set(Action::NewNote, Some(chord(&names[4]))).unwrap();
+    // Recording-only: not registered while no recording runs.
+    set.set(Action::Pen, Some(chord(&names[4]))).unwrap();
 
     let started = Instant::now();
     let hotkeys = match Hotkeys::start(&set) {
@@ -161,10 +161,10 @@ fn main() -> ExitCode {
         (Action::DiscardTop, Registration::Active),
         (Action::DiscardAll, Registration::Active),
         (Action::OpenSettings, Registration::Active),
-        (Action::NewNote, Registration::Unavailable),
-        (Action::ToggleRecording, Registration::Unavailable),
-        (Action::Pen, Registration::Unavailable),
-        (Action::Highlighter, Registration::Unavailable),
+        (Action::NewNote, Registration::NotSet),
+        (Action::ToggleRecording, Registration::NotSet),
+        (Action::Pen, Registration::WhileRecording),
+        (Action::Highlighter, Registration::NotSet),
     ];
     report.check(
         "status after start",
@@ -172,7 +172,7 @@ fn main() -> ExitCode {
         format!("{status:?}"),
     );
     report.check(
-        "unavailable action is not registered",
+        "recording-only action is not registered while idle",
         free_from_here(&names[4]),
         "its chord is still free",
     );
@@ -298,6 +298,59 @@ fn main() -> ExitCode {
         "resume registers again",
         !free_from_here(&names[0]) && !free_from_here(&names[5]),
         "chords held again",
+    );
+
+    // Recording: Pen and Highlighter are registered only while a recording runs.
+    let mut drawing = changed.clone();
+    drawing.set(Action::Highlighter, Some(chord(&names[3]))).unwrap();
+    hotkeys.apply(&drawing);
+    let idle = wait_until(|| {
+        status_of(&hotkeys, Action::Highlighter) == Registration::WhileRecording
+            && status_of(&hotkeys, Action::Pen) == Registration::WhileRecording
+    });
+    report.check("idle: pen keys wait", idle, format!("{:?}", hotkeys.status()));
+    report.check(
+        "idle: pen chords free",
+        free_from_here(&names[3]) && free_from_here(&names[4]),
+        "not registered",
+    );
+    let (_, woke, out) = press(&hotkeys, Action::Pen, Duration::from_millis(200));
+    report.check("idle: no pen press", !woke && out.is_empty(), format!("{out:?}"));
+    hotkeys.set_recording(true);
+    let active = wait_until(|| {
+        status_of(&hotkeys, Action::Pen) == Registration::Active
+            && status_of(&hotkeys, Action::Highlighter) == Registration::Active
+    });
+    report.check("recording: pen keys active", active, format!("{:?}", hotkeys.status()));
+    report.check(
+        "recording: pen chords held",
+        !free_from_here(&names[3]) && !free_from_here(&names[4]),
+        "registered by the service",
+    );
+    let (_, woke, out) = press(&hotkeys, Action::Highlighter, Duration::from_secs(1));
+    report.check(
+        "recording: highlighter press arrives",
+        woke && out.len() == 1 && out[0].action == Action::Highlighter,
+        format!("{out:?}"),
+    );
+    // Pause during a recording (the settings window records a shortcut): all free, then back.
+    hotkeys.set_paused(true);
+    let released = wait_until(|| free_from_here(&names[3]) && free_from_here(&names[4]));
+    report.check("recording, paused: pen chords free", released, "unregistered");
+    hotkeys.set_paused(false);
+    let back = wait_until(|| !free_from_here(&names[3]) && !free_from_here(&names[4]));
+    report.check("recording, resumed: pen chords held", back, "registered again");
+    hotkeys.set_recording(false);
+    let stopped = wait_until(|| {
+        status_of(&hotkeys, Action::Pen) == Registration::WhileRecording
+            && free_from_here(&names[3])
+            && free_from_here(&names[4])
+    });
+    report.check("stopped: pen keys released", stopped, format!("{:?}", hotkeys.status()));
+    report.check(
+        "stopped: others kept",
+        status_of(&hotkeys, Action::RestoreLast) == Registration::Active,
+        "RestoreLast still Active",
     );
 
     // Shutdown.

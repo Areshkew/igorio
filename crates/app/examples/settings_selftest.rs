@@ -16,7 +16,9 @@ use igorio_app::settings_window::{
     Control, Control::*, SettingsWindow, ShortcutPart, ShortcutService, TestMode, TestScene,
     test_client_size, test_window_size,
 };
-use igorio_app::shortcuts::{Action, Chord, Registration, RegistrationReport, Shortcuts};
+use igorio_app::shortcuts::{
+    Action, Chord, Registration, RegistrationReport, Shortcuts, display_for_layout,
+};
 use windows::Win32::Foundation::{
     CloseHandle, FILETIME, HANDLE, HWND, LPARAM, RECT, WAIT_OBJECT_0, WPARAM,
 };
@@ -115,6 +117,7 @@ fn tab_order(hwnd: HWND) -> bool {
             Screenshots,
             Keep,
             Notes,
+            Recording,
             ChooseNotes,
             OpenNotes,
             ResetNotes,
@@ -156,7 +159,7 @@ fn verify_controls(
         (Screenshots, "Screenshots", expected.is_enabled("fairy.screenshots"), true),
         (Keep, "Keep every screenshot", expected.keep_every_screenshot, true),
         (Notes, "Notes", expected.is_enabled("fairy.notes"), true),
-        (Recording, "Screen recording, not available yet", false, false),
+        (Recording, "Screen recording", expected.is_enabled("fairy.screen-recording"), true),
         (Small, "Small", false, true),
         (Medium, "Medium", true, true),
         (Large, "Large", false, true),
@@ -179,6 +182,15 @@ fn verify_controls(
         let control = child(hwnd, id);
         checks.check(label, text(control) == label && enabled(control));
     }
+    // The chips' accessible name follows the shortcuts.
+    let recording_keys = [Action::ToggleRecording, Action::Pen, Action::Highlighter]
+        .iter()
+        .filter_map(|&action| {
+            let chord = expected.shortcuts.get(action)?;
+            Some(format!("{} {}", action.label(), display_for_layout(&chord)))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     checks.check(
         "window title and static names are available through Win32",
         text(hwnd) == "Igorio Settings"
@@ -192,8 +204,11 @@ fn verify_controls(
                 (NotesKeys, "Hold Alt and click on empty space"),
                 (NotesDetail, "A sticky note opens where you click, saved as Markdown."),
                 (RecordingTitle, "Screen recording"),
-                (RecordingKeys, "Control plus Shift plus 6, 7, or 8"),
-                (RecordingDetail, "Not available yet"),
+                (RecordingKeys, recording_keys.as_str()),
+                (
+                    RecordingDetail,
+                    "Records the screen under the cursor as MP4. Alt + wheel zooms.",
+                ),
                 (General, "General"),
                 (NotesFolder, "Notes folder"),
                 (CapturesFolder, "Captures folder"),
@@ -242,11 +257,15 @@ fn verify_controls(
             disk(controller, path, &expected) && checked(child(hwnd, Notes)) == on,
         );
     }
-    click(hwnd, Recording);
-    checks.check(
-        "disabled capability notifications leave the file alone",
-        Settings::load(path)? == expected && controller.saved(None, &expected.shortcuts).is_empty(),
-    );
+    for _ in 0..2 {
+        let on = !expected.is_enabled("fairy.screen-recording");
+        click(hwnd, Recording);
+        expected.set_enabled("fairy.screen-recording", on);
+        checks.check(
+            &format!("Screen recording {on} saves and publishes"),
+            disk(controller, path, &expected) && checked(child(hwnd, Recording)) == on,
+        );
+    }
 
     for (id, size, dimensions) in [
         (Large, CardSize::Large, "112 × 84 px"),
@@ -420,6 +439,8 @@ impl ShortcutService for FakeService {
                 let status = match applied.get(action) {
                     _ if !action.available() => Registration::Unavailable,
                     None => Registration::NotSet,
+                    // No recording runs in this test (`shortcuts::registration_plan`).
+                    Some(_) if action.recording_only() => Registration::WhileRecording,
                     Some(chord) if Some(chord) == self.taken.get() => Registration::Taken,
                     Some(_) => Registration::Active,
                 };
@@ -587,13 +608,10 @@ fn verify_pages(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: HWND
         .collect();
     checks.check("Shortcuts page: Tab visits each enabled control once, in row order", tab_cycle(hwnd) == expected);
     checks.check(
-        "unavailable rows: recorder disabled, Reset absent, default chips named, Not available yet",
-        Action::ALL.iter().filter(|action| !action.available()).all(|&action| {
-            let default = action.default_chord().map(|chord| chord.display());
-            !enabled(row(hwnd, action, ShortcutPart::Recorder))
-                && !visible(row(hwnd, action, ShortcutPart::Reset))
-                && text(row(hwnd, action, ShortcutPart::Recorder)) == recorder_name(action, default.as_deref())
-                && text(row(hwnd, action, ShortcutPart::Status)) == "Not available yet"
+        "recording rows are editable (no service here: shortcuts are off, as for every row)",
+        [Action::ToggleRecording, Action::Pen, Action::Highlighter].iter().all(|&action| {
+            enabled(row(hwnd, action, ShortcutPart::Recorder))
+                && text(row(hwnd, action, ShortcutPart::Status)) == "Keyboard shortcuts are off."
         }),
     );
     // Ctrl+Tab goes through the window's own message loop: post it, with Ctrl held per the seam.
@@ -733,15 +751,27 @@ fn verify_shortcuts(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: 
             && text(recorder(Action::DiscardAll)) == recorder_name(Action::DiscardAll, None),
     );
 
-    // Unavailable rows cannot be edited.
-    service.calls.borrow_mut().clear();
+    // A recording-only row is edited like the others; its note says when it is registered.
     click(hwnd, Control::shortcut(Action::Pen, ShortcutPart::Recorder));
+    let paused = ui.until(controller, |ui| ui.service.paused.get());
+    let saved_before = ui.saved.len();
     press(controller, recorder(Action::Pen), "Ctrl+Alt+F6");
+    let done = ui.until(controller, |ui| ui.saved.len() > saved_before && !ui.service.paused.get());
     ui.idle(controller);
     checks.check(
-        "an unavailable row ignores clicks and keys",
-        service.calls.borrow().is_empty() && Settings::load(path)?.shortcuts.get(Action::Pen) == Action::Pen.default_chord(),
+        "Pen records Ctrl+Alt+F6: saved, shown, Active while recording",
+        paused && done
+            && Settings::load(path)?.shortcuts.get(Action::Pen) == Chord::parse("Ctrl+Alt+F6").ok()
+            && text(recorder(Action::Pen)) == recorder_name(Action::Pen, Some("Ctrl+Alt+F6"))
+            && status(Action::Pen) == "Active while recording"
+            && visible(row(hwnd, Action::Pen, ShortcutPart::Reset)),
     );
+    click(hwnd, Control::shortcut(Action::Pen, ShortcutPart::Reset));
+    let reset = ui.until(controller, |ui| {
+        ui.saved.last().is_some_and(|s| s.shortcuts.get(Action::Pen) == Action::Pen.default_chord())
+    });
+    ui.idle(controller);
+    checks.check("Pen's Reset restores Ctrl+Shift+7", reset);
 
     // Another program holds the chord: the old one stays, unsaved, and the row says so.
     let taken = "Ctrl+Alt+F8";

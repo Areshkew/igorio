@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use igorio_app::layout::CardSize;
 use igorio_app::scene::{Leaving, SceneCard};
-use igorio_app::state::FairyState;
+use igorio_app::state::{FairyState, Hidden};
 use igorio_core::geom::CardId;
 use igorio_core::pile::LeaveStyle;
 use igorio_kit::Image;
@@ -637,4 +637,32 @@ fn the_fifth_card_is_drawn_only_while_fading_out() {
     let settled = state.scene(4.22, 1.0);
     assert_eq!(settled.cards.len(), 4, "the fifth card is now hidden");
     approx(settled.cards[0].depth, 3.0);
+}
+
+/// The screenshot UI and a pen in hand during a recording hide the fairy for two reasons
+/// (`setCaptureUIVisible(_:owner:)`): it is hidden while either holds and comes back only
+/// when both are gone, and only the edges count (fade, shake gate).
+#[test]
+fn hidden_reasons_combine() {
+    let mut state = FairyState::new(21);
+    hold(&mut state, 0.0);
+    assert!(state.set_hidden(Hidden::Drawing, true, 1.0), "hidden: an edge");
+    assert!(!state.set_hidden(Hidden::Drawing, true, 1.05), "already hidden");
+    // A screenshot while drawing: no new edge.
+    assert!(!state.set_hidden(Hidden::CaptureUi, true, 2.0));
+    assert!(state.hidden_by(Hidden::CaptureUi) && state.hidden_by(Hidden::Drawing));
+    // The screenshot UI goes: still hidden for the pen.
+    assert!(!state.set_hidden(Hidden::CaptureUi, false, 3.0));
+    assert!(state.hidden_for_capture() && !state.hidden_by(Hidden::CaptureUi));
+    approx(state.scene(3.5, 1.0).opacity, 0.0);
+    // The pen is put down: shown again.
+    assert!(state.set_hidden(Hidden::Drawing, false, 4.0));
+    assert!(!state.hidden_for_capture());
+    approx(state.scene(4.15, 1.0).opacity, 1.0);
+    // The other order: the pen goes first, the capture still hides.
+    state.set_hidden_for_capture(true, 5.0);
+    assert!(!state.set_hidden(Hidden::Drawing, true, 5.1));
+    assert!(!state.set_hidden(Hidden::Drawing, false, 5.2));
+    assert!(state.hidden_for_capture());
+    assert!(state.set_hidden(Hidden::CaptureUi, false, 6.0));
 }

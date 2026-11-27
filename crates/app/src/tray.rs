@@ -27,7 +27,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIIF_NOSOUND, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
     NIN_SELECT, NOTIFY_ICON_DATA_FLAGS, NOTIFY_ICON_MESSAGE, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
     NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect, Shell_NotifyIconW,
 };
@@ -257,6 +258,17 @@ impl Tray {
     /// The tray answers WM_QUERYENDSESSION with TRUE: it never blocks the session end.
     pub fn on_end(&self, on_end: Box<dyn FnMut(EndRequest)>) {
         *self.inner.on_end.borrow_mut() = Some(on_end);
+    }
+
+    /// A short notice from the icon (shown as a notification on Windows 10 and 11), for news
+    /// the overlay cannot show because nothing is on the pile. No sound. The title and text
+    /// are cut to the shell's limits (63 and 255 UTF-16 units).
+    pub fn notice(&self, title: &str, text: &str) -> Result<()> {
+        let mut data = self.inner.data(NIF_INFO);
+        data.szInfoTitle = fixed_wide(title);
+        data.szInfo = fixed_wide(text);
+        data.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+        notify(NIM_MODIFY, &data, "NIM_MODIFY (notice)")
     }
 
     /// The hidden window that owns the icon. Valid until the `Tray` is dropped.
@@ -542,12 +554,18 @@ fn menu_text(label: &str) -> Vec<u16> {
 /// The tooltip as the fixed `szTip` buffer: at most 127 units plus the null, never
 /// ending in half a surrogate pair.
 fn tip_wide(tip: &str) -> [u16; 128] {
-    let mut out = [0u16; 128];
+    fixed_wide(tip)
+}
+
+/// `text` in a fixed buffer of `N` units: at most `N - 1` units plus the null, never ending in
+/// half a surrogate pair.
+fn fixed_wide<const N: usize>(text: &str) -> [u16; N] {
+    let mut out = [0u16; N];
     let mut len = 0;
-    for c in tip.chars().filter(|&c| c != '\0') {
+    for c in text.chars().filter(|&c| c != '\0') {
         let mut buf = [0u16; 2];
         let units = c.encode_utf16(&mut buf);
-        if len + units.len() > 127 {
+        if len + units.len() > N - 1 {
             break;
         }
         out[len..len + units.len()].copy_from_slice(units);
@@ -920,6 +938,11 @@ mod tests {
         let cut = tip_wide(&tip);
         assert_eq!(cut[125], 'x' as u16);
         assert_eq!(cut[126], 0);
+
+        // The notice title has room for 63 units.
+        let title: [u16; 64] = fixed_wide(&"t".repeat(100));
+        assert!(title[..63].iter().all(|&u| u == u16::from(b't')));
+        assert_eq!(title[63], 0);
     }
 
     #[test]
