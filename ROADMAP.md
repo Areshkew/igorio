@@ -255,8 +255,14 @@ cursor, so users do not have to guess what the gesture does.
 - Tools are entries in one list, each with a condition for when it is offered. This is
   where later, context-aware tools go.
 
-Ideas for later, not planned yet: tools offered from context, for example a grammar
-review when the user is typing in a text field.
+Ideas for later, not planned yet:
+
+- Tools offered from context, for example a grammar review when the user is typing in a
+  text field.
+- A "Tool menu" list in the settings window: drag rows to reorder the tools and a switch per
+  tool to leave it out of the menu (the tool itself and its shortcut keep working). The first
+  row is the one under the cursor, so it is also the one-click tool. Stored as an ordered
+  list of tool ids in `settings.json`; unknown or missing ids fall back to the default order.
 
 ## Notes editor: Notion-like writing
 
