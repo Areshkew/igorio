@@ -762,6 +762,30 @@ impl Keys {
         self.others.iter().any(|&w| w != 0)
     }
 
+    /// Forgets Shift, Win and other keys that `is_down` says are not held any more. A
+    /// release can be missed (a screenshot overlay, the lock screen, another program's
+    /// hook), and a key left "down" here would cancel every later hold. Returns the
+    /// number of keys forgotten. The combo's own keys are left to their events.
+    fn forget_released(&mut self, is_down: impl Fn(u32) -> bool) -> u32 {
+        let mut forgotten = 0;
+        if self.shift && !is_down(0x10) {
+            self.shift = false;
+            forgotten += 1;
+        }
+        if self.win && !is_down(0x5B) && !is_down(0x5C) {
+            self.win = false;
+            forgotten += 1;
+        }
+        for vk in 0..256u32 {
+            let (word, bit) = (vk as usize / 64, 1u64 << (vk % 64));
+            if self.others[word] & bit != 0 && !is_down(vk) {
+                self.others[word] &= !bit;
+                forgotten += 1;
+            }
+        }
+        forgotten
+    }
+
     /// Exactly the modifier of the gesture is down, nothing else.
     fn combo(&self, modifier: Modifier) -> bool {
         let clean = !self.altgr && !self.shift && !self.win && !self.others();
@@ -986,6 +1010,11 @@ impl Gesture {
 
     pub fn phase(&self) -> Phase {
         self.phase
+    }
+
+    /// See [`Keys::forget_released`]. Call before a key press that may start a hold.
+    pub fn forget_released(&mut self, is_down: impl Fn(u32) -> bool) -> u32 {
+        self.keys.forget_released(is_down)
     }
 
     pub fn modifier(&self) -> Modifier {
@@ -2472,6 +2501,12 @@ impl Driver {
             {
                 self.gesture
                     .step(Input::Buttons(buttons_now()), hook::now());
+                let forgotten = self
+                    .gesture
+                    .forget_released(|vk| key_down(VIRTUAL_KEY(vk as u16)));
+                if forgotten != 0 {
+                    self.log(&format!("forgot {forgotten} key(s) whose release was missed"));
+                }
             }
             self.step(input);
         }
@@ -3949,6 +3984,27 @@ mod tests {
         s.key(1.0, LCTRL, false);
         s.tick_to(2.0);
         assert_eq!(s.asks(), 0);
+    }
+
+    #[test]
+    fn a_missed_key_release_does_not_cancel_later_holds() {
+        // S goes down and its release never arrives (a screenshot overlay took it).
+        let mut s = Script::new(Modifier::Alt);
+        s.key(0.0, 0x53, true);
+        s.key(1.0, LALT, true);
+        assert_eq!(s.g.phase(), Phase::Cancelled);
+        s.key(1.1, LALT, false);
+        assert_eq!(s.g.phase(), Phase::Idle);
+        // The driver asks the system before the next press: S is not held.
+        assert_eq!(s.g.forget_released(|_| false), 1);
+        s.key(2.0, LALT, true);
+        assert_eq!(s.g.phase(), Phase::Held);
+        // A key that is really held is kept.
+        let mut s = Script::new(Modifier::Alt);
+        s.key(0.0, 0x53, true);
+        assert_eq!(s.g.forget_released(|vk| vk == 0x53), 0);
+        s.key(1.0, LALT, true);
+        assert_eq!(s.g.phase(), Phase::Cancelled);
     }
 
     #[test]
