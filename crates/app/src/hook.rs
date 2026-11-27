@@ -69,10 +69,9 @@
 //!
 //! ## Limits
 //!
-//! - When the foreground window belongs to an elevated process and we are not elevated,
-//!   Windows does not call the hook for input to it. This is not worked around; a
-//!   `uiAccess` build (M6) receives that input. While such a window is in front,
-//!   `seems_stalled` can report a stall; a restart then is harmless.
+//! - Without UI access, Windows can skip the hook for input to a higher-integrity window.
+//!   While such a window is in front, `seems_stalled` can report a stall; a restart then is
+//!   harmless. The installed `uiAccess` build can receive that input.
 //! - The secure desktop (UAC prompt, Ctrl+Alt+Del) is not seen at all.
 //! - If the hook is restarted (or the process ends) between a swallowed press and its
 //!   release, the release reaches the window below without its press. Windows never saw

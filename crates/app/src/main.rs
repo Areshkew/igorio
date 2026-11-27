@@ -5,6 +5,7 @@
 //! `FAIRY_DEBUG=1` logs every drop decision (see `drop_router::DebugLog`).
 
 use std::cell::{Cell, RefCell, RefMut};
+use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -36,20 +37,24 @@ use igorio_core::ink::InkTool;
 use igorio_core::shake::{ShakeGate, ShakeResult};
 use igorio_kit::Image;
 use tiny_skia::Pixmap;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, WAIT_FAILED, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, LPARAM, SetLastError,
+    WAIT_FAILED, WPARAM,
+};
 use windows::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler,
 };
+use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::Threading::{
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, GetCurrentThreadId, INFINITE,
-    SYNCHRONIZATION_SYNCHRONIZE, SetWaitableTimer, TIMER_MODIFY_STATE,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateMutexExW, CreateWaitableTimerExW,
+    GetCurrentThreadId, INFINITE, SYNCHRONIZATION_SYNCHRONIZE, SetWaitableTimer, TIMER_MODIFY_STATE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE,
     PeekMessageW, PostQuitMessage, PostThreadMessageW, QS_ALLINPUT, TranslateMessage, WM_CLOSE,
     WM_QUIT,
 };
-use windows::core::BOOL;
+use windows::core::{BOOL, w};
 
 const MENU_RESTORE: u32 = 1;
 const MENU_ADD_DEMO: u32 = 2;
@@ -1314,7 +1319,26 @@ fn overlay_hint(message: &str) -> String {
     }
 }
 
+/// The named mutex needs only to exist. Request no access so either build can detect the
+/// other across integrity levels. Windows removes the name when the last handle closes.
+fn single_instance() -> windows::core::Result<Option<OwnedHandle>> {
+    // SAFETY: the name is static and the non-inheritable handle is newly owned by this call.
+    let (handle, already_running) = unsafe {
+        SetLastError(ERROR_SUCCESS);
+        let handle = CreateMutexExW(None, w!(r"Local\Igorio.SingleInstance"), 0, 0)?;
+        let already_running = GetLastError() == ERROR_ALREADY_EXISTS;
+        (OwnedHandle::from_raw_handle(handle.0), already_running)
+    };
+    Ok((!already_running).then_some(handle))
+}
+
 fn main() -> windows::core::Result<()> {
+    let Some(_instance) = single_instance()? else {
+        DebugLog::from_env().line(hook::now(), "Igorio is already running in this session");
+        // SAFETY: the debug message is a static, terminated string.
+        unsafe { OutputDebugStringW(w!("Igorio is already running in this session\n")) };
+        return Ok(());
+    };
     // First, so a panic or a fault anywhere below leaves a record in crash.log.
     igorio_app::crash::install();
     overlay::ensure_dpi_awareness();
