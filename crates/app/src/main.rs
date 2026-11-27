@@ -4,12 +4,13 @@
 //! drop router. `igorio --demo N` starts with N generated screenshots on the pile.
 //! `FAIRY_DEBUG=1` logs every drop decision (see `drop_router::DebugLog`).
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, RefMut};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use igorio_app::draw::Renderer;
 use igorio_app::drop_router::{DebugLog, Drops};
@@ -26,21 +27,26 @@ use igorio_app::settings_window::{LiveSettings, SettingsWindow, ShortcutService}
 use igorio_app::shortcuts::{Action, Hotkeys};
 use igorio_app::snip::{Snip, SnipEvent};
 use igorio_app::state::FairyState;
-use igorio_app::tray::{MenuItem, Tray};
+use igorio_app::tray::{EndRequest, MenuItem, Tray};
 use igorio_app::uia::Requester;
 use igorio_core::geom::Point;
 use igorio_core::shake::{ShakeGate, ShakeResult};
 use igorio_kit::Image;
 use tiny_skia::Pixmap;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, LPARAM, WAIT_FAILED, WPARAM};
+use windows::Win32::System::Console::{
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler,
+};
 use windows::Win32::System::Threading::{
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, INFINITE,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, GetCurrentThreadId, INFINITE,
     SYNCHRONIZATION_SYNCHRONIZE, SetWaitableTimer, TIMER_MODIFY_STATE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE,
-    PeekMessageW, PostQuitMessage, QS_ALLINPUT, TranslateMessage, WM_QUIT,
+    PeekMessageW, PostQuitMessage, PostThreadMessageW, QS_ALLINPUT, TranslateMessage, WM_CLOSE,
+    WM_QUIT,
 };
+use windows::core::BOOL;
 
 const MENU_RESTORE: u32 = 1;
 const MENU_ADD_DEMO: u32 = 2;
@@ -51,6 +57,18 @@ const MENU_OPEN_NOTES_FOLDER: u32 = 5;
 const MENU_NOTE_BASE: u32 = 100;
 /// How long stopping the notes may take: saving the text and closing the windows.
 const NOTES_STOP: Duration = Duration::from_secs(2);
+/// At session end Windows may end the process a few seconds after WM_ENDSESSION, so the quit
+/// does only what matters, most important first, within 4.0 s in all: the clipboard restore
+/// (this), the notes' text and window positions ([`END_NOTES`]), then the clipboard thread's
+/// stop, which renders what we still own (its own bound, 2 s, in `Clipboard::drop`).
+const END_RESTORE: Duration = Duration::from_millis(800);
+const END_NOTES: Duration = Duration::from_millis(1200);
+/// How long a console handler waits for the quit path. Windows ends the process about 5 s
+/// after the console window is closed; Ctrl+C and Ctrl+Break run the normal quit, whose steps
+/// add up to about 14.3 s at worst. If the quit has not finished by then, the default
+/// handler ends the process.
+const CONSOLE_CLOSE_WAIT: Duration = Duration::from_millis(4500);
+const CONSOLE_BREAK_WAIT: Duration = Duration::from_secs(15);
 
 /// Frame interval while something moves, in seconds.
 const FRAME: f64 = 0.008;
@@ -367,14 +385,22 @@ impl Drop for Sleeper {
     }
 }
 
-/// Dispatches every queued message. Returns false when WM_QUIT was seen.
+/// True for a queued message that ends the loop: WM_QUIT (the tray's Quit, a console event,
+/// the end of a session) and WM_CLOSE posted to any window of this thread (`taskkill` without
+/// /F posts it to the app's top-level windows). A WM_CLOSE seen here never reaches a window
+/// procedure, so it destroys no window of this thread.
+fn ends_loop(message: u32) -> bool {
+    message == WM_QUIT || message == WM_CLOSE
+}
+
+/// Dispatches every queued message. Returns false when a message that ends the loop was seen.
 fn pump_messages() -> bool {
     let mut message = MSG::default();
     // SAFETY: `message` is a valid MSG for the calls to fill and read; this thread owns
     // the windows whose messages are dispatched.
     unsafe {
         while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
-            if message.message == WM_QUIT {
+            if ends_loop(message.message) {
                 return false;
             }
             let _ = TranslateMessage(&message);
@@ -647,6 +673,34 @@ impl NotesFeature {
         }
     }
 
+    /// At session end: only the notes thread (pending text, then the window positions), all
+    /// within `within`, a start or stop in flight included. Returns the gesture, which is
+    /// stopped later or ends with the process.
+    fn stop_notes_within(&mut self, within: Duration) -> Option<Summoner> {
+        let until = Instant::now() + within;
+        if let Some(transition) = self.transition.take() {
+            while !transition.is_finished() && Instant::now() < until {
+                thread::sleep(Duration::from_millis(2));
+            }
+            if !transition.is_finished() {
+                // Dropping the handle detaches the thread; it ends with the process.
+                self.line(hook::now(), "notes: a start or stop is still running at session end");
+            } else if let Ok((running, problems)) = transition.join() {
+                for problem in problems {
+                    self.line(hook::now(), &problem);
+                }
+                if running.is_some() {
+                    self.active = running;
+                }
+            }
+        }
+        let running = self.active.take()?;
+        if !running.notes.shutdown(until.saturating_duration_since(Instant::now())) {
+            self.line(hook::now(), "notes: the notes thread did not stop within its budget");
+        }
+        running.summoner
+    }
+
     /// The mouse events of this pass, for the gesture (the app has one mouse hook).
     fn feed(&self, events: &[MouseEvent]) {
         if let Some(summoner) = self.summoner() {
@@ -817,16 +871,251 @@ impl NotesFeature {
     }
 }
 
-/// Stops the Notes capability when `main` ends, on every way out (errors and unwinding
-/// included). Declared after `drops`, so the gesture and the notes stop before the UI
-/// Automation worker and the clipboard.
-struct NotesOwner(Rc<RefCell<NotesFeature>>);
+/// How the app ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// The tray's Quit, a close request, Ctrl+C or Ctrl+Break, an error return or a panic:
+    /// every step, each within its own bound.
+    Normal,
+    /// The session ends (WM_ENDSESSION) or the debug console window closes: Windows may end
+    /// the process within seconds, so only what matters runs, most important first.
+    SessionEnd,
+}
 
-impl Drop for NotesOwner {
-    fn drop(&mut self) {
-        if let Ok(mut feature) = self.0.try_borrow_mut() {
-            feature.stop_now();
+/// The console events that ask the app to quit, and how. CTRL_LOGOFF_EVENT and
+/// CTRL_SHUTDOWN_EVENT never reach a process that loaded user32; the end of a session arrives
+/// as WM_ENDSESSION instead.
+fn console_request(ctrl: u32) -> Option<Ending> {
+    match ctrl {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => Some(Ending::Normal),
+        CTRL_CLOSE_EVENT => Some(Ending::SessionEnd),
+        _ => None,
+    }
+}
+
+/// The UI thread, for the console handler (which Windows runs on a thread of its own).
+static UI_THREAD: AtomicU32 = AtomicU32::new(0);
+/// The console window is closing: the quit after the loop uses the session-end steps.
+static QUIT_SHORT: AtomicBool = AtomicBool::new(false);
+/// The quit path has done its work (at session end: the part that matters).
+static QUIT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Ctrl+C, Ctrl+Break and closing the console window (the debug build is a console program).
+/// Only asks the UI thread to quit, then waits (bounded) for the quit path: for a close event
+/// Windows ends the process as soon as this returns. FALSE leaves the event to the default
+/// handler, which ends the process.
+unsafe extern "system" fn console_handler(ctrl: u32) -> BOOL {
+    let Some(ending) = console_request(ctrl) else {
+        return false.into();
+    };
+    if !QUIT_DONE.load(SeqCst) {
+        let thread = UI_THREAD.load(SeqCst);
+        if thread == 0 {
+            return false.into();
         }
+        if ending == Ending::SessionEnd {
+            QUIT_SHORT.store(true, SeqCst);
+        }
+        // SAFETY: a message without pointers to the UI thread, which lives as long as the
+        // process. A WM_QUIT also ends a modal loop (the tray menu), which posts it again.
+        if unsafe { PostThreadMessageW(thread, WM_QUIT, WPARAM(0), LPARAM(0)) }.is_err() {
+            return false.into();
+        }
+    }
+    let wait = match ending {
+        Ending::Normal => CONSOLE_BREAK_WAIT,
+        Ending::SessionEnd => CONSOLE_CLOSE_WAIT,
+    };
+    let until = Instant::now() + wait;
+    while !QUIT_DONE.load(SeqCst) && Instant::now() < until {
+        thread::sleep(Duration::from_millis(5));
+    }
+    QUIT_DONE.load(SeqCst).into()
+}
+
+/// Hands out what the quit path stops exactly once, to whichever caller comes first: the end
+/// of the loop, WM_ENDSESSION inside the tray's window procedure, or [`QuitOnDrop`].
+struct QuitOnce<T>(RefCell<Option<T>>);
+
+#[derive(Debug, PartialEq)]
+enum Claim<T> {
+    First(T),
+    /// The quit already ran: nothing to do.
+    Done,
+    /// The loop holds the parts right now (the caller runs nested inside it).
+    Busy,
+}
+
+impl<T> QuitOnce<T> {
+    fn new(parts: T) -> Self {
+        QuitOnce(RefCell::new(Some(parts)))
+    }
+
+    /// For the loop: the parts, until the quit has taken them.
+    fn get(&self) -> Option<RefMut<'_, T>> {
+        RefMut::filter_map(self.0.try_borrow_mut().ok()?, Option::as_mut).ok()
+    }
+
+    fn claim(&self) -> Claim<T> {
+        match self.0.try_borrow_mut() {
+            Ok(mut slot) => slot.take().map_or(Claim::Done, Claim::First),
+            Err(_) => Claim::Busy,
+        }
+    }
+}
+
+/// The workers the loop drives and the quit path stops.
+struct Parts {
+    settings: LiveSettings,
+    settings_window: SettingsWindow,
+    hotkeys: Option<Hotkeys>,
+    detector: Detector,
+    drops: Option<Drops>,
+}
+
+/// What session end leaves running. Windows ends it with the process; if the process lives
+/// on (the session end was only a message), it is stopped after the loop.
+struct Rest {
+    parts: Parts,
+    summoner: Option<Summoner>,
+}
+
+/// The one quit path, for every way the app ends. See [`Quit::stop_all`] and
+/// [`Quit::stop_what_matters`] for the steps and their bounds.
+struct Quit {
+    parts: QuitOnce<Parts>,
+    notes: Rc<RefCell<NotesFeature>>,
+    log: RefCell<DebugLog>,
+    rest: RefCell<Option<Rest>>,
+}
+
+impl Quit {
+    fn line(&self, text: &str) {
+        if let Ok(mut log) = self.log.try_borrow_mut() {
+            log.line(hook::now(), text);
+        }
+    }
+
+    /// A problem: in the debug log, or on stderr when there is none.
+    fn problem(&self, text: &str) {
+        if self.log.try_borrow().is_ok_and(|log| !log.enabled()) {
+            eprintln!("{text}");
+        }
+        self.line(text);
+    }
+
+    /// Runs the quit path once; a later call does nothing.
+    fn run(&self, ending: Ending) {
+        let parts = match self.parts.claim() {
+            Claim::First(parts) => parts,
+            Claim::Done => return,
+            Claim::Busy => {
+                self.problem("quit: asked while the loop holds the workers; they stop after it");
+                return;
+            }
+        };
+        let started = Instant::now();
+        match ending {
+            Ending::Normal => {
+                self.line("quit: start");
+                self.stop_all(parts);
+            }
+            Ending::SessionEnd => {
+                self.line("quit: start (session end)");
+                let rest = self.stop_what_matters(parts);
+                *self.rest.borrow_mut() = Some(rest);
+            }
+        }
+        self.line(&format!("quit: done in {:.3} s", started.elapsed().as_secs_f64()));
+        QUIT_DONE.store(true, SeqCst);
+    }
+
+    /// Every step, in this order. Worst cases, each for a stuck thread (a quit normally takes
+    /// milliseconds): the settings window 0.95 s; the shortcut thread 1 s; the note gesture
+    /// 1 s and the notes 2 s (plus up to 8 s while a notes start is in flight); screenshot
+    /// detection 1.8 s (plus up to 3.6 s while its start is in flight); then the drop router:
+    /// the clipboard restore 1 s, the clipboard thread 2 s, UI Automation 1.5 s, the key watch
+    /// 1 s, the Explorer lookup 1 s and the PNG saver 1 s. About 14.3 s with nothing in flight.
+    fn stop_all(&self, parts: Parts) {
+        let Parts { settings, settings_window, mut hotkeys, detector, drops } = parts;
+        // The settings window goes first: a recording open in it resumes the hotkeys.
+        let service = hotkeys.as_ref().map(|hotkeys| hotkeys as &dyn ShortcutService);
+        settings_window.shutdown(service, &settings.snapshot.shortcuts);
+        self.line("quit: settings window closed");
+        if let Some(hotkeys) = hotkeys.take()
+            && !hotkeys.shutdown()
+        {
+            self.problem("the shortcut thread did not stop within its shutdown budget");
+        }
+        self.line("quit: shortcuts stopped");
+        // The note gesture, then the notes (pending text written), then the workers they use.
+        match self.notes.try_borrow_mut() {
+            Ok(mut notes) => notes.stop_now(),
+            Err(_) => self.problem("quit: the notes are in use; they stop with the process"),
+        }
+        self.line("quit: notes stopped");
+        drop(detector);
+        self.line("quit: screenshot detection stopped");
+        // Puts the user's clipboard back if a paste left ours there, then stops the workers.
+        drop(drops);
+        self.line("quit: clipboard checked, workers stopped");
+    }
+
+    /// Session end: what the user would lose, most important first, within 4.0 s: the
+    /// clipboard restore (0.8 s); the notes' pending text, then their window positions (1.2 s,
+    /// a notes start or stop in flight included); the clipboard thread, which renders a staged
+    /// screenshot we still own (2 s). Hooks, hotkeys and the other workers are left: Windows
+    /// releases them when the process ends.
+    fn stop_what_matters(&self, mut parts: Parts) -> Rest {
+        // If a step could legitimately take long (a recording being finalized), this is where
+        // `ShutdownBlockReasonCreate` would ask Windows to wait and tell the user why.
+        if let Some(drops) = &mut parts.drops {
+            drops.restore_clipboard(END_RESTORE);
+        }
+        self.line("quit: clipboard checked");
+        let summoner = match self.notes.try_borrow_mut() {
+            Ok(mut notes) => notes.stop_notes_within(END_NOTES),
+            Err(_) => {
+                self.problem("quit: the notes are in use; they stop with the process");
+                None
+            }
+        };
+        self.line("quit: notes stopped");
+        if let Some(drops) = &mut parts.drops {
+            drops.stop_clipboard();
+        }
+        self.line("quit: clipboard thread stopped");
+        Rest { parts, summoner }
+    }
+
+    /// After a session end the process lived on: stop the rest in the normal order.
+    fn stop_rest(&self) {
+        let Some(rest) = self.rest.borrow_mut().take() else {
+            return;
+        };
+        if let Some(summoner) = rest.summoner
+            && !summoner.shutdown()
+        {
+            self.problem("notes: the note gesture did not stop within its budget");
+        }
+        self.stop_all(rest.parts);
+        self.line("quit: the rest stopped");
+    }
+}
+
+/// The ending of a quit after the loop: the session-end steps when the console window closes.
+fn ending_after_loop() -> Ending {
+    if QUIT_SHORT.load(SeqCst) { Ending::SessionEnd } else { Ending::Normal }
+}
+
+/// Runs the quit path when `main` ends, on every way out (errors and unwinding included).
+/// After a normal end it finds nothing left to do.
+struct QuitOnDrop(Rc<Quit>);
+
+impl Drop for QuitOnDrop {
+    fn drop(&mut self) {
+        self.0.run(ending_after_loop());
+        self.0.stop_rest();
     }
 }
 
@@ -848,7 +1137,7 @@ fn overlay_hint(message: &str) -> String {
 fn main() -> windows::core::Result<()> {
     overlay::ensure_dpi_awareness();
     let settings_path = settings::default_settings_path();
-    let mut settings = LiveSettings::from(Settings::load(&settings_path).unwrap_or_default());
+    let settings = LiveSettings::from(Settings::load(&settings_path).unwrap_or_default());
     // Note window positions live next to the settings.
     let notes = Rc::new(RefCell::new(NotesFeature::new(
         settings_path.with_file_name("note-windows.json"),
@@ -887,7 +1176,7 @@ fn main() -> windows::core::Result<()> {
     let action_settings = Rc::clone(&open_settings);
     let menu_notes = Rc::clone(&notes);
     let action_notes = Rc::clone(&notes);
-    let _tray = Tray::new(
+    let tray = Tray::new(
         "Igorio",
         Box::new(move || {
             let can_restore = menu_app.borrow().state.can_restore();
@@ -927,24 +1216,17 @@ fn main() -> windows::core::Result<()> {
     let sleeper = Sleeper::new()?;
 
     // The drop router and its workers (UI Automation, clipboard). Without them the app
-    // still carries, shakes and restores. Dropping `drops` (on every way out of `main`,
-    // errors and panics included) puts the user's clipboard back if a paste left ours there.
-    let mut drops = match Drops::start(settings.snapshot.clone(), DebugLog::from_env()) {
+    // still carries, shakes and restores. Stopping it (in the quit path, or by dropping it on
+    // an early error return) puts the user's clipboard back if a paste left ours there.
+    let drops = match Drops::start(settings.snapshot.clone(), DebugLog::from_env()) {
         Ok(drops) => Some(drops),
         Err(why) => {
             eprintln!("double-click drops are off: {why}");
             None
         }
     };
-    // This local is declared after `drops`, so it stops before clipboard restore and
-    // shutdown on normal quit, error returns and unwinding.
-    let mut detector = Detector::default();
-    // Also after `drops`: the note gesture, then the notes, stop before UI Automation does.
-    let _notes_owner = NotesOwner(Rc::clone(&notes));
-    // This owner is dropped first on quit, error, and unwind.
-    let mut settings_window = SettingsWindow::new(settings_path)?;
-    // Declared after the settings window, so it stops first (bounded) on every way out.
-    let mut hotkeys = match Hotkeys::start(&settings.snapshot.shortcuts) {
+    let settings_window = SettingsWindow::new(settings_path)?;
+    let hotkeys = match Hotkeys::start(&settings.snapshot.shortcuts) {
         Ok(hotkeys) => Some(hotkeys),
         Err(error) => {
             eprintln!("keyboard shortcuts are off: {error}");
@@ -961,11 +1243,50 @@ fn main() -> windows::core::Result<()> {
         wakes.extend(drops.wake_handles());
     }
     let permanent_wakes = wakes.len();
+    // From here every way out of `main` runs the one quit path (see `Quit` for the order).
+    let quit = Rc::new(Quit {
+        parts: QuitOnce::new(Parts {
+            settings,
+            settings_window,
+            hotkeys,
+            detector: Detector::default(),
+            drops,
+        }),
+        notes: Rc::clone(&notes),
+        log: RefCell::new(DebugLog::from_env()),
+        rest: RefCell::new(None),
+    });
+    let _quit_on_drop = QuitOnDrop(Rc::clone(&quit));
+    let end_quit = Rc::clone(&quit);
+    tray.on_end(Box::new(move |request| match request {
+        // SAFETY: posts WM_QUIT to this thread's own queue.
+        EndRequest::Close => unsafe { PostQuitMessage(0) },
+        EndRequest::QueryEndSession => end_quit.line("quit: Windows asks to end the session: yes"),
+        EndRequest::EndSession => {
+            // Windows may end the process as soon as this returns, so the quit runs here. If
+            // the process lives on, the loop ends and stops the rest.
+            end_quit.run(Ending::SessionEnd);
+            // SAFETY: posts WM_QUIT to this thread's own queue.
+            unsafe { PostQuitMessage(0) };
+        }
+    }));
+    // SAFETY: no arguments.
+    UI_THREAD.store(unsafe { GetCurrentThreadId() }, SeqCst);
+    // SAFETY: `console_handler` is a plain function that lives as long as the process; it only
+    // reads atomics and posts a message. Without a console (the release build) it never runs.
+    if let Err(error) = unsafe { SetConsoleCtrlHandler(Some(console_handler), true) } {
+        eprintln!("console events are not handled: {error}");
+    }
     // When the next frame runs; `None` waits for a mouse move or a menu action.
     let mut due = Some(hook::now());
     let mut next_health_check = hook::now() + HEALTH_CHECK;
 
     while pump_messages() {
+        // None once the quit ran inside the window procedure (WM_ENDSESSION).
+        let Some(mut parts) = quit.parts.get() else {
+            break;
+        };
+        let Parts { settings, settings_window, hotkeys, detector, drops } = &mut *parts;
         let now = hook::now();
         if let Some(hotkeys) = &hotkeys {
             hotkeys.drain(&mut presses);
@@ -983,8 +1304,8 @@ fn main() -> windows::core::Result<()> {
         // Also carries the shortcut recorder's pause, resume and registration checks.
         let service = hotkeys.as_ref().map(|hotkeys| hotkeys as &dyn ShortcutService);
         for saved in settings_window.saved(service, &settings.snapshot.shortcuts) {
-            settings = saved.into();
-            if let Some(drops) = &mut drops {
+            *settings = saved.into();
+            if let Some(drops) = drops.as_mut() {
                 drops.set_settings(&settings.snapshot);
             }
             let mut app = app.borrow_mut();
@@ -1068,19 +1389,8 @@ fn main() -> windows::core::Result<()> {
         let wait = Duration::from_secs_f64((until - hook::now()).max(0.0));
         sleeper.wait(wait, &wakes)?;
     }
-    // Put the user's clipboard back if a paste left ours there, then stop the workers.
-    // The settings window goes first: a recording open in it resumes the hotkeys.
-    let service = hotkeys.as_ref().map(|hotkeys| hotkeys as &dyn ShortcutService);
-    settings_window.shutdown(service, &settings.snapshot.shortcuts);
-    if let Some(hotkeys) = hotkeys.take()
-        && !hotkeys.shutdown()
-    {
-        eprintln!("the shortcut thread did not stop within its shutdown budget");
-    }
-    // The note gesture, then the notes (pending text written), then the workers they use.
-    notes.borrow_mut().stop_now();
-    drop(detector);
-    drop(drops);
+    quit.run(ending_after_loop());
+    quit.stop_rest();
     Ok(())
 }
 
@@ -1147,10 +1457,11 @@ mod tests {
         })
     }
 
-    /// The quit paths of `main`: the explicit stop after the loop, and `NotesOwner` when
-    /// `main` ends by an error or a panic. Both write a note's unsaved text before the workers
-    /// stop. (The gesture is not started here: it needs a keyboard hook and UI Automation;
-    /// `NotesRunning::stop` shuts it down before the notes by construction.)
+    /// The two ways the quit path stops the notes: every step (`stop_now`, the tray's Quit,
+    /// errors and panics) and the session-end steps (`stop_notes_within`). Both write a note's
+    /// unsaved text before the workers stop. (The gesture is not started here: it needs a
+    /// keyboard hook and UI Automation; `NotesRunning::stop` shuts it down before the notes by
+    /// construction.)
     #[test]
     fn quitting_writes_unsaved_note_text_on_every_way_out() {
         let root = std::env::temp_dir().join(format!("igorio-main-notes-{}", std::process::id()));
@@ -1164,14 +1475,49 @@ mod tests {
         assert!(feature.active.is_none());
         assert!(on_disk(&normal.join("Notes"), "quit"));
 
-        let unwound = root.join("unwound");
-        let feature = Rc::new(RefCell::new(NotesFeature::new(unwound.join("note-windows.json"))));
-        feature.borrow_mut().active = Some(running_with_typed_note(&unwound, "drop"));
-        drop(NotesOwner(Rc::clone(&feature)));
-        assert!(feature.borrow().active.is_none());
-        assert!(on_disk(&unwound.join("Notes"), "drop"));
+        let ended = root.join("ended");
+        let mut feature = NotesFeature::new(ended.join("note-windows.json"));
+        feature.active = Some(running_with_typed_note(&ended, "end"));
+        let started = Instant::now();
+        assert!(feature.stop_notes_within(END_NOTES).is_none(), "no gesture was started");
+        assert!(started.elapsed() <= END_NOTES + Duration::from_millis(100));
+        assert!(feature.active.is_none());
+        assert!(on_disk(&ended.join("Notes"), "end"));
+        assert!(ended.join("note-windows.json").exists(), "window positions written");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_quit_runs_once_whoever_asks_first() {
+        let once = QuitOnce::new(7);
+        *once.get().expect("before the quit") += 1;
+        {
+            // The loop holds the parts: a nested caller cannot take them.
+            let _held = once.get();
+            assert_eq!(once.claim(), Claim::Busy);
+        }
+        assert_eq!(once.claim(), Claim::First(8));
+        assert_eq!(once.claim(), Claim::Done);
+        assert_eq!(once.claim(), Claim::Done);
+        assert!(once.get().is_none(), "the loop ends after the quit");
+    }
+
+    #[test]
+    fn messages_and_console_events_that_quit() {
+        assert!(ends_loop(WM_QUIT));
+        assert!(ends_loop(WM_CLOSE));
+        assert!(!ends_loop(windows::Win32::UI::WindowsAndMessaging::WM_NULL));
+        assert_eq!(console_request(CTRL_C_EVENT), Some(Ending::Normal));
+        assert_eq!(console_request(CTRL_BREAK_EVENT), Some(Ending::Normal));
+        assert_eq!(console_request(CTRL_CLOSE_EVENT), Some(Ending::SessionEnd));
+        // CTRL_LOGOFF_EVENT and CTRL_SHUTDOWN_EVENT: the session end comes as WM_ENDSESSION.
+        assert_eq!(console_request(5), None);
+        assert_eq!(console_request(6), None);
+        // The session-end steps fit in Windows' few seconds.
+        let clipboard_thread_stop = Duration::from_secs(2);
+        assert!(END_RESTORE + END_NOTES + clipboard_thread_stop <= Duration::from_secs(4));
+        assert!(END_RESTORE + END_NOTES + clipboard_thread_stop < CONSOLE_CLOSE_WAIT);
     }
 
     #[test]
