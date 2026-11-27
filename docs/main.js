@@ -8,10 +8,13 @@ const REPO = 'Areshkew/igorio';
 // ?t=<seconds> starts the demo there; add &still=1 to show only that frame.
 // ?record=1 shows only the demo and its caption, for recording (see tools/record.py).
 // ?og=1 lays the page out as the 1200 x 630 Open Graph picture.
+// ?stars=mock (37 stars) or ?stars=mock-big (2,400) uses sample data instead of the GitHub API.
 const params = new URLSearchParams(location.search);
 const RECORD = params.has('record');
 const OG = params.has('og');
 const STILL = params.has('still') || RECORD;
+const MOCK = /^mock(-big)?$/.test(params.get('stars')) ? params.get('stars') : '';
+const DAY = 864e5;
 if (RECORD) document.body.classList.add('record');
 if (OG) document.body.classList.add('og');
 
@@ -25,18 +28,250 @@ if (OG) document.body.classList.add('og');
     support.hidden = false;
   }
   if (STILL || OG) return;
-  fetch('https://api.github.com/repos/' + REPO, { headers: { Accept: 'application/vnd.github+json' } })
-    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
-    .then((data) => {
+  gh('')
+    .then(({ data }) => {
       const n = data && data.stargazers_count;
       if (typeof n !== 'number') return;
       const text = n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/\.0$/, '') + 'k' : String(n);
       document.getElementById('star-count').textContent = text;
       document.getElementById('stars').hidden = false;
       document.getElementById('github').setAttribute('aria-label', `GitHub, ${n} stars`);
+      starPopover(n);
     })
     .catch(() => {});
 })();
+
+// ---------------------------------------------------------------------------
+// Star history: a small chart under the GitHub button, on hover or keyboard focus.
+
+// GET from the repo's API (or the mock). Resolves to { data, link }.
+function gh(path, accept = 'application/vnd.github+json') {
+  if (MOCK) return mockGh(path);
+  return fetch('https://api.github.com/repos/' + REPO + path, { headers: { Accept: accept } }).then((r) =>
+    r.ok ? r.json().then((data) => ({ data, link: r.headers.get('Link') || '' })) : Promise.reject(new Error(String(r.status))),
+  );
+}
+
+// Sample stars: a launch bump, then steady, served in pages of 100 like the API.
+function mockGh(path) {
+  const big = MOCK === 'mock-big';
+  const n = big ? 2400 : 37, span = (big ? 425 : 92) * DAY, now = Date.now();
+  const at = (i) => {
+    const u = (i + 0.5) / n;
+    const f = (u < 0.3 ? u / 3 : 0.1 + ((u - 0.3) * 9) / 7) + 0.01 * Math.sin(u * 20);
+    return new Date(now - DAY - span * (1 - f)).toISOString();
+  };
+  const m = /[?&]page=(\d+)/.exec(path);
+  const last = Math.ceil(n / 100), p = m && +m[1];
+  const res = !m
+    ? { data: { stargazers_count: n }, link: '' }
+    : { data: Array.from({ length: Math.max(0, Math.min(100, n - (p - 1) * 100)) }, (_, j) => ({ starred_at: at((p - 1) * 100 + j) })),
+        link: last > 1 ? `<https://api.github.com/x?per_page=100&page=${last}>; rel="last"` : '' };
+  return new Promise((done) => setTimeout(done, 200, res));
+}
+
+// Points [time, stars so far], oldest first, ending with [now, total]. At most 6 requests:
+// up to 600 stars every page (one point per star); above that, 6 pages spread evenly from
+// the first to the last (one point per page: its first star). Cached for an hour.
+async function loadStarHistory(total) {
+  const key = 'igorio-stars-' + (MOCK || REPO);
+  try {
+    const c = JSON.parse(sessionStorage.getItem(key));
+    if (c && c.total === total && Date.now() - c.at < 3600e3) return c.points;
+  } catch (e) {}
+  const page = (p) => gh(`/stargazers?per_page=100&page=${p}`, 'application/vnd.github.star+json');
+  const time = (s) => Date.parse(s.starred_at);
+  const first = await page(1);
+  const lastLink = /<([^>]*)>;\s*rel="last"/.exec(first.link);
+  const last = lastLink ? +(/[?&]page=(\d+)/.exec(lastLink[1]) || [])[1] || 1 : 1;
+  let points;
+  if (last <= 6) {
+    const rest = await Promise.all(Array.from({ length: last - 1 }, (_, i) => page(i + 2)));
+    points = [first, ...rest].flatMap((r) => r.data).map((s, i) => [time(s), i + 1]);
+  } else {
+    const nums = [1, 2, 3, 4, 5].map((k) => 1 + Math.round((k * (last - 1)) / 5));
+    const rest = await Promise.all(nums.map(page));
+    points = [first, ...rest].map((r, k) => [time(r.data[0]), (k ? nums[k - 1] - 1 : 0) * 100 + 1]);
+  }
+  points = points.filter((p) => p[0] > 0);
+  if (!points.length) throw new Error('no stars');
+  points.push([Date.now(), Math.max(total, points[points.length - 1][1])]);
+  try {
+    sessionStorage.setItem(key, JSON.stringify({ at: Date.now(), total, points }));
+  } catch (e) {}
+  return points;
+}
+
+// Stars at time t, read straight between the points.
+function starsAt(points, t) {
+  if (t < points[0][0]) return 0;
+  for (let i = 1; i < points.length; i++) {
+    const [t1, c1] = points[i];
+    if (t <= t1) {
+      const [t0, c0] = points[i - 1];
+      return t1 > t0 ? c0 + ((c1 - c0) * (t - t0)) / (t1 - t0) : c1;
+    }
+  }
+  return points[points.length - 1][1];
+}
+
+// A monotone cubic through P ([x, y], x rising): no overshoot, so the line never dips.
+function monotone(P) {
+  const n = P.length, s = [], m = [];
+  for (let i = 0; i < n - 1; i++) s.push((P[i + 1][1] - P[i][1]) / (P[i + 1][0] - P[i][0]));
+  m[0] = s[0];
+  m[n - 1] = s[n - 2];
+  for (let i = 1; i < n - 1; i++) {
+    const h0 = P[i][0] - P[i - 1][0], h1 = P[i + 1][0] - P[i][0];
+    const p = (s[i - 1] * h1 + s[i] * h0) / (h0 + h1);
+    m[i] = (Math.sign(s[i - 1]) + Math.sign(s[i])) * Math.min(Math.abs(s[i - 1]), Math.abs(s[i]), 0.5 * Math.abs(p)) || 0;
+  }
+  const f = (v) => v.toFixed(2);
+  let d = `M${f(P[0][0])} ${f(P[0][1])}`;
+  for (let i = 0; i < n - 1; i++) {
+    const h = (P[i + 1][0] - P[i][0]) / 3;
+    d += `C${f(P[i][0] + h)} ${f(P[i][1] + m[i] * h)} ${f(P[i + 1][0] - h)} ${f(P[i + 1][1] - m[i + 1] * h)} ${f(P[i + 1][0])} ${f(P[i + 1][1])}`;
+  }
+  // y at x, on the same curve.
+  const yAt = (x) => {
+    let i = 0;
+    while (i < n - 2 && x > P[i + 1][0]) i++;
+    const h = P[i + 1][0] - P[i][0], u = clamp((x - P[i][0]) / h, 0, 1);
+    const a = u * u * (3 - 2 * u);
+    return P[i][1] * (1 - a) + P[i + 1][1] * a + h * (m[i] * u * (1 - u) * (1 - u) - m[i + 1] * u * u * (1 - u));
+  };
+  return { d, yAt };
+}
+
+function renderStarPopover(pop, total, points) {
+  const plural = (n) => n.toLocaleString('en-US') + (n === 1 ? ' star' : ' stars');
+  const now = Date.now();
+  const recent = points.length > 1 ? total - Math.floor(starsAt(points, now - 30 * DAY)) : 0;
+  const change = recent > 0 ? `+${recent.toLocaleString('en-US')} in the last 30 days` : '';
+  pop.setAttribute('aria-label', `${plural(total)} on GitHub` + (change ? ', ' + change.slice(1) : ''));
+  if (points.length < 2) {
+    pop.innerHTML = `<div class="sp-total">${plural(total)}</div><div class="sp-sub">Be the first to star Igorio</div>`;
+    return;
+  }
+
+  // Chart box, in px. Up to 60 points are drawn as they are; more are read at 60 even steps.
+  const W = 260, H = 96, PX = 3, TOP = 6, BOT = 1;
+  const t0 = points[0][0], t1 = Math.max(points[points.length - 1][0], t0 + DAY);
+  const x = (t) => PX + ((t - t0) / (t1 - t0)) * (W - 2 * PX);
+  const y = (c) => H - BOT - (c / Math.max(total, 1)) * (H - TOP - BOT);
+  const series = points.length <= 60 ? points : Array.from({ length: 60 }, (_, i) => t0 + ((t1 - t0) * i) / 59).map((t) => [t, starsAt(points, t)]);
+  const P = [];
+  for (const [t, c] of series) {
+    const p = [x(t), y(c)];
+    if (P.length && p[0] - P[P.length - 1][0] < 0.5) P[P.length - 1] = [P[P.length - 1][0], p[1]];
+    else P.push(p);
+  }
+  if (P.length < 2) P.unshift([PX, y(0)]);
+  const curve = monotone(P);
+  const end = P[P.length - 1];
+  const month = new Date(t0).toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+
+  pop.innerHTML = `<div class="sp-total">${plural(total)}</div>${change ? `<div class="sp-sub">${change}</div>` : ''}
+    <svg class="sp-chart" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" aria-hidden="true">
+      <defs><linearGradient id="sp-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" class="sp-stop-a"/><stop offset="1" class="sp-stop-b"/></linearGradient></defs>
+      <path class="sp-area" d="${curve.d}L${end[0].toFixed(2)} ${H}L${P[0][0].toFixed(2)} ${H}Z" fill="url(#sp-fill)"/>
+      <line class="sp-base" x1="0" x2="${W}" y1="${H - 0.5}" y2="${H - 0.5}"/>
+      <path class="sp-line" d="${curve.d}"/>
+      <line class="sp-rule" y1="0" y2="${H}"/>
+      <circle class="sp-dot" r="3.5"/>
+    </svg>
+    <div class="sp-axis"><span>${month}</span><span>now</span><span class="sp-read"></span></div>`;
+
+  const svg = pop.querySelector('svg'), rule = svg.querySelector('.sp-rule'), dot = svg.querySelector('.sp-dot');
+  const axis = pop.querySelector('.sp-axis'), read = pop.querySelector('.sp-read');
+  svg.addEventListener('pointermove', (e) => {
+    const r = svg.getBoundingClientRect();
+    const px = clamp(((e.clientX - r.left) / r.width) * W, P[0][0], end[0]);
+    const py = curve.yAt(px);
+    const t = t0 + ((px - PX) / (W - 2 * PX)) * (t1 - t0);
+    const c = clamp(Math.round(((H - BOT - py) / (H - TOP - BOT)) * total), 0, total);
+    rule.setAttribute('x1', px.toFixed(2));
+    rule.setAttribute('x2', px.toFixed(2));
+    dot.setAttribute('cx', px.toFixed(2));
+    dot.setAttribute('cy', py.toFixed(2));
+    const date = new Date(t).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    read.textContent = `${date} · ${plural(c)}`;
+    read.style.left = clamp(px - read.offsetWidth / 2, 0, W - read.offsetWidth) + 'px';
+    axis.classList.add('reading');
+  });
+  svg.addEventListener('pointerleave', () => axis.classList.remove('reading'));
+}
+
+function starPopover(total) {
+  const btn = document.getElementById('github');
+  const pop = document.getElementById('star-pop');
+  if (!matchMedia('(hover: hover)').matches) return;
+  let ready = null, hover = false, focus = false, timer = 0;
+
+  // Loads once, on the first hover or focus. Any error: the popover never opens.
+  const load = () =>
+    (ready ||= (total < 2 ? Promise.resolve([]) : loadStarHistory(total)).then(
+      (points) => {
+        renderStarPopover(pop, total, points);
+        btn.setAttribute('aria-describedby', 'star-pop');
+        return true;
+      },
+      () => false,
+    ));
+
+  function place() {
+    const nav = pop.offsetParent.getBoundingClientRect();
+    const left = btn.offsetLeft + btn.offsetWidth / 2 - pop.offsetWidth / 2;
+    pop.style.left = clamp(left, 16 - nav.left, innerWidth - 16 - nav.left - pop.offsetWidth) + 'px';
+    pop.style.top = btn.offsetTop + btn.offsetHeight + 8 + 'px';
+  }
+
+  // Open after a short hover, close after a short grace, so the pointer can cross the gap.
+  function sync(delay) {
+    clearTimeout(timer);
+    const on = hover || focus;
+    if (on) load();
+    timer = setTimeout(() => {
+      if (!on) return pop.classList.remove('open');
+      load().then((ok) => {
+        if (!ok || !(hover || focus) || pop.classList.contains('open')) return;
+        place();
+        pop.classList.add('open');
+      });
+    }, delay);
+  }
+  const isOpen = () => pop.classList.contains('open');
+  btn.addEventListener('pointerenter', (e) => {
+    if (e.pointerType !== 'mouse') return;
+    hover = true;
+    sync(isOpen() ? 0 : 150);
+  });
+  pop.addEventListener('pointerenter', () => {
+    hover = true;
+    sync(0);
+  });
+  for (const node of [btn, pop]) {
+    node.addEventListener('pointerleave', () => {
+      hover = false;
+      sync(120);
+    });
+  }
+  btn.addEventListener('focus', () => {
+    if (!btn.matches(':focus-visible')) return;
+    focus = true;
+    sync(150);
+  });
+  btn.addEventListener('blur', () => {
+    focus = false;
+    sync(0);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || !(hover || focus || isOpen())) return;
+    hover = focus = false;
+    clearTimeout(timer);
+    pop.classList.remove('open');
+  });
+}
 
 // ---------------------------------------------------------------------------
 // The demo. Everything on the stage is a pure function of time: renderAt(t).
