@@ -29,6 +29,10 @@ use igorio_core::geom::{CardId, Point, Rect};
 use igorio_kit::{HeldCard, Image};
 use tiny_skia::{Color, FillRule, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Transform};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
+    DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, ReleaseDC, SRCCOPY, SelectObject,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetForegroundWindow, GetLayeredWindowAttributes, GetWindowDisplayAffinity,
@@ -128,6 +132,42 @@ fn lparam(x: i32, y: i32) -> LPARAM {
 fn send(hwnd: HWND, message: u32, wp: usize, lp: LPARAM) {
     // SAFETY: a message to a window of this process, as its own thread would get it.
     unsafe { SendMessageW(hwnd, message, Some(WPARAM(wp)), Some(lp)) };
+}
+
+/// What the window painted (its own surface, not the screen), BGRA rows. Run on the pins
+/// thread, between its frames.
+fn window_pixels(hwnd: HWND, width: i32, height: i32) -> Option<Vec<u8>> {
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // SAFETY: GDI objects made, used and freed here; the window is ours.
+    unsafe {
+        let window_dc = GetDC(Some(hwnd));
+        let dc = CreateCompatibleDC(Some(window_dc));
+        let mut bits = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0).ok();
+        let pixels = bitmap.filter(|_| !bits.is_null()).map(|bitmap| {
+            let old = SelectObject(dc, bitmap.into());
+            let _ = BitBlt(dc, 0, 0, width, height, Some(window_dc), 0, 0, SRCCOPY);
+            let _ = GdiFlush();
+            let pixels = std::slice::from_raw_parts(bits.cast::<u8>(), (width * height * 4) as usize).to_vec();
+            SelectObject(dc, old);
+            let _ = DeleteObject(bitmap.into());
+            pixels
+        });
+        let _ = DeleteDC(dc);
+        ReleaseDC(Some(hwnd), window_dc);
+        pixels
+    }
 }
 
 fn gone(pins: &Pins, id: u64) -> bool {
@@ -278,13 +318,16 @@ fn run() -> Result<bool> {
     // The wheel resizes it around the cursor; Ctrl+wheel changes its opacity.
     let cursor = Point::new((moved.x + moved.width / 4.0).round(), (moved.y + moved.height / 4.0).round());
     let bounds = monitor_bounds_at(cursor).bounds;
+    let settled = |pins: &Pins| wait_for(|| pins.test_with(id, |pin| pin.zooming()) == Some(false));
     send(hwnd, WM_MOUSEWHEEL, 120 << 16, lparam(cursor.x as i32, cursor.y as i32));
+    settled(&pins);
     let grown = frame_of(&pins, id).unwrap_or_default();
     let want = wheel_frame(moved, cursor, 1.0, MIN_SIDE, (bounds.width, bounds.height));
     checks.check(&format!("a wheel notch grows it around the cursor ({grown:?}, expected {want:?})"), grown == want);
     for _ in 0..60 {
         send(hwnd, WM_MOUSEWHEEL, (-120i16 as u16 as usize) << 16, lparam(cursor.x as i32, cursor.y as i32));
     }
+    settled(&pins);
     let small = frame_of(&pins, id).unwrap_or_default();
     checks.check(
         &format!("turning it down stops at the minimum side ({small:?})"),
@@ -384,7 +427,123 @@ fn run() -> Result<bool> {
         &format!("it grows in ({} frames on the way, first {:?}) and settles at its frame", growing.len(), growing.first()),
         !growing.is_empty() && settled && frame_of(&pins, id) == Some(expected),
     );
-    send(hwnd_of(&pins, id).ok_or("no pin window")?, WM_COMMAND, MENU_CLOSE, LPARAM(0));
+    // With motion the wheel zooms smoothly. Quick notches add up and end where the instant
+    // steps did.
+    let hwnd = hwnd_of(&pins, id).ok_or("no pin window")?;
+    pins.test_with(id, |pin| pin.hover(false, false));
+    let start = frame_of(&pins, id).unwrap_or_default();
+    let cursor = Point::new((start.x + start.width / 3.0).round(), (start.y + start.height / 3.0).round());
+    let bounds = monitor_bounds_at(cursor).bounds;
+    let mut want = start;
+    let mut on_the_way = Vec::new();
+    pins.test_with(id, |pin| pin.paint_stats());
+    let began = Instant::now();
+    for _ in 0..4 {
+        send(hwnd, WM_MOUSEWHEEL, 120 << 16, lparam(cursor.x as i32, cursor.y as i32));
+        want = wheel_frame(want, cursor, 1.0, MIN_SIDE, (bounds.width, bounds.height));
+        let until = Instant::now() + Duration::from_millis(25);
+        while Instant::now() < until {
+            on_the_way.extend(frame_of(&pins, id));
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let settled = wait_for(|| {
+        on_the_way.extend(frame_of(&pins, id));
+        pins.test_with(id, |pin| pin.zooming()) == Some(false)
+    });
+    let took = began.elapsed().as_secs_f64();
+    let (paints, total, longest) = pins.test_with(id, |pin| pin.paint_stats()).unwrap_or_default();
+    println!(
+        "INFO four notches: {paints} paints in {:.0} ms ({:.0} a second), {:.2} ms each on average, {longest:.2} ms at most",
+        took * 1000.0,
+        f64::from(paints) / took,
+        total / f64::from(paints.max(1)),
+    );
+    on_the_way.dedup();
+    let end = frame_of(&pins, id).unwrap_or_default();
+    checks.check(
+        &format!("four quick notches zoom smoothly ({} frames on the way) and end where the instant steps did ({end:?}, expected {want:?})", on_the_way.len()),
+        settled && end == want && on_the_way.len() >= 3,
+    );
+    checks.check(
+        "after a zoom the picture is made sharp at the new size",
+        wait_for(|| pins.test_with(id, |pin| pin.sharp()) == Some(true)),
+    );
+
+    // A frame in the middle of a zoom is painted all over at its size. Growing, so a window
+    // not painted yet would show a black strip.
+    send(hwnd, WM_MOUSEWHEEL, 240 << 16, lparam(cursor.x as i32, cursor.y as i32));
+    let target = [1.0, 1.0].iter().fold(end, |frame, notches| {
+        wheel_frame(frame, cursor, *notches, MIN_SIDE, (bounds.width, bounds.height))
+    });
+    let mut middle = None;
+    wait_for(|| {
+        let seen = pins.test_with(id, |pin| {
+            // Right after a frame, before anything else can paint the window.
+            let moving = pin.zoom_frame();
+            let frame = pin.frame();
+            (moving, frame, window_pixels(pin.hwnd(), frame.width as i32, frame.height as i32))
+        });
+        if let Some((true, frame, pixels)) = seen
+            && frame != end
+            && frame != target
+        {
+            middle = Some((frame, pixels));
+        }
+        middle.is_some()
+    });
+    let gaps = middle.as_ref().map(|(_, pixels)| {
+        pixels.as_deref().map_or(usize::MAX, |pixels| {
+            pixels.as_chunks::<4>().0.iter().filter(|p| p[..3] == [0, 0, 0] || p[..3] == [255, 255, 255]).count()
+        })
+    });
+    checks.check(
+        &format!("a frame mid-zoom ({:?}) has no black or white gaps ({gaps:?} such pixels)", middle.as_ref().map(|(frame, _)| frame)),
+        gaps == Some(0),
+    );
+    wait_for(|| pins.test_with(id, |pin| pin.zooming()) == Some(false));
+
+    // A press during a zoom stops it where it is.
+    let before = frame_of(&pins, id).unwrap_or_default();
+    send(hwnd, WM_MOUSEWHEEL, (-360i16 as u16 as usize) << 16, lparam(cursor.x as i32, cursor.y as i32));
+    wait_for(|| frame_of(&pins, id).is_some_and(|frame| frame != before));
+    send(hwnd, WM_LBUTTONDOWN, 1, lparam(20, 20));
+    let stopped = pins.test_with(id, |pin| pin.zooming()) == Some(false);
+    let held = frame_of(&pins, id).unwrap_or_default();
+    thread::sleep(Duration::from_millis(150));
+    let later = frame_of(&pins, id).unwrap_or_default();
+    send(hwnd, WM_LBUTTONUP, 0, lparam(20, 20));
+    checks.check(
+        &format!("a press during a zoom stops it where it is ({held:?}, then {later:?})"),
+        stopped && held == later && held != before,
+    );
+
+    // Paint time while zooming a big card: eight quick notches up, then eight down.
+    let big = pins.pin(card(9, demo_image(2560, 1440, [59, 130, 246]), false), at);
+    wait_for(|| pins.test_ids().contains(&big) && pins.test_with(big, |pin| pin.still()) == Some(true));
+    let big_hwnd = hwnd_of(&pins, big).ok_or("no pin window")?;
+    pins.test_with(big, |pin| pin.hover(false, false));
+    let start = frame_of(&pins, big).unwrap_or_default();
+    let middle = lparam((start.x + start.width / 2.0) as i32, (start.y + start.height / 2.0) as i32);
+    pins.test_with(big, |pin| pin.paint_stats());
+    let began = Instant::now();
+    for notch in [120i16, -120] {
+        for _ in 0..8 {
+            send(big_hwnd, WM_MOUSEWHEEL, (notch as u16 as usize) << 16, middle);
+            thread::sleep(Duration::from_millis(40));
+        }
+        wait_for(|| pins.test_with(big, |pin| pin.zooming() || !pin.sharp()) == Some(false));
+    }
+    let took = began.elapsed().as_secs_f64();
+    let (count, total, longest) = pins.test_with(big, |pin| pin.paint_stats()).unwrap_or_default();
+    println!(
+        "INFO zooming a 2560x1440 card from {start:?}: {count} paints in {took:.2} s, {:.2} ms each on average, {longest:.2} ms at most",
+        total / f64::from(count.max(1))
+    );
+    send(big_hwnd, WM_COMMAND, MENU_CLOSE, LPARAM(0));
+    gone(&pins, big);
+
+    send(hwnd, WM_COMMAND, MENU_CLOSE, LPARAM(0));
     checks.check("with motion it fades out and closes", gone(&pins, id));
     checks.check("the last pins thread stops", pins.shutdown(Duration::from_secs(1)));
 
