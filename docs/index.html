@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Igorio</title>
+<meta name="description" content="Igorio for Windows: take a screenshot and it follows your cursor. Double-click to paste or save it, shake to let go. Sticky notes and screen recording are one key away. Free and open source.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f6f8fb" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#111318" media="(prefers-color-scheme: dark)">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.png" type="image/png" sizes="64x64">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Igorio">
+<meta property="og:description" content="Take a screenshot and it follows your cursor. Double-click to paste or save it, shake to let go. For Windows 10 and 11.">
+<meta property="og:url" content="https://igorio.areshk.dev/">
+<meta property="og:image" content="https://igorio.areshk.dev/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="A screenshot card following the cursor on a Windows desktop">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<svg class="defs" aria-hidden="true" focusable="false">
+  <symbol id="logo" viewBox="346 400 612 612">
+    <path d="M618 842C570 902 535 968 479 963C420 955 404 640 419 520C428 455 480 432 545 460C660 512 792 598 864 659C922 710 880 768 774 773" fill="none" stroke="currentColor" stroke-width="96" stroke-linecap="round" stroke-linejoin="round"/>
+    <ellipse cx="568" cy="683" rx="24" ry="40" transform="rotate(-6.875 568 683)" fill="currentColor"/>
+    <ellipse cx="652" cy="658" rx="24" ry="40" transform="rotate(-6.875 652 658)" fill="currentColor"/>
+  </symbol>
+  <symbol id="pic" viewBox="0 0 320 200" preserveAspectRatio="xMidYMid slice">
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" style="stop-color:var(--sky-a)"/>
+      <stop offset="1" style="stop-color:var(--sky-b)"/>
+    </linearGradient>
+    <rect width="320" height="200" fill="url(#sky)"/>
+    <circle cx="237" cy="60" r="16" style="fill:var(--sun)"/>
+    <path d="M0 132C34 116 58 94 92 104C122 113 140 80 172 86C204 92 222 120 256 110C284 102 302 96 320 100V200H0Z" style="fill:var(--hill-a)"/>
+    <path d="M0 162C52 140 92 132 142 146C190 160 230 150 270 138C294 131 310 134 320 136V200H0Z" style="fill:var(--hill-b)"/>
+    <path d="M0 182C84 172 200 174 320 184V200H0Z" style="fill:var(--hill-c)"/>
+  </symbol>
+  <symbol id="lines" viewBox="0 0 216 130" preserveAspectRatio="xMidYMid slice">
+    <rect width="216" height="130" style="fill:var(--win)"/>
+    <g style="fill:var(--bar)">
+      <rect x="8" y="8" width="150" height="7" rx="3.5"/>
+      <rect x="8" y="27" width="196" height="7" rx="3.5"/>
+      <rect x="8" y="46" width="176" height="7" rx="3.5"/>
+      <rect x="8" y="65" width="190" height="7" rx="3.5"/>
+      <rect x="8" y="84" width="132" height="7" rx="3.5"/>
+      <rect x="8" y="103" width="184" height="7" rx="3.5"/>
+    </g>
+  </symbol>
+</svg>
+
+<div class="page">
+  <header class="top">
+    <a class="brand" href="./">
+      <svg class="brand-mark" aria-hidden="true"><use href="#logo"/></svg>
+      <span>Igorio</span>
+    </a>
+    <nav class="actions" aria-label="Links">
+      <a class="btn quiet" id="support" hidden target="_blank" rel="noopener">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 16.2s-6-3.6-6-8.1A3.3 3.3 0 0 1 10 6.3a3.3 3.3 0 0 1 6 1.8c0 4.5-6 8.1-6 8.1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+        <span>Pay what you want</span>
+      </a>
+      <a class="btn quiet" id="github" href="https://github.com/Areshkew/igorio">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        <span>GitHub</span>
+        <span class="stars" id="stars" hidden>
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 1.6l1.9 3.9 4.3.6-3.1 3 .7 4.3L8 11.4l-3.8 2 .7-4.3-3.1-3 4.3-.6z"/></svg>
+          <span id="star-count"></span>
+        </span>
+      </a>
+      <a class="btn dark" href="https://github.com/Areshkew/igorio/releases/latest/download/Igorio-Setup.exe">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3.5v9M6.2 8.9 10 12.7l3.8-3.8M4.5 16h11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Download for Windows</span>
+      </a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="intro">
+      <h1>Your screenshots follow your cursor.</h1>
+      <p>Take a screenshot and carry it to where it goes. Notes and screen recording are one key away.</p>
+    </div>
+
+    <figure class="demo" id="figure">
+      <div class="fit" id="fit">
+        <div class="stage" id="stage" role="img" aria-label="Animated demo of Igorio on a Windows desktop">
+          <div class="screen" id="screen">
+            <div class="wall"></div>
+
+            <div class="desk">
+              <div class="desk-icon"><span class="folder"></span><span>Screenshots</span></div>
+              <div class="desk-icon"><span class="folder"></span><span>Projects</span></div>
+              <div class="desk-icon"><span class="file"></span><span>Trip.pdf</span></div>
+            </div>
+
+            <div class="win">
+              <div class="win-tabs">
+                <div class="tab"><span class="tab-dot"></span>Lake trail, day two</div>
+                <div class="win-ctl"><span class="ctl-min"></span><span class="ctl-max"></span><span class="ctl-x"></span></div>
+              </div>
+              <div class="win-bar">
+                <span class="nav-ico"></span><span class="nav-ico"></span>
+                <div class="address">journal.example/lake-trail</div>
+              </div>
+              <div class="page-doc">
+                <div class="doc-title">Lake trail, day two</div>
+                <div class="doc-meta">Saturday · 6 min read</div>
+                <svg class="doc-pic"><use href="#pic"/></svg>
+                <div class="doc-col">
+                  <i style="width:84%"></i><i></i><i style="width:92%"></i><i style="width:96%"></i><i style="width:70%"></i><i></i><i style="width:88%"></i><i style="width:54%"></i>
+                </div>
+                <i class="doc-line" style="top:281px;width:520px"></i>
+                <i class="doc-line" style="top:298px;width:390px"></i>
+                <div class="comment" id="comment">
+                  <span class="placeholder" id="placeholder">Add a comment</span>
+                  <svg class="thumb" id="thumb"><use href="#pic"/></svg>
+                  <span class="caret" id="caret"></span>
+                  <span class="send"></span>
+                </div>
+              </div>
+            </div>
+
+            <div class="note" id="note">
+              <div class="note-head">
+                <span class="note-chip"><span class="mon"></span>Desktop</span>
+                <span class="note-btns"><span class="nb-hide" id="hideBtn"></span><span class="nb-trash"></span><span class="nb-x"></span></span>
+              </div>
+              <div class="note-body" id="noteBody"></div>
+              <div class="note-foot">Created just now</div>
+            </div>
+
+            <div class="taskbar">
+              <div class="apps"><span></span><span></span><span class="on"></span><span></span><span></span></div>
+              <div class="tray">
+                <span class="chev"></span>
+                <svg class="tray-logo" id="trayLogo" aria-hidden="true"><use href="#logo"/></svg>
+                <span class="vol"></span>
+                <span class="clock">10:24</span>
+              </div>
+            </div>
+
+            <svg class="ink" viewBox="0 0 960 600"><path id="ink" d=""/></svg>
+
+            <div class="region" id="region"></div>
+            <div class="snipbar" id="snipbar"><span class="sb-rect on"></span><span class="sb-free"></span><span class="sb-win"></span><span class="sb-full"></span><span class="sb-sep"></span><span class="sb-x"></span></div>
+
+            <div class="outline" id="outline"></div>
+            <div class="strip" id="strip">
+              <span class="rec-dot"></span><span class="rec-time" id="recTime">0:00</span>
+              <span class="rec-zoom" id="recZoom">2.0x</span>
+              <span class="rec-sep"></span>
+              <span class="rec-tool" id="recPen"><span class="pen-ico"></span></span>
+              <span class="rec-tool"><span class="hl-ico"></span></span>
+              <span class="rec-tool"><span class="stop-ico"></span></span>
+            </div>
+
+            <div class="menu" id="menu">
+              <div class="menu-row hot"><span class="doc-ico"></span><span>New note</span></div>
+              <div class="menu-row"><span class="rec-ico"></span><span>Record screen</span><span class="mchips"><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>6</kbd></span></div>
+            </div>
+
+            <div class="card" id="card1"><svg><use href="#pic"/></svg></div>
+            <div class="card" id="card2"><svg><use href="#lines"/></svg></div>
+            <div class="card" id="card3"><svg><use href="#pic"/></svg><span class="badge"><i></i>0:04</span></div>
+
+            <div class="ripple" id="ripple1"></div>
+            <div class="ripple" id="ripple2"></div>
+            <div class="hud" id="hud"></div>
+
+            <svg class="cursor" id="cursor" viewBox="-2 -2 22 32" aria-hidden="true"><path d="M0 0V23l5.7-5.2 3.8 8.7 3.5-1.5-3.6-8.4h7.1Z"/></svg>
+            <svg class="cross" id="cross" viewBox="-12 -12 24 24" aria-hidden="true"><path d="M0-10V10M-10 0H10"/><path d="M0-10V10M-10 0H10"/></svg>
+            <div class="pentip" id="pentip"></div>
+          </div>
+        </div>
+      </div>
+      <figcaption class="caption">
+        <div class="cap-line"><span class="cap-title" id="capTitle"></span><span class="keys" id="capKeys"></span></div>
+        <p class="cap-text" id="capText"></p>
+        <div class="dots" id="dots"></div>
+      </figcaption>
+    </figure>
+  </main>
+
+  <footer class="foot">Windows 10 and 11 · Free and open source (MIT) · <a href="https://github.com/Areshkew/igorio">Source on GitHub</a></footer>
+</div>
+<script src="main.js"></script>
+</body>
+</html>
