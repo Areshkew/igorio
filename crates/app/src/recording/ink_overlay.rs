@@ -90,7 +90,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{Error, PCWSTR, w};
 
-use super::frame::{self, FrameWindows, Labels, ease_out};
+use super::frame::{self, FrameWindows, Labels, PillAction, PillSnapshot, ease_out};
 use super::input::{
     Action, DRAW_KEYS, Input, KeyHook, KeyInput, Machine, Mods, ZoomModifier, send_mask,
 };
@@ -755,6 +755,9 @@ pub struct RecordingUiConfig {
     pub capturable: bool,
     /// Emit [`UiEvent::Log`] lines (`FAIRY_DEBUG=1`).
     pub debug: bool,
+    /// Show "Hold Alt and scroll to zoom" under the strip for a few seconds after it appears.
+    /// The app decides (the first recordings only).
+    pub show_start_hint: bool,
 }
 
 impl Default for RecordingUiConfig {
@@ -767,6 +770,7 @@ impl Default for RecordingUiConfig {
             key_hook: true,
             capturable: false,
             debug: false,
+            show_start_hint: true,
         }
     }
 }
@@ -783,6 +787,9 @@ pub enum UiEvent {
     ResetZoom,
     /// The tool in hand changed (`setCaptureUIVisible`: the fairy steps aside while drawing).
     ToolChanged(Option<InkTool>),
+    /// The stop button on the strip was clicked: stop the recording (as the toggle would,
+    /// but never start one).
+    StopRequested,
     /// After [`RecordingUi::stop`]: the fades ended and every window is hidden.
     Hidden,
     /// A debug line (only with `RecordingUiConfig::debug`).
@@ -848,6 +855,7 @@ struct Shared {
     stats: Mutex<InkStats>,
     state: Mutex<InkState>,
     full_present: Mutex<Option<f64>>,
+    pill: Mutex<PillSnapshot>,
     passes: AtomicU64,
     /// The latest cursor from `feed`: x in the high 32 bits, y in the low; and its presence.
     cursor: AtomicI64,
@@ -911,6 +919,7 @@ impl RecordingUi {
             stats: Mutex::new(InkStats::default()),
             state: Mutex::new(InkState::default()),
             full_present: Mutex::new(None),
+            pill: Mutex::new(PillSnapshot::default()),
             passes: AtomicU64::new(0),
             cursor: AtomicI64::new(0),
             has_cursor: AtomicU64::new(0),
@@ -1040,6 +1049,11 @@ impl RecordingUi {
     }
 
     /// Passes of the thread's loop so far (each wake is one): an idle UI adds none.
+    /// The strip as of the thread's last pass: where its parts are on screen, the tip shown.
+    pub fn pill(&self) -> PillSnapshot {
+        lock(&self.shared.pill).clone()
+    }
+
     pub fn passes(&self) -> u64 {
         self.shared.passes.load(Relaxed)
     }
@@ -1095,6 +1109,8 @@ fn run(
         config.labels.clone(),
         config.modifier,
         config.capturable,
+        config.show_start_hint,
+        hook::now(),
     ) {
         Ok(frame) => frame,
         Err(e) => {
@@ -1147,7 +1163,7 @@ fn run(
     if driver.keys.is_some() {
         driver.apply(Input::KeysReset(Mods::now()), now);
     }
-    driver.frame.set_pill(0.0, None);
+    driver.frame.set_pill(0.0, None, now);
     driver.frame.appear(now);
     let _ = ready.send(Ok(()));
     drop(ready);
@@ -1194,6 +1210,9 @@ impl Driver {
                 due = due.min(now + frame::until_next_second(self.elapsed_now(now)));
             }
             if let Some(at) = self.machine.next_deadline() {
+                due = due.min(at);
+            }
+            if let Some(at) = self.frame.next_deadline(now) {
                 due = due.min(at);
             }
             if animating {
@@ -1307,9 +1326,25 @@ impl Driver {
             self.frame.set_area(area);
         }
         let now = hook::now();
+        for action in self.frame.input(now) {
+            if self.stopping {
+                continue;
+            }
+            match action {
+                PillAction::Tool(tool) => self.apply(Input::ToolShortcut(tool), now),
+                PillAction::Stop => {
+                    self.shared.emit(UiEvent::StopRequested);
+                    self.log("stop button");
+                }
+                PillAction::ResetZoom => {
+                    self.shared.emit(UiEvent::ResetZoom);
+                    self.log("zoom badge: whole screen");
+                }
+            }
+        }
         if !self.stopping {
             self.frame
-                .set_pill(self.elapsed_now(now), self.ink.ink.tool());
+                .set_pill(self.elapsed_now(now), self.ink.ink.tool(), now);
             if now >= self.next_health {
                 self.health();
                 self.next_health = now + 1.0;
@@ -1363,7 +1398,8 @@ impl Driver {
                 }
                 Action::Tool(tool) => {
                     self.ink.set_tool(tool);
-                    self.frame.set_pill(self.elapsed_now(hook::now()), tool);
+                    let now = hook::now();
+                    self.frame.set_pill(self.elapsed_now(now), tool, now);
                     if tool.is_some() {
                         // The ink window just came up; the outline and the pill stay above.
                         self.ink.draw();
@@ -1400,6 +1436,7 @@ impl Driver {
     fn publish(&self) {
         *lock(&self.shared.stats) = self.ink.stats;
         *lock(&self.shared.state) = self.ink.state();
+        *lock(&self.shared.pill) = self.frame.snapshot();
     }
 }
 

@@ -6,10 +6,13 @@
 //! - Zoom: hold Alt and turn the wheel (the outline shrinks and grows), hold Alt and move
 //!   to move the zoomed area, let go to leave it, tap Alt twice for the whole screen. The
 //!   demo steps a `RecordingViewport` with the events, as the recorder will.
-//! - Tools: type `pen` or `hl` and Enter in this console (or start with `--chords` to use
-//!   Ctrl+Shift+7 and Ctrl+Shift+8, registered only while the demo runs). Draw with the mouse;
-//!   Ctrl+Z undoes, Backspace or Delete clears, Esc puts the pen down. Typing `pen` again also
-//!   puts it down. `undo`, `clear` and `done` work as console lines too.
+//! - The strip at the top: click the pen or highlighter button to pick it up or put it down,
+//!   click the `2.0x` badge for the whole screen, drag the dot or the time to move the strip
+//!   along the top, hover a button for its tooltip. The stop button ends the demo.
+//! - Tools also by console line `pen` or `hl` (or start with `--chords` to use Ctrl+Shift+7
+//!   and Ctrl+Shift+8, registered only while the demo runs). Draw with the mouse; Ctrl+Z
+//!   undoes, Backspace or Delete clears, Esc puts the pen down. `undo`, `clear` and `done`
+//!   work as console lines too.
 //! - `q` and Enter quits.
 //!
 //! Options: `--ctrl-alt` (Ctrl+Alt instead of Alt), `--no-mask` (do not send the mask key, so
@@ -77,8 +80,8 @@ fn main() -> Result<(), String> {
         } else {
             Labels {
                 toggle: None,
-                pen: Some("\"pen\"".into()),
-                highlighter: Some("\"hl\"".into()),
+                pen: None,
+                highlighter: None,
             }
         },
         inject_mask: !has("--no-mask"),
@@ -145,6 +148,10 @@ fn main() -> Result<(), String> {
                 UiEvent::ResetZoom => viewport.reset(),
                 UiEvent::ToolChanged(tool) => println!("tool: {tool:?}"),
                 UiEvent::Log(line) => println!("{line}"),
+                UiEvent::StopRequested => {
+                    println!("stop button");
+                    break 'main;
+                }
                 UiEvent::Hidden => {}
             }
         }

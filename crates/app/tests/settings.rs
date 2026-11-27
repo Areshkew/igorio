@@ -439,3 +439,16 @@ fn a_bad_shortcut_keeps_the_rest_of_the_file() {
     assert_eq!(settings.shortcuts, Shortcuts::defaults());
     assert!(settings.launch_at_login);
 }
+
+#[test]
+fn the_recording_hint_count_defaults_to_zero_and_round_trips() {
+    let scratch = Scratch::new("hints");
+    let path = scratch.path("settings.json");
+    fs::write(&path, r#"{"launch_at_login": true}"#).unwrap();
+    let mut settings = Settings::load(&path).unwrap();
+    assert_eq!(settings.recording_hints_shown, 0);
+    assert!(settings.launch_at_login);
+    settings.recording_hints_shown = 2;
+    settings.save(&path).unwrap();
+    assert_eq!(Settings::load(&path).unwrap().recording_hints_shown, 2);
+}
