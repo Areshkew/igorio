@@ -1,5 +1,5 @@
-//! What is under the cursor for notes: whether a spot is empty background, and where a note
-//! made there comes from (desktop, app window, web page). From `NoteContext.swift`.
+//! What is under the cursor for notes: whether the tool menu may open at a spot, and where a
+//! note made there comes from (desktop, app window, web page). From `NoteContext.swift`.
 //!
 //! Both rules are pure functions over a UI Automation answer ([`Outcome`], a [`Snapshot`]
 //! from `uia`) plus a few Win32 facts about the window at the point ([`WindowFacts`]). The
@@ -7,20 +7,18 @@
 //! version resource (cached per path); it never waits on another process and never calls
 //! UI Automation.
 //!
-//! # Empty space ([`is_empty_space`])
+//! # Where the menu opens ([`allows_menu`])
 //!
-//! Not empty: no answer (timed out, failed), our own windows, an elevated window, the
-//! taskbar and other shell surfaces ([`SYSTEM_CLASSES`]), terminals, anything editable
-//! (the hit or an ancestor takes text), and anything with a control or chrome on the way
-//! up (`drop_router::ACTIVATING_ROLES` and `ACTIVATING_ARIA_ROLES`: title bars and
-//! toolbars, menus, buttons, links, tabs, rows, scroll bars). In web content
-//! (Chromium, Firefox, Electron) only the page counts: the hit must be inside a page, so
-//! the browser's own tab strip and custom title bar are never empty.
+//! Anywhere except where text is typed: not over anything editable (the hit or an ancestor
+//! takes text), a password field, or a terminal. Also not over our own windows or an
+//! elevated window. Everywhere else it opens: buttons, links, page text, lists, toolbars,
+//! title bars, the desktop, the taskbar, window backgrounds. A lookup that timed out or
+//! failed allows it too (unless the window is a terminal): a wrong open costs little, the
+//! menu shows and releasing Alt closes it.
 //!
-//! Then the hit's role decides: page and window background ([`BACKGROUND_ROLES`], as in
-//! Swift; static text is left out on purpose: the margin of a page is empty, a paragraph is
-//! not). On the desktop and in File Explorer the empty area is the items view, a list
-//! ([`SHELL_BACKGROUND_ROLES`]); an icon or a file (a row) is not.
+//! It used to open only over empty background (a page margin, the desktop, as in Swift). That
+//! proved hard to find: holding Alt over a button or text did nothing, and the feature looked
+//! broken.
 //!
 //! # Origin ([`origin`])
 //!
@@ -59,40 +57,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
-use crate::drop_router::{ACTIVATING_ARIA_ROLES, ACTIVATING_ROLES};
 use crate::notes::store::{NoteKind, NoteOrigin};
 use crate::uia::{Outcome, Shell, Snapshot, UiaNode, shell_kind};
-
-/// Roles that are page or window background rather than content or a control
-/// (`NoteContext.backgroundRoles`).
-pub const BACKGROUND_ROLES: &[&str] = &[
-    "AXWebArea",
-    "AXGroup",
-    "AXScrollArea",
-    "AXSplitGroup",
-    "AXLayoutArea",
-    "AXWindow",
-];
-
-/// On the desktop and in File Explorer: the items view (a list) and its panes.
-pub const SHELL_BACKGROUND_ROLES: &[&str] = &["AXList", "AXGroup", "AXWindow"];
-
-/// Top-level window classes of shell surfaces that are never empty space: the taskbars,
-/// the notification overflow, Start, search and the action center, Alt+Tab and Task View,
-/// menus and pop-ups.
-pub const SYSTEM_CLASSES: &[&str] = &[
-    "Shell_TrayWnd",
-    "Shell_SecondaryTrayWnd",
-    "NotifyIconOverflowWindow",
-    "TopLevelWindowForOverflowXamlIsland",
-    "Windows.UI.Core.CoreWindow",
-    "XamlExplorerHostIslandWindow",
-    "MultitaskingViewFrame",
-    "TaskListThumbnailWnd",
-    "ForegroundStaging",
-    "Xaml_WindowedPopupClass",
-    "#32768",
-];
 
 /// Browsers, by exe name (ASCII case-insensitive). A page in one of these is a `Web` origin.
 pub const BROWSER_EXES: &[&str] = &[
@@ -111,58 +77,43 @@ pub const BROWSER_EXES: &[&str] = &[
     "zen.exe",
 ];
 
-/// `FrameworkId` of web content.
-const WEB_FRAMEWORKS: &[&str] = &["Chrome", "Gecko", "MicrosoftEdge"];
-
 /// Page addresses kept for a `Web` origin.
 const WEB_SCHEMES: &[&str] = &["http://", "https://", "file://"];
 
 /// Exe names cached by [`AppNames`].
 const NAME_CACHE_LIMIT: usize = 64;
 
-/// Is the spot of this answer empty background?
-pub fn is_empty_space(outcome: &Outcome) -> bool {
+/// May the tool menu open at the spot of this answer?
+pub fn allows_menu(outcome: &Outcome) -> bool {
     match outcome {
-        Outcome::Found(snapshot) => is_empty_snapshot(snapshot),
-        // Our own windows, elevated windows and no answer: no pill.
-        Outcome::OwnProcess
-        | Outcome::Elevated { .. }
-        | Outcome::TimedOut { .. }
-        | Outcome::Failed(_) => false,
+        Outcome::Found(snapshot) => allows_menu_snapshot(snapshot),
+        // Our own windows and elevated windows: no menu.
+        Outcome::OwnProcess | Outcome::Elevated { .. } => false,
+        // No answer: a wrong open costs little (releasing Alt closes the menu).
+        Outcome::TimedOut { target } => !target.is_terminal,
+        Outcome::Failed(_) => true,
     }
 }
 
-/// The empty-space rule over a snapshot (see the module docs).
-pub fn is_empty_snapshot(snapshot: &Snapshot) -> bool {
-    let target = &snapshot.target;
-    if SYSTEM_CLASSES.contains(&target.class_name.as_str()) || target.is_terminal {
+/// The menu rule over a snapshot: not where text is typed (see the module docs).
+pub fn allows_menu_snapshot(snapshot: &Snapshot) -> bool {
+    if snapshot.target.is_terminal {
         return false;
     }
     let hit = &snapshot.hit;
     if editable_self_or_ancestor(hit).is_some() {
         return false;
     }
-    let mut in_page = false;
+    // A password field is no text input to `editable` (it takes no paste); it still takes
+    // typed text.
     let mut node = Some(hit.clone());
     while let Some(current) = node {
-        let e = current.element();
-        if e.password
-            || ACTIVATING_ROLES.contains(&e.role)
-            || ACTIVATING_ARIA_ROLES.contains(&e.aria_role.as_str())
-        {
+        if current.element().password {
             return false;
         }
-        in_page |= e.role == "AXWebArea" && is_web(&e.framework);
         node = current.parent();
     }
-    if is_web(&hit.element().framework) && !in_page {
-        return false;
-    }
-    let role = hit.element().role;
-    match target.shell {
-        Some(_) => SHELL_BACKGROUND_ROLES.contains(&role),
-        None => BACKGROUND_ROLES.contains(&role),
-    }
+    true
 }
 
 /// Win32 facts about the top-level window at a point.
@@ -266,10 +217,6 @@ fn page_of(hit: &UiaNode) -> Option<UiaNode> {
         node = current.parent();
     }
     found
-}
-
-fn is_web(framework: &str) -> bool {
-    WEB_FRAMEWORKS.contains(&framework)
 }
 
 pub fn is_browser(exe: &str) -> bool {
@@ -584,13 +531,13 @@ mod tests {
     }
 
     #[test]
-    fn desktop_background_is_empty_and_icons_are_not() {
+    fn the_menu_opens_on_the_desktop_and_its_icons() {
         let mut list = el(UIA_ListControlTypeId);
         list.class_name = "SysListView32".into();
         list.name = "Desktop".into();
-        assert!(is_empty_space(&desktop(list)));
+        assert!(allows_menu(&desktop(list)));
         let icon = el(UIA_ListItemControlTypeId);
-        assert!(!is_empty_space(&desktop(icon)));
+        assert!(allows_menu(&desktop(icon)));
     }
 
     #[test]
@@ -621,25 +568,44 @@ mod tests {
     }
 
     #[test]
-    fn notepad_text_menu_and_status_bar_are_not_empty() {
+    fn notepad_text_has_no_menu_but_its_menu_bar_status_bar_and_title_bar_do() {
         let mut text = el(UIA_DocumentControlTypeId);
         text.text_pattern = true;
         text.focusable = true;
         text.class_name = "RichEditD2DPT".into();
         text.hwnd = 0x55;
-        assert!(!is_empty_space(&notepad(vec![text])));
+        assert!(!allows_menu(&notepad(vec![text])));
         let menu = el(UIA_MenuItemControlTypeId);
-        assert!(!is_empty_space(&notepad(vec![
+        assert!(allows_menu(&notepad(vec![
             menu,
             el(UIA_MenuBarControlTypeId)
         ])));
         let status = el(UIA_TextControlTypeId);
-        assert!(!is_empty_space(&notepad(vec![
+        assert!(allows_menu(&notepad(vec![
             status,
             el(UIA_StatusBarControlTypeId)
         ])));
         let title = el(UIA_TitleBarControlTypeId);
-        assert!(!is_empty_space(&notepad(vec![title])));
+        assert!(allows_menu(&notepad(vec![title])));
+        assert!(allows_menu(&notepad(vec![el(UIA_ButtonControlTypeId)])));
+    }
+
+    #[test]
+    fn a_win32_edit_and_a_password_field_have_no_menu() {
+        let mut edit = el(UIA_EditControlTypeId);
+        edit.value_pattern = true;
+        edit.value_read_only = Some(false);
+        edit.focusable = true;
+        assert!(!allows_menu(&notepad(vec![edit])));
+        let mut password = el(UIA_EditControlTypeId);
+        password.password = true;
+        password.focusable = true;
+        assert!(!allows_menu(&notepad(vec![password.clone()])));
+        // Its inner text part too.
+        assert!(!allows_menu(&notepad(vec![
+            el(UIA_TextControlTypeId),
+            password
+        ])));
     }
 
     #[test]
@@ -684,45 +650,52 @@ mod tests {
     }
 
     #[test]
-    fn chrome_page_margin_is_empty_but_text_links_and_fields_are_not() {
+    fn chrome_page_text_links_and_buttons_have_the_menu_but_fields_do_not() {
         let url = "https://doc.rust-lang.org/book/";
         // The page itself (its margin), and a plain div.
-        assert!(is_empty_space(&found(
+        assert!(allows_menu(&found(
             target("chrome.exe", "Chrome_WidgetWin_1"),
             vec![page(url, "Rust Book")]
         )));
-        assert!(is_empty_space(&chrome(
-            vec![web(UIA_GroupControlTypeId)],
-            url
-        )));
-        // A paragraph's text, a link, a div with role=button, an input.
-        assert!(!is_empty_space(&chrome(
-            vec![web(UIA_TextControlTypeId)],
-            url
-        )));
-        assert!(!is_empty_space(&chrome(
+        assert!(allows_menu(&chrome(vec![web(UIA_GroupControlTypeId)], url)));
+        // A paragraph's text, a link, a div with role=button, a button.
+        assert!(allows_menu(&chrome(vec![web(UIA_TextControlTypeId)], url)));
+        assert!(allows_menu(&chrome(
             vec![web(UIA_TextControlTypeId), web(UIA_HyperlinkControlTypeId)],
             url
         )));
         let mut button = web(UIA_GroupControlTypeId);
         button.aria_role = "button".into();
-        assert!(!is_empty_space(&chrome(vec![button], url)));
+        assert!(allows_menu(&chrome(vec![button], url)));
+        assert!(allows_menu(&chrome(
+            vec![web(UIA_ButtonControlTypeId)],
+            url
+        )));
+        // An input, the text inside it, a password input.
         let mut input = web(UIA_EditControlTypeId);
         input.value_pattern = true;
         input.value_read_only = Some(false);
         input.focusable = true;
-        assert!(!is_empty_space(&chrome(vec![input], url)));
+        assert!(!allows_menu(&chrome(vec![input.clone()], url)));
+        assert!(!allows_menu(&chrome(
+            vec![web(UIA_TextControlTypeId), input],
+            url
+        )));
+        let mut password = web(UIA_EditControlTypeId);
+        password.password = true;
+        password.focusable = true;
+        assert!(!allows_menu(&chrome(vec![password], url)));
     }
 
     #[test]
-    fn chrome_tab_strip_and_title_area_are_not_empty() {
+    fn chrome_tab_strip_and_title_area_have_the_menu() {
         // Outside the page: browser chrome, even where it is a plain pane.
         let window = top(web(UIA_PaneControlTypeId));
-        assert!(!is_empty_space(&found(
+        assert!(allows_menu(&found(
             target("chrome.exe", "Chrome_WidgetWin_1"),
             vec![window.clone()]
         )));
-        assert!(!is_empty_space(&found(
+        assert!(allows_menu(&found(
             target("chrome.exe", "Chrome_WidgetWin_1"),
             vec![
                 web(UIA_PaneControlTypeId),
@@ -777,7 +750,7 @@ mod tests {
     // --- An Electron app ---
 
     #[test]
-    fn electron_app_is_an_app_with_empty_page_areas() {
+    fn electron_app_is_an_app_with_the_menu_on_its_page_and_title_bar() {
         let outcome = found(
             target("slack.exe", "Chrome_WidgetWin_1"),
             vec![
@@ -785,7 +758,7 @@ mod tests {
                 page("https://app.slack.com/client/T1/C2", "general - Slack"),
             ],
         );
-        assert!(is_empty_space(&outcome));
+        assert!(allows_menu(&outcome));
         let o = origin(
             &outcome,
             &facts(
@@ -799,12 +772,12 @@ mod tests {
         assert_eq!(o.app_name.as_deref(), Some("Slack"));
         assert_eq!(o.window_title.as_deref(), Some("general - Slack"));
         assert_eq!(o.url, None);
-        // Its own title bar (outside the page) is not empty.
+        // Its own title bar (outside the page).
         let chrome = found(
             target("Code.exe", "Chrome_WidgetWin_1"),
             vec![top(web(UIA_PaneControlTypeId))],
         );
-        assert!(!is_empty_space(&chrome));
+        assert!(allows_menu(&chrome));
     }
 
     // --- File Explorer ---
@@ -823,14 +796,14 @@ mod tests {
     }
 
     #[test]
-    fn explorer_items_background_is_empty_and_files_are_not() {
+    fn explorer_items_files_headers_and_buttons_have_the_menu() {
         let mut list = el(UIA_ListControlTypeId);
         list.class_name = "UIItemsView".into();
-        assert!(is_empty_space(&explorer(list)));
-        assert!(!is_empty_space(&explorer(el(UIA_ListItemControlTypeId))));
+        assert!(allows_menu(&explorer(list)));
+        assert!(allows_menu(&explorer(el(UIA_ListItemControlTypeId))));
         // The column header and the command bar's buttons.
-        assert!(!is_empty_space(&explorer(el(UIA_HeaderItemControlTypeId))));
-        assert!(!is_empty_space(&explorer(el(UIA_ButtonControlTypeId))));
+        assert!(allows_menu(&explorer(el(UIA_HeaderItemControlTypeId))));
+        assert!(allows_menu(&explorer(el(UIA_ButtonControlTypeId))));
     }
 
     #[test]
@@ -853,9 +826,9 @@ mod tests {
     // --- Elevated, own, no answer, system surfaces ---
 
     #[test]
-    fn an_elevated_window_is_never_empty_but_still_has_an_origin() {
+    fn an_elevated_window_has_no_menu_but_still_has_an_origin() {
         let outcome = Outcome::Elevated { pid: 7 };
-        assert!(!is_empty_space(&outcome));
+        assert!(!allows_menu(&outcome));
         let o = origin(
             &outcome,
             &facts(
@@ -871,11 +844,15 @@ mod tests {
     }
 
     #[test]
-    fn own_windows_and_missing_answers_are_not_empty() {
-        assert!(!is_empty_space(&Outcome::OwnProcess));
-        assert!(!is_empty_space(&Outcome::Failed("x".into())));
-        assert!(!is_empty_space(&Outcome::TimedOut {
+    fn own_windows_have_no_menu_and_missing_answers_have_it() {
+        assert!(!allows_menu(&Outcome::OwnProcess));
+        assert!(allows_menu(&Outcome::Failed("x".into())));
+        assert!(allows_menu(&Outcome::TimedOut {
             target: target("chrome.exe", "Chrome_WidgetWin_1")
+        }));
+        // Unless the window is known to be a terminal.
+        assert!(!allows_menu(&Outcome::TimedOut {
+            target: target("WindowsTerminal.exe", "CASCADIA_HOSTING_WINDOW_CLASS")
         }));
         assert_eq!(
             origin(&Outcome::OwnProcess, &WindowFacts::default()),
@@ -889,26 +866,26 @@ mod tests {
     }
 
     #[test]
-    fn taskbar_and_terminals_are_not_empty() {
+    fn the_taskbar_has_the_menu_and_terminals_do_not() {
         let taskbar = found(
             target("explorer.exe", "Shell_TrayWnd"),
             vec![top(el(UIA_PaneControlTypeId))],
         );
-        assert!(!is_empty_space(&taskbar));
+        assert!(allows_menu(&taskbar));
         let terminal = found(
             target("WindowsTerminal.exe", "CASCADIA_HOSTING_WINDOW_CLASS"),
             vec![el(UIA_PaneControlTypeId), top(el(UIA_WindowControlTypeId))],
         );
-        assert!(!is_empty_space(&terminal));
+        assert!(!allows_menu(&terminal));
     }
 
     #[test]
-    fn a_dialog_background_is_empty() {
+    fn a_dialog_background_has_the_menu() {
         let outcome = found(
             target("app.exe", "#32770"),
             vec![top(el(UIA_WindowControlTypeId))],
         );
-        assert!(is_empty_space(&outcome));
+        assert!(allows_menu(&outcome));
     }
 
     #[test]

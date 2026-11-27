@@ -54,7 +54,7 @@ const SCREENSHOTS: &str = "fairy.screenshots";
 const NOTES: &str = "fairy.notes";
 const RECORDING: &str = crate::recording::feature::CAPABILITY;
 /// Parts of a capability's key line drawn as plain text, not as key chips.
-const PLAIN_WORDS: &[&str] = &["or", "Hold", "and click on empty space"];
+const PLAIN_WORDS: &[&str] = &["or", "Hold", "and click"];
 const CLASS: PCWSTR = w!("IgorioSettings");
 const OPEN: u32 = WM_APP + 1;
 const PICK: u32 = WM_APP + 2;
@@ -981,7 +981,7 @@ const ITEMS: &[Item] = &[
     item(KeepTitle, Kind::Title, "Keep every screenshot", [36, 156, 412, 24]),
     item(Keep, Kind::Switch, "Keep every screenshot", [458, 154, 50, 28]),
     item(NotesTitle, Kind::Title, "Notes", [24, 195, 45, 22]),
-    item(NotesKeys, Kind::Keys, "Hold|Alt|and click on empty space", [75, 196, 367, 20]),
+    item(NotesKeys, Kind::Keys, "Hold|Alt|and click", [75, 196, 367, 20]),
     item(Notes, Kind::Switch, "Notes", [470, 192, 50, 28]),
     item(
         NotesDetail,
@@ -1497,7 +1497,7 @@ impl Item {
         }
         match self.id {
             ScreenshotKeys => "Windows plus Shift plus S, or Print Screen",
-            NotesKeys => "Hold Alt and click on empty space",
+            NotesKeys => "Hold Alt and click",
             // Replaced by `recording_keys_name` at the first refresh.
             RecordingKeys => "Recording shortcuts",
             _ => self.text,
