@@ -223,7 +223,8 @@ compare it with what the user is working on.
   corners and shadow like a note. It shows at the card's natural size, made smaller to fit 40%
   of the work area, with a short grow-in (none with reduced motion), and never takes the
   foreground when it appears.
-- Drag moves it, the wheel resizes it around the cursor (64 DIPs to the monitor), Ctrl+wheel
+- Drag moves it, the wheel zooms it smoothly around the cursor (64 DIPs to the monitor; at
+  once with reduced motion), Ctrl+wheel
   changes its opacity (30% to 100%). Hovered, it shows a close button; Esc closes it while
   hovered or focused. A right-click opens a native menu: Carry again, Copy, Save as PNG…
   (starts in the captures folder), Close.
