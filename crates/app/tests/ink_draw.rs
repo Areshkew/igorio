@@ -433,3 +433,43 @@ fn cursors_are_drawn_at_the_requested_scale() {
     assert!(alpha(&highlighter, 6, 13) > 150);
     assert_premultiplied(&pen2);
 }
+
+#[test]
+fn growing_strokes_at_two_x_with_fast_flicks_match_a_fresh_render() {
+    // Partial frames repaint only the changed rectangle; at 2x and with long jumps between
+    // points the outline's curves are long, which is where a clipped repaint could differ.
+    for tool in [InkTool::Pen, InkTool::Highlighter] {
+        let mut ink = Ink::new();
+        add_stroke(&mut ink, InkTool::Pen, &line(20.0, 30.0, 380.0, 30.0, 4.0));
+        add_stroke(
+            &mut ink,
+            InkTool::Highlighter,
+            &line(20.0, 170.0, 380.0, 150.0, 4.0),
+        );
+        take(&mut ink, tool);
+        ink.begin_stroke(Point::new(30.0, 100.0));
+        let mut renderer = InkRenderer::new();
+        let mut pixmap = Pixmap::new(800, 400).expect("pixmap");
+        for i in 1..=40 {
+            let step = if i % 7 == 0 { 25.0 } else { 6.0 };
+            let last = ink
+                .current()
+                .expect("stroke")
+                .points()
+                .last()
+                .copied()
+                .expect("point");
+            ink.extend_stroke(Point::new(
+                (last.x + step).min(390.0),
+                100.0 + (i as f64 / 3.0).sin() * 60.0,
+            ));
+            renderer.render(&ink, 2.0, 1.0, &mut pixmap);
+            if i % 8 == 0 {
+                assert_same(&pixmap, &render(&ink, 2.0, 1.0, 800, 400), 0);
+            }
+        }
+        ink.end_stroke();
+        renderer.render(&ink, 2.0, 1.0, &mut pixmap);
+        assert_same(&pixmap, &render(&ink, 2.0, 1.0, 800, 400), 0);
+    }
+}

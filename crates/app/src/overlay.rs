@@ -50,7 +50,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HTTRANSPARENT, HWND_TOPMOST, IsWindowVisible, MA_NOACTIVATE, RegisterClassW, SM_CXSCREEN,
     SM_CYSCREEN, SPI_SETWORKAREA, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
     SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowDisplayAffinity, SetWindowPos,
-    ULW_ALPHA, UPDATE_LAYERED_WINDOW_FLAGS, UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_DISPLAYCHANGE,
+    ULW_ALPHA, UPDATE_LAYERED_WINDOW_FLAGS, UPDATELAYEREDWINDOWINFO, UpdateLayeredWindow,
+    UpdateLayeredWindowIndirect, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -318,6 +319,192 @@ pub fn monitor_at(point: Point) -> MonitorInfo {
     }
 }
 
+/// A monitor's full rectangle, its work area and its DPI scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MonitorBounds {
+    /// The whole monitor, physical pixels, top-left origin (`rcMonitor`).
+    pub bounds: Rect,
+    /// The part not covered by the taskbar and docked bars (`rcWork`).
+    pub work_area: Rect,
+    /// Effective DPI / 96.
+    pub scale: f64,
+}
+
+/// The monitor nearest to `point` (physical px), with its full rectangle.
+pub fn monitor_bounds_at(point: Point) -> MonitorBounds {
+    let at = POINT {
+        x: point.x.round() as i32,
+        y: point.y.round() as i32,
+    };
+    // SAFETY: plain value arguments; `MONITOR_DEFAULTTONEAREST` always returns a monitor.
+    let monitor = unsafe { MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let rect = |r: RECT| {
+        Rect::new(
+            f64::from(r.left),
+            f64::from(r.top),
+            f64::from(r.right - r.left),
+            f64::from(r.bottom - r.top),
+        )
+    };
+    // SAFETY: `info` is a local with `cbSize` set.
+    if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        let scale = monitor_at(point).scale;
+        MonitorBounds {
+            bounds: rect(info.rcMonitor),
+            work_area: rect(info.rcWork),
+            scale,
+        }
+    } else {
+        let fallback = monitor_at(point);
+        MonitorBounds {
+            bounds: fallback.work_area,
+            work_area: fallback.work_area,
+            scale: fallback.scale,
+        }
+    }
+}
+
+/// The cached DIB behind a layered window that has its own window procedure (the overlay's
+/// `present` is for the overlay's own window). Presents a whole pixmap, or only a dirty
+/// rectangle of it with `UpdateLayeredWindowIndirect` and `prcDirty`: only that rectangle is
+/// converted into the DIB and handed to the compositor, which is what keeps a monitor-sized
+/// window cheap to update.
+pub struct LayeredSurface {
+    surface: Surface,
+    /// Whether the DIB holds the alpha floor (see [`present`](Self::present)).
+    floor: bool,
+}
+
+impl LayeredSurface {
+    pub fn new() -> Result<LayeredSurface> {
+        Ok(LayeredSurface {
+            surface: Surface::new()?,
+            floor: false,
+        })
+    }
+
+    /// Copies `pixmap` (premultiplied RGBA) into the DIB and updates `hwnd`'s content at
+    /// `origin` with the constant `alpha` (255: as drawn). With `dirty` (`x, y, w, h`), only
+    /// that rectangle is copied and presented; the rest of the window keeps what it showed.
+    /// A size change, or a change of `floor`, presents the whole pixmap.
+    ///
+    /// `floor`: pixels with alpha 0 are written as black at alpha 1 (one 255th: no visible
+    /// change). A layered window lets the mouse through wherever its alpha is 0, so a window
+    /// that must take the mouse everywhere needs the floor.
+    pub fn present(
+        &mut self,
+        hwnd: HWND,
+        pixmap: &Pixmap,
+        origin: (i32, i32),
+        dirty: Option<(u32, u32, u32, u32)>,
+        floor: bool,
+        alpha: u8,
+    ) -> Result<()> {
+        let size = SIZE {
+            cx: pixmap.width() as i32,
+            cy: pixmap.height() as i32,
+        };
+        let whole =
+            size != self.surface.size || self.surface.bitmap.is_invalid() || floor != self.floor;
+        self.surface.resize(size)?;
+        self.floor = floor;
+        let (x, y, w, h) = match dirty {
+            Some(rect) if !whole => rect,
+            _ => (0, 0, pixmap.width(), pixmap.height()),
+        };
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+        let stride = pixmap.width() as usize * 4;
+        let src = pixmap.data();
+        let dst = self.surface.pixels();
+        for row in y as usize..(y + h) as usize {
+            let start = row * stride + x as usize * 4;
+            let end = start + w as usize * 4;
+            copy_rgba_to_bgra_floor(&src[start..end], &mut dst[start..end], floor);
+        }
+        let dirty = RECT {
+            left: x as i32,
+            top: y as i32,
+            right: (x + w) as i32,
+            bottom: (y + h) as i32,
+        };
+        self.update(hwnd, origin, size, alpha, &dirty)
+    }
+
+    /// Changes only the window's constant alpha (a fade), re-sending one pixel.
+    pub fn set_alpha(&mut self, hwnd: HWND, origin: (i32, i32), alpha: u8) -> Result<()> {
+        let size = self.surface.size;
+        if size.cx <= 0 || size.cy <= 0 {
+            return Ok(());
+        }
+        let one = RECT {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        };
+        self.update(hwnd, origin, size, alpha, &one)
+    }
+
+    fn update(
+        &self,
+        hwnd: HWND,
+        origin: (i32, i32),
+        size: SIZE,
+        alpha: u8,
+        dirty: &RECT,
+    ) -> Result<()> {
+        let origin = POINT {
+            x: origin.0,
+            y: origin.1,
+        };
+        let source = POINT::default();
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: alpha,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let info = UPDATELAYEREDWINDOWINFO {
+            cbSize: size_of::<UPDATELAYEREDWINDOWINFO>() as u32,
+            hdcDst: HDC::default(),
+            pptDst: &origin,
+            psize: &size,
+            hdcSrc: self.surface.dc,
+            pptSrc: &source,
+            crKey: COLORREF(0),
+            pblend: &blend,
+            dwFlags: ULW_ALPHA,
+            prcDirty: dirty,
+        };
+        // SAFETY: every pointer in `info` is to a local or to `dirty`, all alive for the call;
+        // the memory DC holds the DIB of exactly `size`.
+        unsafe { UpdateLayeredWindowIndirect(hwnd, &info) }.ok()
+    }
+}
+
+/// [`copy_rgba_to_bgra`] that also writes alpha-0 pixels as black at alpha 1 when `floor`.
+fn copy_rgba_to_bgra_floor(src: &[u8], dst: &mut [u8], floor: bool) {
+    if !floor {
+        copy_rgba_to_bgra(src, dst);
+        return;
+    }
+    for (s, d) in src.as_chunks::<4>().0.iter().zip(dst.as_chunks_mut::<4>().0) {
+        let rgba = u32::from_le_bytes(*s);
+        let bgra = if rgba >> 24 == 0 {
+            0x0100_0000
+        } else {
+            (rgba & 0xFF00_FF00) | ((rgba & 0xFF) << 16) | ((rgba >> 16) & 0xFF)
+        };
+        *d = bgra.to_le_bytes();
+    }
+}
+
 /// Sets Per-Monitor V2 awareness for the process if nothing set it yet; never fails.
 /// The release build sets it in the manifest, and then this call does nothing. Call it
 /// before creating any window.
@@ -482,5 +669,15 @@ mod tests {
         let mut dst = [0; 8];
         copy_rgba_to_bgra(&src, &mut dst);
         assert_eq!(dst, [30, 20, 10, 40, 3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn the_floor_turns_only_transparent_pixels_into_faint_black() {
+        let src = [0, 0, 0, 0, 10, 20, 30, 40];
+        let mut dst = [9; 8];
+        copy_rgba_to_bgra_floor(&src, &mut dst, true);
+        assert_eq!(dst, [0, 0, 0, 1, 30, 20, 10, 40]);
+        copy_rgba_to_bgra_floor(&src, &mut dst, false);
+        assert_eq!(dst, [0, 0, 0, 0, 30, 20, 10, 40]);
     }
 }
