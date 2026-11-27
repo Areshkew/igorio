@@ -620,3 +620,404 @@ fn styles_twenty_thousand_characters() {
         spans.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Blocks and live editing. Cases are written with `|` for the caret and `«…»` for a selection.
+// ---------------------------------------------------------------------------
+
+mod live {
+    use std::ops::Range;
+
+    use igorio_app::notes::markdown::{
+        Block, BlockCommand, Change, Inline, SlashItem, apply_slash, backspace, blocks,
+        change_between, enter, image_target, indent, link_at, list_numbers, paste, renumber,
+        set_block, slash_matches, slash_query, toggle_inline, toggle_link, toggle_todo,
+        type_char, word_at,
+    };
+
+    /// Text and selection from a case string.
+    fn parse(case: &str) -> (String, Range<usize>) {
+        if let Some(at) = case.find('|') {
+            return (case.replacen('|', "", 1), at..at);
+        }
+        let start = case.find('«').expect("caret or selection");
+        let text = case.replacen('«', "", 1);
+        let end = text.find('»').expect("selection end");
+        (text.replacen('»', "", 1), start..end)
+    }
+
+    /// The case string of a text and selection.
+    fn show(text: &str, sel: Range<usize>) -> String {
+        if sel.is_empty() {
+            format!("{}|{}", &text[..sel.start], &text[sel.start..])
+        } else {
+            format!("{}«{}»{}", &text[..sel.start], &text[sel.clone()], &text[sel.end..])
+        }
+    }
+
+    type Case<'a> = (&'a str, Option<&'a str>);
+
+    fn table(cases: &[Case<'_>], edit: impl Fn(&str, Range<usize>) -> Option<Change>) {
+        for (case, expected) in cases {
+            let (text, sel) = parse(case);
+            let got = edit(&text, sel).map(|change| show(&change.apply(&text), change.selection));
+            assert_eq!(got.as_deref(), *expected, "case {case:?}");
+        }
+    }
+
+    #[test]
+    fn blocks_classify_each_line() {
+        let text = "# Title\n## Two\n#### four\n- a\n  * b\n1. one\n10) ten\n- [ ] todo\n- [x] done\n> quote\n---\n***\n![s](attachments/a.png)\n```\n# not a heading\n```\nplain\n#tag";
+        let kinds: Vec<Block> = blocks(text).iter().map(|line| line.block).collect();
+        assert_eq!(
+            kinds,
+            [
+                Block::Heading(1),
+                Block::Heading(2),
+                Block::Paragraph,
+                Block::Bullet,
+                Block::Bullet,
+                Block::Numbered(1),
+                Block::Numbered(10),
+                Block::Todo(false),
+                Block::Todo(true),
+                Block::Quote,
+                Block::Divider,
+                Block::Divider,
+                Block::Image,
+                Block::Fence,
+                Block::Code,
+                Block::Fence,
+                Block::Paragraph,
+                Block::Paragraph,
+            ]
+        );
+        let depths: Vec<u8> = blocks("- a\n  - b\n    - c\n  - d\ntext\n  - e")
+            .iter()
+            .map(|line| line.depth)
+            .collect();
+        assert_eq!(depths, [0, 1, 2, 1, 0, 0]);
+        let todo = &blocks("  - [ ] task")[0];
+        assert_eq!((todo.indent, todo.content), (2, 8));
+        // "# " with nothing after it is already a heading (the Notion shortcut).
+        assert_eq!(blocks("# ")[0].block, Block::Heading(1));
+        assert_eq!(blocks("")[0].range, 0..0);
+        assert_eq!(blocks("a\n").len(), 2);
+    }
+
+    #[test]
+    fn images_and_links_are_found() {
+        assert_eq!(
+            image_target("![screenshot](attachments/shot-1.png)"),
+            Some("attachments/shot-1.png")
+        );
+        assert_eq!(image_target("see ![s](a.png)"), None);
+        let text = "go [home](https://a.example) or https://b.example now ![x](c.png)";
+        assert_eq!(link_at(text, 5).as_deref(), Some("https://a.example"));
+        assert_eq!(link_at(text, 35).as_deref(), Some("https://b.example"));
+        assert_eq!(link_at(text, 0), None);
+        assert_eq!(link_at(text, text.len() - 3), None);
+    }
+
+    #[test]
+    fn enter_follows_notion() {
+        table(
+            &[
+                ("- one|", Some("- one\n- |")),
+                ("* one|", Some("* one\n* |")),
+                ("- [x] done|", Some("- [x] done\n- [ ] |")),
+                ("1. a|\n2. b", Some("1. a\n2. |\n3. b")),
+                ("3) a|", Some("3) a\n4) |")),
+                ("> said|", Some("> said\n> |")),
+                ("  - nested|", Some("  - nested\n  - |")),
+                // The text after the caret moves to the new item.
+                ("- ab|cd", Some("- ab\n- |cd")),
+                // An empty item leaves the list; a nested one moves out a level first.
+                ("- a\n- |", Some("- a\n|")),
+                ("- a\n  - |", Some("- a\n- |")),
+                ("- [ ] |", Some("|")),
+                ("> |", Some("|")),
+                // A list split by text keeps its written numbers (valid Markdown: "3." starts
+                // a list at 3); the editor draws the same numbers.
+                ("1. a\n2. |\n3. c", Some("1. a\n|\n3. c")),
+                // Headings, text and code take the control's plain line break.
+                ("# Title|", None),
+                ("text|", None),
+                ("```\ncode|\n```", None),
+                ("«- a»", None),
+                ("|- a", None),
+            ],
+            enter,
+        );
+    }
+
+    #[test]
+    fn backspace_at_a_block_start_makes_text() {
+        table(
+            &[
+                ("# |Title", Some("|Title")),
+                ("## |", Some("|")),
+                ("- |item", Some("|item")),
+                ("  - [x] |done", Some("|done")),
+                ("> |quote", Some("|quote")),
+                ("1. a\n2. |b\n3. c", Some("1. a\n|b\n3. c")),
+                ("- i|tem", None),
+                ("|plain", None),
+                ("pl|ain", None),
+                ("« »- x", None),
+            ],
+            backspace,
+        );
+    }
+
+    #[test]
+    fn tab_nests_and_shift_tab_unnests() {
+        table(
+            &[
+                ("- a\n- b|", Some("- a\n  - b|")),
+                ("1. a\n2. b|", Some("1. a\n   1. b|")),
+                ("- [ ] a\n- [ ] b|", Some("- [ ] a\n  - [ ] b|")),
+                // The first item has nothing to nest under: handled, unchanged.
+                ("- a|", Some("- a|")),
+                ("- a\n«- b\n- c»", Some("- a\n  «- b\n  - c»")),
+                ("text|", None),
+            ],
+            |text, sel| indent(text, sel, false),
+        );
+        table(
+            &[
+                ("- a\n  - b|", Some("- a\n- b|")),
+                ("1. a\n2. b\n   1. c|", Some("1. a\n2. b\n3. c|")),
+                ("- a|", Some("- a|")),
+                ("text|", None),
+            ],
+            |text, sel| indent(text, sel, true),
+        );
+    }
+
+    #[test]
+    fn numbered_lists_count_again() {
+        assert_eq!(renumber("1. a\n1. b\n1. c"), "1. a\n2. b\n3. c");
+        assert_eq!(renumber("3. a\n9. b"), "3. a\n4. b");
+        assert_eq!(
+            renumber("1. a\n   1. x\n   5. y\n2. b"),
+            "1. a\n   1. x\n   2. y\n2. b"
+        );
+        assert_eq!(renumber("1. a\n\n5. b"), "1. a\n\n5. b");
+        assert_eq!(renumber("1) a\n7) b"), "1) a\n2) b");
+        assert_eq!(
+            list_numbers("- x\n1. a\n1. b\ntext"),
+            [None, Some(1), Some(2), None]
+        );
+    }
+
+    #[test]
+    fn typed_shortcuts_rewrite_text() {
+        let typing = |ch: char| move |text: &str, sel: Range<usize>| type_char(text, sel, ch);
+        table(
+            &[
+                ("[]|", Some("- [ ] |")),
+                ("[ ]|", Some("- [ ] |")),
+                ("a\n[x]|", Some("a\n- [x] |")),
+                ("x[]|", None),
+                ("```\n[]|\n```", None),
+            ],
+            typing(' '),
+        );
+        table(
+            &[("``|", Some("```\n|\n```")), ("``|x", None), ("a``|", None)],
+            typing('`'),
+        );
+        table(
+            &[("--|", Some("---\n|")), ("--|x", None), ("- -|", None)],
+            typing('-'),
+        );
+        table(&[("# |", None), ("- |", None)], typing('x'));
+    }
+
+    #[test]
+    fn formatting_keys_toggle() {
+        let key = |mark: Inline| {
+            move |text: &str, sel: Range<usize>| Some(toggle_inline(text, sel, mark))
+        };
+        table(
+            &[
+                ("a «word» b", Some("a **«word»** b")),
+                ("a **«word»** b", Some("a «word» b")),
+                ("a «**word**» b", Some("a «word» b")),
+                ("wo|rd", Some("**wo|rd**")),
+                ("**wo|rd**", Some("wo|rd")),
+                ("a | b", Some("a **|** b")),
+                ("«one\ntwo»", Some("**«one**\n**two»**")),
+                ("*«it»*", Some("***«it»***")),
+            ],
+            key(Inline::Bold),
+        );
+        table(
+            &[
+                ("«word»", Some("*«word»*")),
+                ("*«word»*", Some("«word»")),
+                // Bold is not italic: Ctrl+I on bold text adds italic.
+                ("**«word»**", Some("***«word»***")),
+                ("***«word»***", Some("**«word»**")),
+            ],
+            key(Inline::Italic),
+        );
+        table(
+            &[("«x»", Some("`«x»`")), ("`«x»`", Some("«x»"))],
+            key(Inline::Code),
+        );
+        table(
+            &[("«x»", Some("~~«x»~~")), ("~~«x»~~", Some("«x»"))],
+            key(Inline::Strike),
+        );
+    }
+
+    #[test]
+    fn link_key_wraps_and_unwraps() {
+        table(
+            &[
+                ("see «docs» now", Some("see [docs](|) now")),
+                ("do|cs", Some("[docs](|)")),
+                ("a | b", Some("a [|]() b")),
+                ("[d|ocs](https://x.example)", Some("«docs»")),
+            ],
+            |text, sel| Some(toggle_link(text, sel)),
+        );
+    }
+
+    #[test]
+    fn block_keys_set_and_toggle() {
+        let key = |command: BlockCommand| {
+            move |text: &str, sel: Range<usize>| Some(set_block(text, sel, command))
+        };
+        table(
+            &[
+                ("ti|tle", Some("# ti|tle")),
+                ("# ti|tle", Some("ti|tle")),
+                ("## ti|tle", Some("# ti|tle")),
+                ("- it|em", Some("# it|em")),
+            ],
+            key(BlockCommand::Heading(1)),
+        );
+        table(
+            &[
+                // The selection keeps covering the words, after the new markers.
+                ("«a\nb»", Some("- «a\n- b»")),
+                ("- |a", Some("|a")),
+                ("1. |a", Some("- |a")),
+            ],
+            key(BlockCommand::Bullet),
+        );
+        table(
+            &[("«a\nb\nc»", Some("1. «a\n2. b\n3. c»"))],
+            key(BlockCommand::Numbered),
+        );
+        table(
+            &[
+                ("buy| milk", Some("- [ ] buy| milk")),
+                ("- [x] |x", Some("|x")),
+            ],
+            key(BlockCommand::Todo),
+        );
+        table(
+            &[("> |q", Some("|q")), ("|q", Some("> |q"))],
+            key(BlockCommand::Quote),
+        );
+        table(
+            &[("# |T", Some("|T")), ("- |x", Some("|x"))],
+            key(BlockCommand::Text),
+        );
+        table(
+            &[
+                ("|", Some("```\n|\n```")),
+                ("«a\nb»", Some("```\n«a\nb»\n```")),
+            ],
+            key(BlockCommand::Code),
+        );
+        table(
+            &[
+                ("|", Some("---\n|")),
+                ("te|xt", Some("text\n***\n|")),
+                ("# H|", Some("# H\n---\n|")),
+            ],
+            key(BlockCommand::Divider),
+        );
+    }
+
+    #[test]
+    fn todos_toggle_in_place() {
+        table(
+            &[
+                ("- [ ] a|", Some("- [x] a|")),
+                ("- [x] a|", Some("- [ ] a|")),
+                ("  * [X] |b", Some("  * [ ] |b")),
+                ("- a|", None),
+            ],
+            |text, sel| toggle_todo(text, sel.start, sel),
+        );
+    }
+
+    #[test]
+    fn slash_menu_finds_filters_and_applies() {
+        assert_eq!(slash_query("/he", 3), Some((0..3, "he")));
+        assert_eq!(slash_query("word /h", 7), Some((5..7, "h")));
+        assert_eq!(slash_query("- /to", 5), Some((2..5, "to")));
+        assert_eq!(slash_query("a/b", 3), None);
+        assert_eq!(slash_query("/a b", 4), None);
+        assert_eq!(slash_query("```\n/x\n```", 6), None);
+        assert_eq!(slash_matches("").len(), 10);
+        assert_eq!(
+            slash_matches("he"),
+            [SlashItem::Heading1, SlashItem::Heading2, SlashItem::Heading3]
+        );
+        assert_eq!(slash_matches("LIST"), [SlashItem::Bullet, SlashItem::Numbered]);
+        assert_eq!(slash_matches("h2"), [SlashItem::Heading2]);
+        assert_eq!(slash_matches("to"), [SlashItem::Todo]);
+        assert_eq!(slash_matches("zzz"), []);
+        let pick = |item: SlashItem| {
+            move |text: &str, sel: Range<usize>| {
+                let (range, _) = slash_query(text, sel.start)?;
+                Some(apply_slash(text, range, item))
+            }
+        };
+        table(
+            &[("/he|", Some("# |")), ("idea /h1|", Some("# idea |"))],
+            pick(SlashItem::Heading1),
+        );
+        table(&[("/to|", Some("- [ ] |"))], pick(SlashItem::Todo));
+        table(&[("- a /|", Some("- a |"))], pick(SlashItem::Bullet));
+        table(&[("/co|", Some("```\n|\n```"))], pick(SlashItem::Code));
+        table(&[("/div|", Some("---\n|"))], pick(SlashItem::Divider));
+        table(&[("# x /t|", Some("x |"))], pick(SlashItem::Text));
+    }
+
+    #[test]
+    fn paste_is_plain_and_links_selections() {
+        let pasting = |pasted: &'static str| {
+            move |text: &str, sel: Range<usize>| Some(paste(text, sel, pasted))
+        };
+        table(
+            &[
+                ("see «docs»", Some("see [docs](https://x.example)|")),
+                ("a |", Some("a https://x.example|")),
+                ("«two\nlines»", Some("https://x.example|")),
+            ],
+            pasting("https://x.example"),
+        );
+        table(&[("|", Some("a\nb\nc|"))], pasting("a\r\nb\rc"));
+    }
+
+    #[test]
+    fn small_helpers() {
+        assert_eq!(word_at("one two", 5), 4..7);
+        assert_eq!(word_at("one two", 3), 0..3);
+        assert_eq!(word_at("a  b", 2), 2..2);
+        assert_eq!(word_at("héllo", 3), 0..6);
+        let change = change_between("abc", "aXc", 2..2);
+        assert_eq!((change.range, change.text.as_str()), (1..2, "X"));
+        let change = change_between("aaa", "aaaa", 4..4);
+        assert_eq!((change.range, change.text.as_str()), (3..3, "a"));
+        assert_eq!(change_between("é", "è", 0..0).apply("é"), "è");
+    }
+}
