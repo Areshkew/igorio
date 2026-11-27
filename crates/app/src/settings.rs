@@ -20,6 +20,7 @@ use windows::Win32::UI::Shell::{
 };
 
 use crate::layout::CardSize;
+use crate::notes::summoner::ToolMenu;
 use crate::shortcuts::Shortcuts;
 
 /// Sub-folder of Documents where notes are kept by default.
@@ -44,6 +45,9 @@ pub struct Settings {
     /// Action id -> chord text or null. Read leniently: a bad entry gives that action its
     /// default and leaves the rest alone (see `Shortcuts::from_json`).
     pub shortcuts: Shortcuts,
+    /// The tools of the Alt tool menu in the user's order, each shown or hidden. Read
+    /// leniently: missing gives the default order, all shown (see `ToolMenu::from_json`).
+    pub tool_menu: ToolMenu,
     /// How many recordings showed the "Hold Alt and scroll to zoom" hint; it shows while
     /// this is below `recording::feature::START_HINT_RECORDINGS`. Missing: 0. To see the hint
     /// again, set it to 0 or delete it in settings.json.
@@ -287,5 +291,25 @@ mod tests {
         writable_folder(&folder).unwrap();
         assert!(fs::read_dir(&folder).unwrap().next().is_none());
         fs::remove_dir(folder).unwrap();
+    }
+
+    #[test]
+    fn the_tool_menu_list_is_read_leniently_and_never_spoils_the_file() {
+        use crate::notes::summoner::{MenuEntry, ToolId};
+        let read = |text: &str| serde_json::from_str::<Settings>(text).unwrap();
+        assert_eq!(read(r#"{"launch_at_login": true}"#).tool_menu, ToolMenu::default());
+        let bad = read(r#"{"tool_menu": {"id": "note"}, "launch_at_login": true}"#);
+        assert!(bad.launch_at_login && bad.tool_menu == ToolMenu::default());
+        let partial = read(r#"{"tool_menu": [{"id": "record", "shown": false}, {"id": "spell"}]}"#);
+        assert_eq!(
+            partial.tool_menu.entries(),
+            &[
+                MenuEntry { tool: ToolId::RecordScreen, shown: false },
+                MenuEntry { tool: ToolId::NewNote, shown: true },
+            ]
+        );
+        let json = serde_json::to_value(&partial).unwrap();
+        assert_eq!(json["tool_menu"], serde_json::json!([{"id": "record", "shown": false}, {"id": "note", "shown": true}]));
+        assert_eq!(serde_json::from_value::<Settings>(json).unwrap(), partial);
     }
 }

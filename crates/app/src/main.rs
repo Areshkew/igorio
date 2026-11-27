@@ -675,6 +675,7 @@ impl NotesFeature {
         if let Some(running) = &mut self.active {
             if let Some(summoner) = &mut running.summoner {
                 summoner.set_shortcuts(&settings.shortcuts);
+                summoner.set_tool_menu(settings.tool_menu);
             }
             if running.chosen != settings.notes_folder {
                 // Rare and asked for: the folder check runs here.

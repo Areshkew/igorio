@@ -12,10 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use igorio_core::geom::Point;
 use igorio_kit::theme;
+use tiny_skia::{Pixmap, PixmapPaint, Transform};
 use windows::Win32::Foundation::{
     COLORREF, CloseHandle, ERROR_CANCELLED, ERROR_CLASS_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
-    HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM,
+    HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::*;
@@ -30,8 +32,8 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObj
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetFocus, IsWindowEnabled, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VK_MENU, VK_RETURN, VK_TAB,
+    EnableWindow, GetActiveWindow, GetFocus, IsWindowEnabled, ReleaseCapture, SetCapture, SetFocus,
+    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_DOWN, VK_MENU, VK_RETURN, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     DefSubclassProc, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog,
@@ -43,6 +45,7 @@ use windows::core::{Error, HRESULT, PCWSTR, Result, w};
 
 use crate::input::Held;
 use crate::layout::CardSize;
+use crate::notes::summoner::{self, TOOL_COUNT, TOOLS, ToolId};
 use crate::overlay::{cursor_pos, monitor_at};
 use crate::settings::{DefaultFolders, Settings};
 use crate::shortcuts::{
@@ -215,6 +218,8 @@ pub struct TestMode {
     pub dark: bool,
     pub dpi: u32,
     pub run_suffix: u32,
+    /// Open on the monitor of this point (physical pixels) instead of the cursor's.
+    pub at: Option<(i32, i32)>,
 }
 
 impl TestMode {
@@ -660,8 +665,9 @@ impl Window<'_> {
                 from + FOCUS_MS
             }
             n if n == TestScene::PageSlide as usize => {
-                let to = if self.page.get() == Page::Shortcuts { 1.0 } else { 0.0 };
-                motion.page.retarget(1.0 - to, from, 0.0);
+                // From the tab before (General comes from Shortcuts).
+                let to = self.page.get() as usize as f64;
+                motion.page.retarget(if to == 0.0 { 1.0 } else { to - 1.0 }, from, 0.0);
                 motion.page.retarget(to, from, PAGE_MS);
                 motion.content.retarget(0.0, from, 0.0);
                 motion.content.retarget(1.0, from, PAGE_MS);
@@ -950,6 +956,15 @@ pub enum Control {
     HighlighterRecorder,
     HighlighterReset,
     HighlighterStatus,
+    ToolMenuTab,
+    ToolMenuTitle,
+    ToolMenuDetail,
+    ToolMenuHint,
+    ToolMenuEmpty,
+    ToolRow0,
+    ToolSwitch0,
+    ToolRow1,
+    ToolSwitch1,
 }
 
 use Control::*;
@@ -967,6 +982,8 @@ enum Kind {
     Preview,
     Status,
     Recorder,
+    /// A row of the tool menu list: dragged, or moved with Alt+Up and Alt+Down.
+    ToolRow,
 }
 
 #[derive(Clone, Copy)]
@@ -986,7 +1003,7 @@ const WIDTH: i32 = 544;
 /// the status row showing, and fits the work area of 1366x768 at 100% and 1920x1080 at 150%.
 const HEIGHT: i32 = 630;
 const STATUS_HEIGHT: i32 = 34;
-const PAGE_SWITCH: [i32; 4] = [24, 12, 214, 32];
+const PAGE_SWITCH: [i32; 4] = [24, 12, 321, 32];
 /// Everything below the page switch, which moves when the page changes.
 const CONTENT: [i32; 4] = [0, 48, WIDTH, HEIGHT - 48];
 const KEEP_PATCH: [i32; 4] = [24, 150, 496, 36];
@@ -995,6 +1012,7 @@ const CARD_PATCH: [i32; 4] = [24, 437, 496, 72];
 const ITEMS: &[Item] = &[
     item(GeneralTab, Kind::Radio, "General", [24, 12, 107, 32]),
     item(ShortcutsTab, Kind::Radio, "Shortcuts", [131, 12, 107, 32]),
+    item(ToolMenuTab, Kind::Radio, "Tool menu", [238, 12, 107, 32]),
     item(Capabilities, Kind::Heading, "Capabilities", [24, 54, 496, 22]),
     item(ScreenshotsTitle, Kind::Title, "Screenshots", [24, 83, 92, 22]),
     item(Screenshots, Kind::Switch, "Screenshots", [470, 81, 50, 28]),
@@ -1109,8 +1127,86 @@ const SHORTCUT_ITEMS: [Item; ROWS * PARTS] = {
     list
 };
 
+/// The Tool menu page: one row per tool in the user's order, each with a switch. The rows'
+/// controls belong to places in the list, not to tools: a moved tool takes the controls of
+/// its new place.
+const TOOL_TOP: i32 = 128;
+const TOOL_PITCH: i32 = 52;
+const TOOL_HEIGHT: i32 = 44;
+const TOOL_ROWS: [Control; TOOL_COUNT] = [ToolRow0, ToolRow1];
+const TOOL_SWITCHES: [Control; TOOL_COUNT] = [ToolSwitch0, ToolSwitch1];
+/// The list with room for the focus ring, repainted while rows move.
+const TOOL_LIST: [i32; 4] = [0, TOOL_TOP - 8, WIDTH, TOOL_COUNT as i32 * TOOL_PITCH + 16];
+
+const fn tool_y(slot: usize) -> i32 {
+    TOOL_TOP + slot as i32 * TOOL_PITCH
+}
+
+const TOOL_ITEMS: [Item; 4 + 2 * TOOL_COUNT] = {
+    let mut list = [item(ToolMenuTitle, Kind::Heading, "Tool menu", [24, 54, 496, 22]); 4 + 2 * TOOL_COUNT];
+    list[1] = item(
+        ToolMenuDetail,
+        Kind::Detail,
+        "Hold Alt to open it. The first shown tool sits under the cursor.",
+        [24, 80, 496, 17],
+    );
+    list[2] = item(
+        ToolMenuHint,
+        Kind::Detail,
+        "Drag a row to move it, or press Alt+Up or Alt+Down on it.",
+        [24, 98, 496, 17],
+    );
+    list[3] = item(
+        ToolMenuEmpty,
+        Kind::Detail,
+        "Every tool is hidden, so holding Alt opens no menu.",
+        [24, tool_y(TOOL_COUNT) + 2, 496, 17],
+    );
+    let mut slot = 0;
+    while slot < TOOL_COUNT {
+        let y = tool_y(slot);
+        list[4 + 2 * slot] = item(TOOL_ROWS[slot], Kind::ToolRow, "", [24, y, 424, TOOL_HEIGHT]);
+        list[5 + 2 * slot] = item(TOOL_SWITCHES[slot], Kind::Switch, "", [458, y + 8, 50, 28]);
+        slot += 1;
+    }
+    list
+};
+
 fn items() -> impl Iterator<Item = &'static Item> {
-    ITEMS.iter().chain(&SHORTCUT_ITEMS)
+    ITEMS.iter().chain(&SHORTCUT_ITEMS).chain(&TOOL_ITEMS)
+}
+
+/// The place a dragged row drops into when its top is at `top` (logical px): the nearest.
+fn drop_slot(top: f64, count: usize) -> usize {
+    let slot = ((top - f64::from(TOOL_TOP)) / f64::from(TOOL_PITCH)).round();
+    slot.clamp(0.0, count.saturating_sub(1) as f64) as usize
+}
+
+/// Where Alt+Up (`up`) or Alt+Down moves the row at `slot`, if it can move.
+fn nudged(slot: usize, up: bool, count: usize) -> Option<usize> {
+    if up { slot.checked_sub(1) } else { (slot + 1 < count).then_some(slot + 1) }
+}
+
+/// Why a shown tool is still not in the menu: its capability is off.
+fn tool_off_note(tool: ToolId, settings: &Settings) -> Option<&'static str> {
+    match tool {
+        ToolId::NewNote => (!settings.is_enabled(NOTES)).then_some("Notes are off"),
+        ToolId::RecordScreen if !Action::ToggleRecording.available() => Some("Not available yet"),
+        ToolId::RecordScreen => (!settings.is_enabled(RECORDING)).then_some("Recording is off"),
+    }
+}
+
+/// The tools' icons for one DPI and theme (dark): BGRA, in `TOOLS` order.
+type ToolIcons = (u32, bool, Vec<Option<Pixmap>>);
+
+/// A tool row held by the pointer: which tool, its place when the drag began, where the
+/// pointer holds it (logical px below the row's top), and the row's top now.
+#[derive(Clone, Copy)]
+struct Drag {
+    tool: ToolId,
+    from: usize,
+    grab: f64,
+    top: f64,
 }
 
 impl Control {
@@ -1127,18 +1223,52 @@ impl Control {
             [index % PARTS];
         Some((action, part))
     }
+
+    /// A control of the Tool menu page (not its tab).
+    fn tool_item(self) -> bool {
+        (ToolMenuTitle as i32..=ToolSwitch1 as i32).contains(&(self as i32))
+    }
+
+    /// The place in the tool list of a row or a switch, and whether it is the switch.
+    fn tool_slot(self) -> Option<(usize, bool)> {
+        TOOL_ROWS
+            .iter()
+            .position(|&id| id == self)
+            .map(|slot| (slot, false))
+            .or_else(|| TOOL_SWITCHES.iter().position(|&id| id == self).map(|slot| (slot, true)))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     General,
     Shortcuts,
+    Tools,
 }
 
 impl Page {
+    const ALL: [Page; 3] = [Page::General, Page::Shortcuts, Page::Tools];
+
+    fn tab(self) -> Control {
+        match self {
+            Self::General => GeneralTab,
+            Self::Shortcuts => ShortcutsTab,
+            Self::Tools => ToolMenuTab,
+        }
+    }
+
     fn contains(self, id: Control) -> bool {
-        matches!(id, GeneralTab | ShortcutsTab)
-            || (id.shortcut_row().is_some() == (self == Self::Shortcuts))
+        if matches!(id, GeneralTab | ShortcutsTab | ToolMenuTab) {
+            return true;
+        }
+        let page = if id.shortcut_row().is_some() {
+            Self::Shortcuts
+        } else if id.tool_item() {
+            Self::Tools
+        } else {
+            Self::General
+        };
+        page == self
     }
 }
 
@@ -1312,7 +1442,7 @@ impl ButtonMotion {
     }
 }
 
-const CONTROLS: usize = HighlighterStatus as usize - Capabilities as usize + 1;
+const CONTROLS: usize = ToolSwitch1 as usize - Capabilities as usize + 1;
 
 impl Control {
     fn index(self) -> usize {
@@ -1336,6 +1466,8 @@ struct Motion {
     content: Transition,
     /// Per shortcut row: the new chips, the Reset button and the note under the row.
     rows: [[Transition; 3]; ROWS],
+    /// Per tool, in `TOOLS` order: the place in the list its row is drawn at.
+    tools: [Transition; TOOL_COUNT],
     /// The recorder's outline pulses from this time while it waits for keys.
     pulse_since: Option<f64>,
 }
@@ -1357,6 +1489,7 @@ impl Motion {
             content: shown,
             // Chips start shown; they fade in only when they change.
             rows: [[shown, Transition::default(), Transition::default()]; ROWS],
+            tools: [Transition::default(); TOOL_COUNT],
             pulse_since: None,
         }
     }
@@ -1391,6 +1524,7 @@ impl Motion {
         .into_iter()
         .chain(self.selection)
         .chain(self.rows.iter().flatten().copied())
+        .chain(self.tools)
         .chain(self.buttons.iter().flat_map(ButtonMotion::tracks))
     }
 
@@ -1411,6 +1545,7 @@ impl Motion {
         snap(&mut self.folders[1]);
         self.selection.iter_mut().for_each(snap);
         self.rows.iter_mut().flatten().for_each(snap);
+        self.tools.iter_mut().for_each(snap);
         for button in &mut self.buttons {
             for track in
                 [&mut button.checked, &mut button.hover, &mut button.press, &mut button.focus]
@@ -1516,12 +1651,12 @@ pub(crate) fn scaled([x, y, w, h]: [i32; 4], dpi: u32) -> RECT {
 
 impl Item {
     fn button(&self) -> bool {
-        matches!(self.kind, Kind::Switch | Kind::Push(_) | Kind::Radio | Kind::Recorder)
+        matches!(self.kind, Kind::Switch | Kind::Push(_) | Kind::Radio | Kind::Recorder | Kind::ToolRow)
     }
 
     /// Hover and press feedback: everything but the radio segments.
     fn pointer_effects(&self) -> bool {
-        matches!(self.kind, Kind::Switch | Kind::Push(_) | Kind::Recorder)
+        matches!(self.kind, Kind::Switch | Kind::Push(_) | Kind::Recorder | Kind::ToolRow)
     }
 
     fn caption(&self) -> &'static str {
@@ -1544,11 +1679,16 @@ impl Item {
                 BS_AUTORADIOBUTTON as u32 | WS_TABSTOP.0 | WS_GROUP.0
             }
             Kind::Radio => BS_AUTORADIOBUTTON as u32,
-            Kind::Push(_) | Kind::Recorder => BS_OWNERDRAW as u32 | WS_TABSTOP.0 | WS_GROUP.0,
+            Kind::Push(_) | Kind::Recorder | Kind::ToolRow => {
+                BS_OWNERDRAW as u32 | WS_TABSTOP.0 | WS_GROUP.0
+            }
             Kind::Path => SS_OWNERDRAW.0 | SS_NOTIFY.0 | WS_GROUP.0,
             _ => SS_OWNERDRAW.0 | WS_GROUP.0,
         };
-        let visible = if matches!(self.id, Status | Retry) || self.id.shortcut_row().is_some() {
+        let visible = if matches!(self.id, Status | Retry)
+            || self.id.shortcut_row().is_some()
+            || self.id.tool_item()
+        {
             0
         } else {
             WS_VISIBLE.0
@@ -1697,6 +1837,10 @@ struct Window<'a> {
     tooltip: Cell<HWND>,
     tips: RefCell<[Vec<u16>; 2]>,
     icons: [HICON; 2],
+    /// The tool row being dragged.
+    drag: Cell<Option<Drag>>,
+    /// The tools' icons (BGRA), in `TOOLS` order, for this DPI and theme.
+    tool_icons: RefCell<Option<ToolIcons>>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -1720,6 +1864,7 @@ struct Frame {
     page: f64,
     content: f64,
     rows: [[f64; 3]; ROWS],
+    tools: [f64; TOOL_COUNT],
     /// The recorder outline, 1 at its strongest. Steady at 1 with reduced motion.
     pulse: f64,
 }
@@ -1752,6 +1897,7 @@ impl Motion {
             page: self.page.value(now),
             content: self.content.value(now),
             rows: self.rows.map(|row| row.map(|track| track.value(now))),
+            tools: self.tools.map(|track| track.value(now)),
             pulse: match self.pulse_since {
                 Some(start) if self.enabled => {
                     0.5 + 0.5 * ((now - start) * std::f64::consts::TAU / PULSE_MS).cos()
@@ -1833,10 +1979,18 @@ impl Window<'_> {
                     }
                 }
             }
+            if self.page.get() == Page::Tools && frame.tools != previous.tools {
+                self.invalidate(Some(scaled(TOOL_LIST, dpi)));
+            }
             for item in items().filter(|item| item.button() && self.page.get().contains(item.id)) {
                 let index = item.id.index();
                 if previous.buttons[index] != frame.buttons[index] {
-                    self.invalidate_item(item);
+                    if item.id.tool_item() {
+                        // A tool row's look and focus ring cover the whole row.
+                        self.invalidate(Some(scaled(TOOL_LIST, dpi)));
+                    } else {
+                        self.invalidate_item(item);
+                    }
                 }
             }
         }
@@ -2169,8 +2323,9 @@ impl Window<'_> {
             return;
         }
         self.cancel_capture();
+        self.drag_end(false);
         // Focus must not stay on a control that is about to hide.
-        let tab = self.child(if page == Page::Shortcuts { ShortcutsTab } else { GeneralTab });
+        let tab = self.child(page.tab());
         // SAFETY: focus queries and moves stay within this STA's own children.
         unsafe {
             let focused = GetFocus();
@@ -2185,7 +2340,7 @@ impl Window<'_> {
         {
             let mut motion = self.motion.borrow_mut();
             let duration = motion.duration(PAGE_MS);
-            motion.page.retarget(if page == Page::Shortcuts { 1.0 } else { 0.0 }, now, duration);
+            motion.page.retarget(page as usize as f64, now, duration);
             motion.content.retarget(0.0, now, 0.0);
             motion.content.retarget(1.0, now, duration);
         }
@@ -2589,7 +2744,7 @@ impl Window<'_> {
             motion.select_card(card, now, duration);
         }
         let page = self.page.get();
-        let tabs = [(GeneralTab, page == Page::General), (ShortcutsTab, page == Page::Shortcuts)];
+        let tabs = Page::ALL.map(|each| (each.tab(), page == each));
         for (id, checked) in checked.into_iter().chain(tabs) {
             // SAFETY: checkbox and radio BUTTONs accept scalar BM_SETCHECK parameters.
             unsafe {
@@ -2625,7 +2780,7 @@ impl Window<'_> {
                     _ => true,
                 };
             let enabled = on_page
-                && (matches!(item.id, GeneralTab | ShortcutsTab)
+                && (matches!(item.id, GeneralTab | ShortcutsTab | ToolMenuTab)
                     || !item.button()
                     || loaded
                         && match item.id {
@@ -2638,6 +2793,7 @@ impl Window<'_> {
             self.show(item.id, visible, enabled);
         }
         self.refresh_shortcuts();
+        self.refresh_tools();
         self.sync_buttons();
         self.invalidate(None);
     }
@@ -2748,6 +2904,7 @@ impl Window<'_> {
         match item.id {
             GeneralTab => return self.set_page(Page::General),
             ShortcutsTab => return self.set_page(Page::Shortcuts),
+            ToolMenuTab => return self.set_page(Page::Tools),
             _ => {}
         }
         if self.picking.get()
@@ -2854,7 +3011,15 @@ impl Window<'_> {
                 }
             }
             Retry => {}
-            _ => return,
+            id => match id.tool_slot() {
+                Some((slot, true)) => {
+                    let mut model = self.model.borrow_mut();
+                    let entry = model.settings.tool_menu.entries()[slot];
+                    model.settings.tool_menu.set_shown(entry.tool, !entry.shown);
+                }
+                // A row moves by drag or Alt+Up and Alt+Down; Space and Enter do nothing.
+                _ => return,
+            },
         }
         self.save();
     }
@@ -2953,6 +3118,155 @@ impl Window<'_> {
     }
 }
 
+impl Window<'_> {
+    /// The Tool menu page from the model: names, switches, the rows' places, the empty line.
+    fn refresh_tools(&self) {
+        let on_page = self.page.get() == Page::Tools;
+        let (menu, loaded) = {
+            let model = self.model.borrow();
+            (model.settings.tool_menu, model.load_error.is_none())
+        };
+        let now = self.now();
+        for (slot, entry) in menu.entries().iter().enumerate() {
+            let label = summoner::tool(entry.tool).label;
+            let (row, switch) = (TOOL_ROWS[slot], TOOL_SWITCHES[slot]);
+            self.text(
+                row,
+                &format!("{label}, {} of {TOOL_COUNT}, Alt+Up or Alt+Down moves it", slot + 1),
+            );
+            self.text(switch, &format!("Show {label} in the tool menu"));
+            let checked = if entry.shown { BST_CHECKED } else { BST_UNCHECKED };
+            // SAFETY: a checkbox BUTTON of this window accepts a scalar BM_SETCHECK.
+            unsafe { SendMessageW(self.child(switch), BM_SETCHECK, Some(WPARAM(checked.0 as usize)), None) };
+            {
+                let mut motion = self.motion.borrow_mut();
+                let duration = if self.started.get() { motion.duration(SWITCH_MS) } else { 0.0 };
+                let target = if entry.shown { 1.0 } else { 0.0 };
+                motion.buttons[switch.index()].checked.retarget(target, now, duration);
+            }
+            self.show(row, on_page, on_page && loaded);
+            self.show(switch, on_page, on_page && loaded);
+        }
+        for id in [ToolMenuTitle, ToolMenuDetail, ToolMenuHint] {
+            self.show(id, on_page, on_page);
+        }
+        self.show(ToolMenuEmpty, on_page && !menu.any_shown(), on_page);
+        self.place_tools();
+    }
+
+    /// Slides each row to its place: the order with the dragged row dropped where it is now,
+    /// while a drag goes on. The dragged row itself follows the pointer.
+    fn place_tools(&self) {
+        let menu = self.model.borrow().settings.tool_menu;
+        let drag = self.drag.get();
+        let order = drag.map_or(menu, |drag| menu.moved(drag.from, drop_slot(drag.top, TOOL_COUNT)));
+        let now = self.now();
+        {
+            let mut motion = self.motion.borrow_mut();
+            let on_page = self.page.get() == Page::Tools;
+            let duration = if on_page && self.started.get() { motion.duration(ROW_MS) } else { 0.0 };
+            for (index, tool) in TOOLS.iter().enumerate() {
+                if drag.is_none_or(|drag| drag.tool != tool.id) {
+                    motion.tools[index].retarget(order.position(tool.id) as f64, now, duration);
+                }
+            }
+        }
+        self.update_animation();
+        if self.page.get() == Page::Tools {
+            self.invalidate(Some(scaled(TOOL_LIST, self.dpi.get())));
+        }
+    }
+
+    /// Puts the row at `from` at `to` and saves; the rows slide to their new places.
+    fn move_tool(&self, from: usize, to: usize) {
+        if from == to || self.model.borrow().load_error.is_some() {
+            return self.place_tools();
+        }
+        let menu = {
+            let mut model = self.model.borrow_mut();
+            model.settings.tool_menu = model.settings.tool_menu.moved(from, to);
+            model.settings.tool_menu
+        };
+        // Each place's switch now shows its new tool: it jumps there, it does not slide.
+        {
+            let mut motion = self.motion.borrow_mut();
+            for (slot, entry) in menu.entries().iter().enumerate() {
+                let target = if entry.shown { 1.0 } else { 0.0 };
+                motion.buttons[TOOL_SWITCHES[slot].index()].checked.retarget(target, 0.0, 0.0);
+            }
+        }
+        self.save();
+    }
+
+    /// Alt+Up or Alt+Down on the row at `slot`. The focus goes with the row.
+    fn nudge_tool(&self, slot: usize, up: bool) {
+        if self.drag.get().is_some() {
+            return;
+        }
+        let Some(to) = nudged(slot, up, TOOL_COUNT) else { return };
+        // SAFETY: a focus query on this thread.
+        let focused = unsafe { GetFocus() } == self.child(TOOL_ROWS[slot]);
+        self.move_tool(slot, to);
+        if focused {
+            // SAFETY: focus moves between children of this window, on its thread.
+            let _ = unsafe { SetFocus(Some(self.child(TOOL_ROWS[to]))) };
+        }
+    }
+
+    /// The pointer's height in the window, logical px, from a mouse message to a row.
+    fn tool_pointer(&self, row: HWND, lp: LPARAM) -> f64 {
+        let mut point = [POINT { x: i32::from(lp.0 as i16), y: i32::from((lp.0 >> 16) as i16) }];
+        // SAFETY: both windows belong to this thread; the point is a writable local.
+        unsafe { MapWindowPoints(Some(row), Some(self.hwnd), &mut point) };
+        f64::from(point[0].y) * 96.0 / f64::from(self.dpi.get())
+    }
+
+    fn drag_start(&self, slot: usize, y: f64) {
+        if self.model.borrow().load_error.is_some() || self.page.get() != Page::Tools {
+            return;
+        }
+        let tool = self.model.borrow().settings.tool_menu.entries()[slot].tool;
+        let top = f64::from(tool_y(slot));
+        self.drag.set(Some(Drag { tool, from: slot, grab: y - top, top }));
+        self.place_tools();
+    }
+
+    fn drag_move(&self, y: f64) {
+        let Some(mut drag) = self.drag.get() else { return };
+        drag.top = (y - drag.grab).clamp(f64::from(TOOL_TOP), f64::from(tool_y(TOOL_COUNT - 1)));
+        self.drag.set(Some(drag));
+        self.place_tools();
+    }
+
+    /// The pointer let go (`drop`), or the drag was cut short: the row slides from where it
+    /// is to its place, the nearest one or its old one.
+    fn drag_end(&self, drop: bool) {
+        let Some(drag) = self.drag.take() else { return };
+        let to = if drop { drop_slot(drag.top, TOOL_COUNT) } else { drag.from };
+        {
+            let now = self.now();
+            let mut motion = self.motion.borrow_mut();
+            let duration = if self.started.get() { motion.duration(ROW_MS) } else { 0.0 };
+            let index = TOOLS.iter().position(|tool| tool.id == drag.tool).expect("a tool");
+            let track = &mut motion.tools[index];
+            track.retarget((drag.top - f64::from(TOOL_TOP)) / f64::from(TOOL_PITCH), now, 0.0);
+            track.retarget(to as f64, now, duration);
+        }
+        self.move_tool(drag.from, to);
+    }
+
+    /// The tools' icons for this DPI and theme, made once.
+    fn cache_tool_icons(&self, dpi: u32, dark: bool) {
+        let mut cache = self.tool_icons.borrow_mut();
+        if cache.as_ref().is_some_and(|(at, theme, _)| *at == dpi && *theme == dark) {
+            return;
+        }
+        let icons =
+            TOOLS.iter().map(|tool| summoner::tool_icon(tool.id, f64::from(dpi) / 96.0, dark)).collect();
+        *cache = Some((dpi, dark, icons));
+    }
+}
+
 impl Drop for Window<'_> {
     fn drop(&mut self) {
         // Every other way out has ended the recorder already; this one covers a window
@@ -3035,7 +3349,11 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
     };
     // SAFETY: structure is valid for the duration of InitCommonControlsEx.
     let _ = unsafe { InitCommonControlsEx(&controls) };
-    let monitor = monitor_at(cursor_pos());
+    let point = match options.test.as_ref().and_then(|test| test.at) {
+        Some((x, y)) => Point::new(f64::from(x), f64::from(y)),
+        None => cursor_pos(),
+    };
+    let monitor = monitor_at(point);
     let at = monitor.work_area;
     let dpi = options.test.as_ref().map_or((monitor.scale * 96.0).round() as u32, |test| test.dpi);
     // First put the hidden HWND on the target monitor so Windows picks its actual DPI.
@@ -3085,6 +3403,8 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
             settings_icon(instance, theme::TEXT),
             settings_icon(instance, [234, 240, 252, 255]),
         ],
+        drag: Cell::new(None),
+        tool_icons: RefCell::new(None),
     });
     // SAFETY: everything reachable from this shared pointer outlives DestroyWindow.
     // WM_NCDESTROY detaches it, and only this STA reads it.
@@ -3176,11 +3496,10 @@ fn pump(window: &Window<'_>) -> Result<()> {
             let ours = message.hwnd == window.hwnd
                 || unsafe { GetParent(message.hwnd) }.ok() == Some(window.hwnd);
             if ours && held.ctrl && !held.alt && !held.win {
-                // Ctrl+Tab and Ctrl+Shift+Tab: with two pages, both go to the other one.
-                window.set_page(match window.page.get() {
-                    Page::General => Page::Shortcuts,
-                    Page::Shortcuts => Page::General,
-                });
+                // Ctrl+Tab goes to the next page, Ctrl+Shift+Tab to the one before.
+                let count = Page::ALL.len();
+                let step = if held.shift { count - 1 } else { 1 };
+                window.set_page(Page::ALL[(window.page.get() as usize + step) % count]);
                 continue;
             }
         }
@@ -3487,7 +3806,8 @@ impl Window<'_> {
         let rect = |id: Control| scaled(Item::lookup(id as i32).expect("page tab").rect, dpi);
         let (general, shortcuts) = (rect(GeneralTab), rect(ShortcutsTab));
         let fill = mix(p.patch, p.chip, 0.55);
-        canvas.shape(inset(RECT { right: shortcuts.right, ..general }, 1), px(6) as f32, fade(fill));
+        canvas.shape(inset(RECT { right: rect(ToolMenuTab).right, ..general }, 1), px(6) as f32, fade(fill));
+        // The tabs are evenly spaced: `frame.page` (0 to 2) steps one tab per unit.
         let along = |from: i32, to: i32| from + (f64::from(to - from) * frame.page).round() as i32;
         let highlight = RECT {
             left: along(general.left, shortcuts.left),
@@ -3496,7 +3816,7 @@ impl Window<'_> {
         };
         canvas.shape(inset(highlight, px(3)), px(4) as f32, fade(p.selected));
         let font = self.fonts.borrow().0[1];
-        for (index, id) in [GeneralTab, ShortcutsTab].into_iter().enumerate() {
+        for (index, id) in Page::ALL.map(Page::tab).into_iter().enumerate() {
             let bounds = rect(id);
             let shape = inset(bounds, px(3));
             let focus = frame.buttons[id.index()].focus;
@@ -3618,16 +3938,110 @@ impl Window<'_> {
         }
     }
 
+    /// The Tool menu page: the text, then one row per tool at its animated place (a dragged
+    /// row at the pointer, above the others), each a patch with a grip, the tool's icon and
+    /// name as in the menu, a note when its capability is off, and its switch.
+    fn paint_tools(&self, canvas: &mut Canvas<'_>, frame: Frame, p: Palette) {
+        let dpi = self.dpi.get();
+        let px = |size| scale(size, dpi);
+        let edge = |y: f64| (y * f64::from(dpi) / 96.0).round() as i32;
+        let fade = |color| mix(p.paper, color, frame.intro);
+        let fonts = self.fonts.borrow().0;
+        let line = DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
+        let (menu, notes) = {
+            let model = self.model.borrow();
+            let settings = &model.settings;
+            (settings.tool_menu, std::array::from_fn::<_, TOOL_COUNT, _>(|index| tool_off_note(TOOLS[index].id, settings)))
+        };
+        for item in &TOOL_ITEMS[..4] {
+            if item.id == ToolMenuEmpty && menu.any_shown() {
+                continue;
+            }
+            let font = fonts[usize::from(!matches!(item.kind, Kind::Heading))];
+            canvas.text(scaled(item.rect, dpi), item.text, fade(p.muted), line, font);
+        }
+
+        self.cache_tool_icons(dpi, frame.theme >= 0.5);
+        let icons = self.tool_icons.borrow();
+        let drag = self.drag.get();
+        let mut order: Vec<usize> = (0..TOOL_COUNT).collect();
+        order.sort_by_key(|&index| drag.is_some_and(|drag| drag.tool == TOOLS[index].id));
+        for index in order {
+            let id = TOOLS[index].id;
+            let slot = menu.position(id);
+            let dragged = drag.is_some_and(|drag| drag.tool == id);
+            let top = match drag {
+                Some(drag) if dragged => drag.top,
+                _ => f64::from(TOOL_TOP) + frame.tools[index] * f64::from(TOOL_PITCH),
+            };
+            let row = RECT {
+                left: px(24),
+                right: px(520),
+                top: edge(top),
+                bottom: edge(top + f64::from(TOOL_HEIGHT)),
+            };
+            if !canvas.visible(inset(row, -px(4))) {
+                continue;
+            }
+            let state = frame.buttons[TOOL_ROWS[slot].index()];
+            let lift = if dragged { 0.6 } else { state.hover * 0.35 };
+            let face = mix(p.patch, p.selected, lift);
+            paint_focus(canvas, row, [px(8), px(1), px(2)], fade(p.paper), fade(p.accent), state.focus);
+            if dragged {
+                canvas.outlined(row, px(8) as f32, fade(face), fade(p.outline));
+            } else {
+                canvas.shape(row, px(8) as f32, fade(face));
+            }
+            let middle = (row.top + row.bottom) / 2;
+            // The grip: two columns of three dots.
+            let dot = px(3).max(2);
+            for x in [35, 41] {
+                for y in [-6, 0, 6] {
+                    let left = px(x) - dot / 2;
+                    let top = middle + px(y) - dot / 2;
+                    let bounds = RECT { left, top, right: left + dot, bottom: top + dot };
+                    canvas.shape(bounds, dot as f32 / 2.0, fade(p.muted));
+                }
+            }
+            let off = notes[index];
+            if let Some(Some(icon)) = icons.as_ref().and_then(|(_, _, icons)| icons.get(index)) {
+                let size = icon.width() as i32;
+                let at = canvas.moved(RECT { left: px(54), top: middle - size / 2, right: 0, bottom: 0 });
+                let opacity = if off.is_some() { 0.45 } else { 1.0 } * frame.intro;
+                let paint = PixmapPaint { opacity: opacity as f32, ..PixmapPaint::default() };
+                canvas.pixmap.draw_pixmap(at.left, at.top, icon.as_ref(), &paint, Transform::identity(), None);
+            }
+            let label = summoner::tool(id).label;
+            let ink = if off.is_some() { p.muted } else { p.text };
+            canvas.text(RECT { left: px(82), right: px(448), ..row }, label, fade(ink), line, fonts[0]);
+            if let Some(note) = off {
+                let left = px(82) + canvas.width(label, fonts[0]) + px(10);
+                canvas.text(RECT { left, right: px(448), ..row }, note, fade(p.muted), line, fonts[1]);
+            }
+            let switch = RECT {
+                left: px(458),
+                right: px(508),
+                top: edge(top + 8.0),
+                bottom: edge(top + 36.0),
+            };
+            // SAFETY: an enabled-state query for a real child of this window.
+            let disabled = !unsafe { IsWindowEnabled(self.child(TOOL_SWITCHES[slot])) }.as_bool();
+            let state = frame.buttons[TOOL_SWITCHES[slot].index()];
+            paint_switch(canvas, switch, state, disabled, face, p, frame.intro, dpi);
+        }
+    }
+
     fn paint_content(&self, canvas: &mut Canvas<'_>, frame: Frame, p: Palette, hide_accel: bool) {
         self.paint_pages(canvas, frame, p);
         // The shown page fades in and slides in from the side of its tab.
-        let direction = if self.page.get() == Page::Shortcuts { 1.0 } else { -1.0 };
+        let switch = self.motion.borrow().page;
+        let direction = if switch.to >= switch.from { 1.0 } else { -1.0 };
         canvas.dx = scale(((1.0 - frame.content) * 16.0 * direction).round() as i32, self.dpi.get());
         let page_frame = Frame { intro: frame.intro * frame.content, ..frame };
-        if self.page.get() == Page::Shortcuts {
-            self.paint_shortcuts(canvas, page_frame, p);
-        } else {
-            self.paint_general(canvas, page_frame, p, hide_accel);
+        match self.page.get() {
+            Page::General => self.paint_general(canvas, page_frame, p, hide_accel),
+            Page::Shortcuts => self.paint_shortcuts(canvas, page_frame, p),
+            Page::Tools => self.paint_tools(canvas, page_frame, p),
         }
         canvas.dx = 0;
     }
@@ -3657,7 +4071,7 @@ impl Window<'_> {
         canvas.shape(inset(highlight, px(3)), px(4) as f32, fade(p.selected));
 
         let fonts = self.fonts.borrow().0;
-        for item in ITEMS.iter().filter(|item| !matches!(item.id, GeneralTab | ShortcutsTab)) {
+        for item in ITEMS.iter().filter(|item| !matches!(item.id, GeneralTab | ShortcutsTab | ToolMenuTab)) {
             let mut rect = layout.rect(item, dpi);
             let local = match item.id {
                 NotesFallback => frame.folders[0],
@@ -3732,37 +4146,8 @@ impl Window<'_> {
                     );
                 }
                 Kind::Switch => {
-                    let top = rect.top + (rect.bottom - rect.top - px(20)) / 2;
-                    let rail = RECT {
-                        left: rect.right - px(44),
-                        right: rect.right - px(4),
-                        top,
-                        bottom: top + px(20),
-                    };
                     let background = if item.id == Keep { p.patch } else { p.paper };
-                    let track = if disabled { p.disabled } else { mix(p.off, p.on, state.checked) };
-                    paint_focus(
-                        canvas,
-                        rail,
-                        [px(10), px(1), px(2)],
-                        fade(background),
-                        fade(p.accent),
-                        state.focus,
-                    );
-                    canvas.shape(rail, px(10) as f32, fade(track));
-                    let x = f64::from(rail.left + px(11))
-                        + state.checked * f64::from(rail.right - rail.left - 2 * px(11));
-                    let y = f64::from(rail.top + rail.bottom) / 2.0;
-                    let radius =
-                        f64::from(dpi) / 96.0 * (6.0 + state.hover * 0.8 + state.press * 1.2);
-                    let thumb = RECT {
-                        left: (x - radius).round() as i32,
-                        right: (x + radius).round() as i32,
-                        top: (y - radius).round() as i32,
-                        bottom: (y + radius).round() as i32,
-                    };
-                    let ink = if disabled { mix(track, p.thumb, 0.5) } else { p.thumb };
-                    canvas.shape(thumb, radius as f32, fade(ink));
+                    paint_switch(canvas, rect, state, disabled, background, p, frame.intro, dpi);
                 }
                 Kind::Radio => {
                     let shape = inset(rect, px(3));
@@ -3867,6 +4252,39 @@ impl Window<'_> {
             }
         }
     }
+}
+
+/// A switch: its rail at the right of `rect`, the thumb at `state.checked`. `background` is
+/// what it sits on (for the focus ring's gap); `intro` fades it in from the paper.
+#[allow(clippy::too_many_arguments)]
+fn paint_switch(
+    canvas: &mut Canvas<'_>,
+    rect: RECT,
+    state: ButtonFrame,
+    disabled: bool,
+    background: COLORREF,
+    p: Palette,
+    intro: f64,
+    dpi: u32,
+) {
+    let px = |size| scale(size, dpi);
+    let fade = |color| mix(p.paper, color, intro);
+    let top = rect.top + (rect.bottom - rect.top - px(20)) / 2;
+    let rail = RECT { left: rect.right - px(44), right: rect.right - px(4), top, bottom: top + px(20) };
+    let track = if disabled { p.disabled } else { mix(p.off, p.on, state.checked) };
+    paint_focus(canvas, rail, [px(10), px(1), px(2)], fade(background), fade(p.accent), state.focus);
+    canvas.shape(rail, px(10) as f32, fade(track));
+    let x = f64::from(rail.left + px(11)) + state.checked * f64::from(rail.right - rail.left - 2 * px(11));
+    let y = f64::from(rail.top + rail.bottom) / 2.0;
+    let radius = f64::from(dpi) / 96.0 * (6.0 + state.hover * 0.8 + state.press * 1.2);
+    let thumb = RECT {
+        left: (x - radius).round() as i32,
+        right: (x + radius).round() as i32,
+        top: (y - radius).round() as i32,
+        bottom: (y + radius).round() as i32,
+    };
+    let ink = if disabled { mix(track, p.thumb, 0.5) } else { p.thumb };
+    canvas.shape(thumb, radius as f32, fade(ink));
 }
 
 /// The width of one key chip (or plain word) of a key line.
@@ -3975,6 +4393,46 @@ unsafe extern "system" fn control_proc(
                 if recording {
                     window.cancel_capture();
                 }
+            }
+            _ => {}
+        }
+    }
+    // A tool row: the pointer drags it, Alt+Up and Alt+Down move it.
+    if let Some((slot, false)) = item.and_then(|item| item.id.tool_slot()) {
+        let dragging = window.drag.get().is_some();
+        match msg {
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+                window.change_ui_state(UIS_SET, UISF_HIDEFOCUS);
+                // SAFETY: focus and capture for our own child, on its thread. Focus moves only
+                // inside an active window, so a click never activates it from here.
+                unsafe {
+                    if GetActiveWindow() == window.hwnd {
+                        let _ = SetFocus(Some(hwnd));
+                    }
+                    SetCapture(hwnd);
+                }
+                window.drag_start(slot, window.tool_pointer(hwnd, lp));
+                return LRESULT(0);
+            }
+            WM_MOUSEMOVE if dragging => {
+                window.drag_move(window.tool_pointer(hwnd, lp));
+                return LRESULT(0);
+            }
+            WM_LBUTTONUP if dragging => {
+                window.drag_move(window.tool_pointer(hwnd, lp));
+                // Dropped before the capture goes, so losing it does not cancel the drop.
+                window.drag_end(true);
+                // SAFETY: releases the capture this thread took above.
+                let _ = unsafe { ReleaseCapture() };
+                return LRESULT(0);
+            }
+            WM_CAPTURECHANGED | WM_CANCELMODE if dragging => window.drag_end(false),
+            WM_SYSKEYDOWN
+                if lp.0 & (1 << 29) != 0
+                    && (wp.0 == usize::from(VK_UP.0) || wp.0 == usize::from(VK_DOWN.0)) =>
+            {
+                window.nudge_tool(slot, wp.0 == usize::from(VK_UP.0));
+                return LRESULT(0);
             }
             _ => {}
         }
@@ -4192,9 +4650,10 @@ mod tests {
                             _ => true,
                         })
                         .collect::<Vec<_>>();
-                    let tabs = &ITEMS[..2];
+                    let tabs = &ITEMS[..3];
                     let shortcuts = tabs.iter().chain(&SHORTCUT_ITEMS).collect::<Vec<_>>();
-                    for page in [general, shortcuts] {
+                    let tools = tabs.iter().chain(&TOOL_ITEMS).collect::<Vec<_>>();
+                    for page in [general, shortcuts, tools] {
                         for (i, item) in page.iter().enumerate() {
                             let a = layout.rect(item, dpi);
                             assert!(
@@ -4240,6 +4699,58 @@ mod tests {
         }
         assert_eq!(Retry.shortcut_row(), None);
         assert_eq!(ShortcutsTab.shortcut_row(), None);
+        assert_eq!(ToolMenuTab.shortcut_row(), None);
+        assert_eq!(ToolSwitch1.shortcut_row(), None);
+    }
+
+    #[test]
+    fn tool_controls_belong_to_their_page_and_place() {
+        for (slot, (&row, &switch)) in TOOL_ROWS.iter().zip(&TOOL_SWITCHES).enumerate() {
+            assert_eq!(row.tool_slot(), Some((slot, false)));
+            assert_eq!(switch.tool_slot(), Some((slot, true)));
+        }
+        assert_eq!(ToolMenuTitle.tool_slot(), None);
+        for item in &TOOL_ITEMS {
+            assert!(Page::Tools.contains(item.id) && !Page::General.contains(item.id), "{:?}", item.id);
+        }
+        for id in [Keep, Retry, HighlighterStatus] {
+            assert!(!Page::Tools.contains(id), "{id:?}");
+        }
+        assert!(Page::ALL.iter().all(|page| page.contains(ToolMenuTab)));
+    }
+
+    #[test]
+    fn a_dragged_row_drops_into_the_nearest_place() {
+        let top = |slot: usize| f64::from(tool_y(slot));
+        let half = f64::from(TOOL_PITCH) / 2.0;
+        assert_eq!(drop_slot(top(0), 2), 0);
+        assert_eq!(drop_slot(top(0) + half - 1.0, 2), 0);
+        assert_eq!(drop_slot(top(0) + half + 1.0, 2), 1);
+        assert_eq!(drop_slot(top(1), 2), 1);
+        // Beyond either end: the end.
+        assert_eq!(drop_slot(top(0) - 100.0, 2), 0);
+        assert_eq!(drop_slot(top(5), 2), 1);
+        assert_eq!(drop_slot(top(2), 3), 2);
+    }
+
+    #[test]
+    fn alt_up_and_down_move_one_place_within_the_list() {
+        assert_eq!(nudged(0, true, 2), None);
+        assert_eq!(nudged(0, false, 2), Some(1));
+        assert_eq!(nudged(1, true, 2), Some(0));
+        assert_eq!(nudged(1, false, 2), None);
+        assert_eq!(nudged(1, false, 3), Some(2));
+    }
+
+    #[test]
+    fn a_tool_whose_capability_is_off_says_so() {
+        let mut settings = Settings::default();
+        assert_eq!(tool_off_note(ToolId::NewNote, &settings), None);
+        settings.set_enabled(NOTES, false);
+        settings.set_enabled(RECORDING, false);
+        assert_eq!(tool_off_note(ToolId::NewNote, &settings), Some("Notes are off"));
+        let recording = if Action::ToggleRecording.available() { "Recording is off" } else { "Not available yet" };
+        assert_eq!(tool_off_note(ToolId::RecordScreen, &settings), Some(recording));
     }
 
     #[test]

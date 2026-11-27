@@ -256,15 +256,19 @@ cursor, so users do not have to guess what the gesture does.
   and switched on).
 - Tools are entries in one list, each with a condition for when it is offered. This is
   where later, context-aware tools go.
+- The settings window has a "Tool menu" page: one row per tool, dragged (or moved with
+  Alt+Up and Alt+Down) into the user's order, and a switch per row to leave the tool out of
+  the menu (the tool and its shortcut keep working). The first shown tool is the one under
+  the cursor. With every tool hidden the menu never opens, and the page says so. A tool
+  whose capability is off stays in the list, dimmed with a note. Stored as `tool_menu` in
+  `settings.json`, `[{"id": "note", "shown": true}, {"id": "record", "shown": true}]`;
+  read leniently (unknown ids dropped, missing ones added at the end, shown). A change
+  applies at once.
 
 Ideas for later, not planned yet:
 
 - Tools offered from context, for example a grammar review when the user is typing in a
   text field.
-- A "Tool menu" list in the settings window: drag rows to reorder the tools and a switch per
-  tool to leave it out of the menu (the tool itself and its shortcut keep working). The first
-  row is the one under the cursor, so it is also the one-click tool. Stored as an ordered
-  list of tool ids in `settings.json`; unknown or missing ids fall back to the default order.
 
 ## Notes editor: Notion-like writing
 
