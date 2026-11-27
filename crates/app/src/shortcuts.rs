@@ -156,12 +156,18 @@ impl Action {
         }
     }
 
-    /// False for actions whose feature is not built yet (notes, recording): shown disabled,
-    /// and never registered.
+    /// False for actions whose feature is not built yet (recording): shown disabled, and
+    /// never registered. Pen and Highlighter default to Ctrl+Shift+7 and Ctrl+Shift+8, which
+    /// the note editor uses for its numbered and bulleted lists: making them available must
+    /// decide that clash first.
     pub fn available(self) -> bool {
         matches!(
             self,
-            Action::RestoreLast | Action::DiscardTop | Action::DiscardAll | Action::OpenSettings
+            Action::RestoreLast
+                | Action::DiscardTop
+                | Action::DiscardAll
+                | Action::OpenSettings
+                | Action::NewNote
         )
     }
 }
