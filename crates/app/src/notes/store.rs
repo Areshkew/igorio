@@ -30,6 +30,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use igorio_core::geom::Rect;
 use serde::{Deserialize, Serialize};
+use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::UI::Shell::{
     FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FO_DELETE, SHFILEOPSTRUCTW,
     SHFileOperationW,
@@ -311,8 +313,7 @@ impl Note {
             stripped
         };
         if result.chars().count() > 48 {
-            let head: String = result.chars().take(47).collect();
-            format!("{head}…")
+            format!("{}…", safe_cut(&result, 47))
         } else {
             result
         }
@@ -389,16 +390,95 @@ fn trim_trailing_dots_and_spaces(text: &str) -> &str {
     text.trim_end_matches(['.', ' '])
 }
 
+/// Cuts `text` to the longest prefix that fits in `max_units` UTF-16 code units, without
+/// cutting through a character a reader sees as one (see [`safe_cut`]).
 fn truncate_utf16(text: &str, max_units: usize) -> &str {
     let mut units = 0;
-    for (index, c) in text.char_indices() {
+    let mut chars = 0;
+    for c in text.chars() {
         let width = c.len_utf16();
         if units + width > max_units {
-            return &text[..index];
+            break;
         }
         units += width;
+        chars += 1;
     }
-    text
+    safe_cut(text, chars)
+}
+
+/// The longest prefix of `text` of at most `max_chars` characters that does not end in the
+/// middle of what a reader sees as one character.
+///
+/// This is an approximation of grapheme clusters (there is no `unicode-segmentation` here).
+/// It covers the common cases: combining marks (U+0300..=U+036F, U+1AB0..=U+1AFF,
+/// U+1DC0..=U+1DFF, U+20D0..=U+20FF, U+FE20..=U+FE2F), variation selectors (U+FE00..=U+FE0F,
+/// U+E0100..=U+E01EF), zero-width joiners (U+200D) and the character after one, emoji
+/// modifiers (U+1F3FB..=U+1F3FF), and regional indicator pairs, which make a flag
+/// (U+1F1E6..=U+1F1FF, paired from the start of the run). Hangul jamo and Indic conjuncts are
+/// not covered. When the cut would split one of these, it moves back to the nearest point
+/// that does not.
+fn safe_cut(text: &str, max_chars: usize) -> &str {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return text;
+    }
+    let mut end = max_chars;
+    while end > 0 && !is_safe_cut(&chars, end) {
+        end -= 1;
+    }
+    let bytes = chars[..end].iter().map(|c| c.len_utf8()).sum();
+    &text[..bytes]
+}
+
+/// May `chars[..end]` end there without splitting a character a reader sees as one?
+fn is_safe_cut(chars: &[char], end: usize) -> bool {
+    let Some(&next) = chars.get(end) else {
+        return true;
+    };
+    let previous = chars[end - 1];
+    if is_combining(next) || is_variation_selector(next) || is_emoji_modifier(next) {
+        return false;
+    }
+    // Neither before nor after a zero-width joiner: the joined sequence must stay together.
+    if next == '\u{200D}' || previous == '\u{200D}' {
+        return false;
+    }
+    if is_regional_indicator(next) && is_regional_indicator(previous) {
+        // Pair the run from its start; an odd count before `end` means `previous` is the
+        // first half of the flag `next` completes.
+        let run = chars[..end]
+            .iter()
+            .rev()
+            .take_while(|c| is_regional_indicator(**c))
+            .count();
+        if run % 2 == 1 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Unicode general categories Mn, Mc and Me in the ranges this module covers.
+fn is_combining(c: char) -> bool {
+    matches!(c,
+        '\u{0300}'..='\u{036F}'
+        | '\u{1AB0}'..='\u{1AFF}'
+        | '\u{1DC0}'..='\u{1DFF}'
+        | '\u{20D0}'..='\u{20FF}'
+        | '\u{FE20}'..='\u{FE2F}'
+    )
+}
+
+fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
+}
+
+fn is_emoji_modifier(c: char) -> bool {
+    matches!(c, '\u{1F3FB}'..='\u{1F3FF}')
+}
+
+fn is_regional_indicator(c: char) -> bool {
+    matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
 }
 
 fn is_reserved_device_name(stem: &str) -> bool {
@@ -453,6 +533,10 @@ pub struct NoteMeta {
 }
 
 impl NoteFile {
+    /// The file's bytes for `note`, as plain UTF-8.
+    ///
+    /// A UTF-8 byte order mark that [`NoteFile::parse`] skipped is not written back: the note
+    /// itself is text, and the mark belongs to the editor that saved it, not to the file.
     pub fn render(note: &Note) -> String {
         let origin = &note.origin;
         let mut lines = vec![
@@ -481,8 +565,11 @@ impl NoteFile {
     }
 
     /// Splits a file into its metadata and body. A file without the block is all body and
-    /// gets no metadata, which is the Swift rule.
+    /// gets no metadata, which is the Swift rule. One leading UTF-8 byte order mark is
+    /// skipped, as `settings.rs` does: an editor on Windows may add one, and it is not part
+    /// of the note's text.
     pub fn parse(text: &str) -> (NoteMeta, String) {
+        let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
         let mut meta = NoteMeta {
             id: None,
             created: None,
@@ -550,14 +637,28 @@ pub struct RecycleBin;
 
 impl Trash for RecycleBin {
     fn trash(&self, path: &Path) -> io::Result<()> {
-        let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
-        // SHFILEOPSTRUCTW asks for a double-NUL-terminated list of paths.
-        from.extend([0, 0]);
-        // SAFETY: `from` is a live, double-NUL-terminated UTF-16 buffer for the whole call.
-        // The struct is initialized by the windows crate, `pTo` stays null (unused for a
-        // delete) and no pointer escapes. SHFileOperationW only reads `pFrom` and writes into
-        // `operation`.
-        let code = unsafe {
+        let from = shell_delete_buffer(path)?;
+        // SAFETY: this is the only unsafe code in the module.
+        //
+        // `from` is a live, double-NUL-terminated UTF-16 buffer for the whole call. The struct
+        // is initialized by the windows crate, `pTo` stays null (unused for a delete) and no
+        // pointer escapes; SHFileOperationW only reads `pFrom` and writes into `operation`.
+        //
+        // COM pairing: SHFileOperationW needs COM on the calling thread. `CoInitializeEx` on
+        // S_OK (this call initialized the apartment) and on S_FALSE (the thread already had the
+        // same apartment) must each be balanced by exactly one `CoUninitialize` on the same
+        // thread, and only after the API call is done. RPC_E_CHANGED_MODE means the thread
+        // already lives in another apartment: this call did not initialize anything, so it
+        // must not uninitialize, and the operation can still run. Any other failure means COM
+        // is unavailable, so return before touching the shell API.
+        unsafe {
+            let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let must_uninitialize = initialized == S_OK || initialized == S_FALSE;
+            if !must_uninitialize && initialized != RPC_E_CHANGED_MODE {
+                return Err(io::Error::other(format!(
+                    "COM could not be initialized on this thread: {initialized:?}"
+                )));
+            }
             let mut operation = SHFILEOPSTRUCTW {
                 wFunc: FO_DELETE,
                 pFrom: PCWSTR(from.as_ptr()),
@@ -565,17 +666,63 @@ impl Trash for RecycleBin {
                 ..Default::default()
             };
             let code = SHFileOperationW(&mut operation);
-            if code == 0 && operation.fAnyOperationsAborted.as_bool() {
-                return Err(io::Error::other("the file was not moved to the Recycle Bin"));
+            let aborted = code == 0 && operation.fAnyOperationsAborted.as_bool();
+            if must_uninitialize {
+                CoUninitialize();
             }
-            code
-        };
-        if code == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::from_raw_os_error(code))
+            if aborted {
+                Err(io::Error::other(
+                    "the file was not moved to the Recycle Bin",
+                ))
+            } else if code == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(code))
+            }
         }
     }
+}
+
+/// The double-NUL-terminated UTF-16 list `SHFileOperationW` wants for one path.
+///
+/// The API takes an absolute path under `MAX_PATH` and strips trailing spaces and dots from
+/// it, so a relative, too-long or so-shaped path is refused here rather than deleting some
+/// other file. The caller may rely on the returned buffer having at least two NULs at its end.
+fn shell_delete_buffer(path: &Path) -> io::Result<Vec<u16>> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the Recycle Bin needs an absolute path, got {}",
+                path.display()
+            ),
+        ));
+    }
+    let mut buffer: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if buffer.len() > MAX_PATH_UNITS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the path is {} UTF-16 units long; the shell API takes at most {MAX_PATH_UNITS}",
+                buffer.len()
+            ),
+        ));
+    }
+    if buffer
+        .last()
+        .is_some_and(|unit| *unit == u16::from(b' ') || *unit == u16::from(b'.'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "the shell API drops a trailing space or dot from {}",
+                path.display()
+            ),
+        ));
+    }
+    // SHFILEOPSTRUCTW asks for a double-NUL-terminated list of paths.
+    buffer.extend([0, 0]);
+    Ok(buffer)
 }
 
 /// The notes in one folder, plus the window state kept next to the app's other settings.
@@ -848,6 +995,7 @@ impl NoteStore {
 
     /// Every `.md` file in the folder (not subfolders), parsed. Files without our front
     /// matter get a fresh id; it is written into the file the first time the note changes.
+    /// A zero-byte file is skipped: it is not a note yet.
     fn read_folder(&mut self, now: SystemTime) -> Vec<(Note, PathBuf)> {
         let mut result = Vec::new();
         let Ok(entries) = fs::read_dir(&self.folder) else {
@@ -869,6 +1017,12 @@ impl NoteStore {
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
+            // A zero-byte file is not a note: `claim_file` creates one just before the
+            // rename that gives it content, and a crash in between leaves it behind. Leave
+            // it alone — another program may be about to write into it.
+            if metadata.len() == 0 {
+                continue;
+            }
             let (mut meta, body) = NoteFile::parse(&text);
             // A file copied in Explorer keeps its twin's id; give the copy its own.
             if let Some(id) = meta.id
@@ -1359,4 +1513,91 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
         month_prime - 9
     } as u32;
     (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_cut_keeps_plain_text_at_exactly_max() {
+        assert_eq!(safe_cut("abcdef", 3), "abc");
+        assert_eq!(safe_cut("abc", 3), "abc");
+        assert_eq!(safe_cut("abc", 0), "");
+    }
+
+    #[test]
+    fn safe_cut_does_not_split_a_combining_mark_from_its_base() {
+        let text = "e\u{301}x";
+        assert_eq!(safe_cut(text, 2), "e\u{301}", "the pair is kept whole");
+        assert_eq!(safe_cut(text, 1), "", "the pair is dropped whole");
+    }
+
+    #[test]
+    fn safe_cut_never_splits_a_family_emoji_joined_with_zwj() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        let length = family.chars().count();
+        assert_eq!(safe_cut(family, length), family);
+        for max in 1..length {
+            assert_eq!(safe_cut(family, max), "", "cut at {max}");
+        }
+    }
+
+    #[test]
+    fn safe_cut_keeps_a_skin_tone_modifier_with_its_emoji() {
+        let thumbs_up = "\u{1F44D}\u{1F3FD}";
+        assert_eq!(safe_cut(thumbs_up, 1), "");
+        assert_eq!(safe_cut(thumbs_up, 2), thumbs_up);
+    }
+
+    #[test]
+    fn safe_cut_does_not_split_a_flag_made_of_regional_indicators() {
+        let germany = "\u{1F1E9}\u{1F1EA}";
+        assert_eq!(safe_cut(germany, 1), "");
+        assert_eq!(safe_cut(germany, 2), germany);
+    }
+
+    #[test]
+    fn safe_cut_cuts_three_flags_after_a_whole_flag() {
+        let three = "\u{1F1E9}\u{1F1EA}\u{1F1EB}\u{1F1F7}\u{1F1EE}\u{1F1F9}";
+        assert_eq!(safe_cut(three, 3), "\u{1F1E9}\u{1F1EA}");
+        assert_eq!(safe_cut(three, 5), "\u{1F1E9}\u{1F1EA}\u{1F1EB}\u{1F1F7}");
+    }
+
+    #[test]
+    fn safe_cut_leaves_a_short_string_alone() {
+        assert_eq!(safe_cut("short", 48), "short");
+        assert_eq!(safe_cut("", 47), "");
+    }
+
+    #[test]
+    fn shell_delete_buffer_is_double_nul_terminated() {
+        let path = Path::new(r"C:\notes\Hello.md");
+        let buffer = shell_delete_buffer(path).expect("an absolute path");
+        let expected: Vec<u16> = path.as_os_str().encode_wide().collect();
+        assert_eq!(&buffer[..expected.len()], expected.as_slice());
+        assert_eq!(&buffer[expected.len()..], &[0, 0]);
+        assert_eq!(buffer.iter().filter(|unit| **unit == 0).count(), 2);
+        // The comment in `trash` promises a list, so the copy above must be the path itself.
+        assert_eq!(
+            String::from_utf16(&buffer[..expected.len()]).unwrap(),
+            path.display().to_string()
+        );
+    }
+
+    #[test]
+    fn shell_delete_buffer_refuses_paths_the_shell_api_would_change() {
+        let relative = shell_delete_buffer(Path::new("Hello.md")).unwrap_err();
+        assert_eq!(relative.kind(), io::ErrorKind::InvalidInput);
+
+        let trailing_space = shell_delete_buffer(Path::new(r"C:\notes\Hello.md ")).unwrap_err();
+        assert_eq!(trailing_space.kind(), io::ErrorKind::InvalidInput);
+
+        let trailing_dot = shell_delete_buffer(Path::new(r"C:\notes\Hello.")).unwrap_err();
+        assert_eq!(trailing_dot.kind(), io::ErrorKind::InvalidInput);
+
+        let long = format!(r"C:\notes\{}.md", "a".repeat(MAX_PATH_UNITS));
+        let too_long = shell_delete_buffer(Path::new(&long)).unwrap_err();
+        assert_eq!(too_long.kind(), io::ErrorKind::InvalidInput);
+    }
 }

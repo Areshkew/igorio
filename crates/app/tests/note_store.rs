@@ -208,6 +208,106 @@ Eggs";
 }
 
 #[test]
+fn a_byte_order_mark_is_skipped_and_never_written_back() {
+    let scratch = Scratch::new("bom");
+    let folder = scratch.folder("notes");
+    let note_id = id(43);
+    let plain = NoteFile::render(&note(note_id, "Bom note"));
+    let with_mark = format!("\u{FEFF}{plain}");
+
+    // The same file with and without the mark gives the same metadata and body.
+    assert_eq!(NoteFile::parse(&with_mark), NoteFile::parse(&plain));
+
+    fs::write(folder.join("Bom note.md"), with_mark.as_bytes()).unwrap();
+    let store = NoteStore::new(&folder, scratch.path("note-windows.json"), at(CREATED));
+    let loaded = store.note(note_id).expect("the id comes from the block");
+    assert_eq!(loaded.text, "Bom note");
+    assert_eq!(loaded.origin, NoteOrigin::desktop());
+}
+
+#[test]
+fn a_note_read_with_a_mark_is_written_back_without_one() {
+    let scratch = Scratch::new("bom-write");
+    let folder = scratch.folder("notes");
+    let note_id = id(44);
+    let with_mark = format!("\u{FEFF}{}", NoteFile::render(&note(note_id, "Bom note")));
+    fs::write(folder.join("Bom note.md"), with_mark.as_bytes()).unwrap();
+
+    let mut store = NoteStore::new(&folder, scratch.path("note-windows.json"), at(CREATED));
+    store.update(note_id, 0.0, |note| {
+        note.text = "Bom note edited".to_owned()
+    });
+    assert!(store.flush().is_empty());
+
+    let bytes = fs::read(store.file_path(note_id).unwrap()).unwrap();
+    assert!(
+        !bytes.starts_with(b"\xEF\xBB\xBF"),
+        "the byte order mark is not written back"
+    );
+    let text = String::from_utf8(bytes).unwrap();
+    assert_eq!(NoteFile::parse(&text).0.id, Some(note_id));
+
+    let reopened = NoteStore::new(&folder, scratch.path("note-windows.json"), at(CREATED));
+    assert_eq!(reopened.note(note_id).unwrap().text, "Bom note edited");
+}
+
+#[test]
+fn a_note_without_a_mark_round_trips_byte_for_byte() {
+    let scratch = Scratch::new("round-trip");
+    let folder = scratch.folder("notes");
+    let windows = scratch.path("note-windows.json");
+    let note_id = id(45);
+    {
+        let mut store = NoteStore::new(&folder, &windows, at(CREATED));
+        store
+            .insert(note(note_id, "# Heading\nMilk\nEggs"))
+            .unwrap();
+    }
+    let path = md_files(&folder).pop().unwrap();
+    let before = fs::read(&path).unwrap();
+
+    let mut reopened = NoteStore::new(&folder, &windows, at(CREATED));
+    // Mark the note dirty without changing it: a flush right after loading must rewrite the
+    // same bytes.
+    assert!(reopened.update(note_id, 0.0, |_| {}));
+    assert!(reopened.flush().is_empty());
+    assert_eq!(
+        fs::read(reopened.file_path(note_id).unwrap()).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn a_zero_byte_markdown_file_is_not_a_note() {
+    let scratch = Scratch::new("zero-byte");
+    let folder = scratch.folder("notes");
+    let empty = folder.join("Empty.md");
+    fs::write(&empty, b"").unwrap();
+
+    // A crash between `claim_file` and the write leaves an empty file behind; it is not a
+    // note, and it is left in place because another program may be about to write it.
+    let mut store = NoteStore::new(&folder, scratch.path("note-windows.json"), at(CREATED));
+    assert!(store.notes().next().is_none());
+    store.refresh(&[], at(CREATED));
+    assert!(store.notes().next().is_none());
+    assert!(empty.exists(), "the empty file is not deleted");
+
+    // Whitespace alone is still a note, blank because it has no metadata block.
+    fs::write(&empty, " \n\t").unwrap();
+    store.refresh(&[], at(CREATED));
+    assert!(store.notes().next().expect("a blank note").is_blank());
+
+    // A file that starts empty and gets content is picked up by the next refresh.
+    let later = folder.join("Later.md");
+    fs::write(&later, b"").unwrap();
+    store.refresh(&[], at(CREATED));
+    assert_eq!(store.notes().count(), 1);
+    fs::write(&later, NoteFile::render(&note(id(46), "Later"))).unwrap();
+    store.refresh(&[], at(CREATED));
+    assert_eq!(store.note(id(46)).unwrap().text, "Later");
+}
+
+#[test]
 fn title_uses_the_first_non_empty_line_without_markdown_markers() {
     let cases = [
         ("\n\n# Heading\nbody", "Heading"),
