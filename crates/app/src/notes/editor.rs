@@ -61,9 +61,9 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_BACK,
-    VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_RETURN,
-    VK_RMENU, VK_SHIFT, VK_TAB, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LEFT,
+    VK_MENU, VK_RETURN, VK_RMENU, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     DefSubclassProc, RemoveWindowSubclass, SHCreateDataObject, SetWindowSubclass,
@@ -251,6 +251,8 @@ pub const HOVER_IN_MS: f64 = 80.0;
 pub const HOVER_OUT_MS: f64 = 120.0;
 pub const IMAGE_MS: f64 = 220.0;
 pub const MENU_MS: f64 = 120.0;
+/// A wheel notch eases over this long (pixels, not lines).
+pub const SCROLL_MS: f64 = 120.0;
 
 // ---------------------------------------------------------------------------
 // Pure layout
@@ -647,8 +649,11 @@ pub fn layout(text: &str, lines: &[Line], spans: &[Span], input: &LayoutInput) -
         }
         let empty = text[line.content..line.range.end].is_empty();
         let only_line = lines.len() == 1 && text.is_empty();
+        // A placeholder sits where the first typed character goes: at the paragraph mark, after
+        // any revealed marker, never on the marker itself.
+        let hint_at = |kind| Deco { anchor: map.to16(line.range.end), ..deco(kind) };
         if only_line {
-            decos.push(deco(DecoKind::Placeholder("Write, or type / for commands")));
+            decos.push(hint_at(DecoKind::Placeholder("Write, or type / for commands")));
         } else if empty && input.empty_caret_line == Some(index) {
             let hint = match line.block {
                 Block::Heading(1) => Some("Heading 1"),
@@ -661,7 +666,7 @@ pub fn layout(text: &str, lines: &[Line], spans: &[Span], input: &LayoutInput) -
                 _ => None,
             };
             if let Some(hint) = hint {
-                decos.push(deco(DecoKind::Placeholder(hint)));
+                decos.push(hint_at(DecoKind::Placeholder(hint)));
             }
         }
     }
@@ -1031,6 +1036,10 @@ struct SlashMenu {
 struct Hits {
     checks: Vec<(RECT, usize)>,
     images: Vec<(RECT, String)>,
+    /// The placeholder's text box and baseline, client pixels.
+    placeholder: Option<(RECT, i32)>,
+    /// The drawn scroll thumb and its track, when the text overflows.
+    thumb: Option<(RECT, RECT)>,
 }
 
 struct State {
@@ -1070,6 +1079,12 @@ struct State {
     popup: Cell<HWND>,
     popup_shown: Cell<bool>,
     undo: RefCell<UndoStack>,
+    /// A paint is running: layout and text updates wait for the next message.
+    painting: Cell<bool>,
+    /// An eased wheel scroll: from, to (pixels) on the animation clock.
+    scroll: Cell<Option<Transition>>,
+    /// Dragging the drawn scroll thumb: the grab offset inside the thumb.
+    thumb_drag: Cell<Option<i32>>,
     /// UTF-8 to UTF-16 offsets of `text`, rebuilt when the text changes.
     map: RefCell<Utf16Map>,
     recording: Cell<Recording>,
@@ -1204,6 +1219,9 @@ impl Editor {
             popup: Cell::new(HWND::default()),
             popup_shown: Cell::new(false),
             undo: RefCell::new(UndoStack::default()),
+            painting: Cell::new(false),
+            scroll: Cell::new(None),
+            thumb_drag: Cell::new(None),
             map: RefCell::new(Utf16Map::new("")),
             recording: Cell::new(Recording::Typing),
             last_selection: Cell::new(0..0),
@@ -1273,6 +1291,8 @@ impl Editor {
         s.last_selection.set(0..0);
         s.reveal.borrow_mut().clear();
         s.fade.set(None);
+        // Setting the text resets RichEdit's zoom: put the DPI zoom back.
+        s.set_zoom();
         s.relayout_all();
     }
 
@@ -1459,7 +1479,7 @@ impl Editor {
 
     /// The clipboard text a copy of `range` (bytes) produces.
     pub fn copy_text(&self, range: Range<usize>) -> String {
-        clipboard_text(&self.state.text.borrow()[range])
+        clipboard_text(self.state.text.borrow().get(range).unwrap_or_default())
     }
 
     /// The control's own OLE interface (tests import data through it).
@@ -1481,6 +1501,8 @@ impl Editor {
     pub fn freeze(&self, at: Option<f64>) {
         self.state.frozen.set(at);
         self.state.tick();
+        // Formats for the held time (a reveal fade, a block fade), not only the drawings.
+        self.state.relayout();
     }
 
     pub fn now(&self) -> f64 {
@@ -1495,6 +1517,75 @@ impl Editor {
             .as_ref()
             .filter(|menu| !menu.closing)
             .map(|menu| (menu.items.clone(), menu.selected, self.state.popup.get()))
+    }
+
+    /// Paints now and gives the placeholder's box and baseline, the revealed marker's box and
+    /// baseline on the caret's line (if it has one), and the caret's x (tests).
+    pub fn placeholder_geometry(&self) -> Option<PlaceholderGeometry> {
+        let s = &*self.state;
+        // SAFETY: a synchronous repaint of our own control.
+        let _ = unsafe { RedrawWindow(Some(s.hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW) };
+        let (placeholder, baseline) = s.hits.borrow().placeholder?;
+        let caret = s.selection_units().end;
+        let (caret_x, _) = s.position(caret);
+        let marker = {
+            let lines = s.lines.borrow();
+            let map = s.map.borrow();
+            let line = &lines[line_at(&lines, map.to8(caret))];
+            (line.content > line.range.start && reveals_prefix(line.block))
+                .then(|| (map.to16(line.range.start), map.to16(line.content)))
+        };
+        let marker = marker.and_then(|(start, end)| {
+            let (left, top) = s.point_of(start, TA_TOP.0 as i32)?;
+            let (right, bottom) = s.point_of(end, TA_BOTTOM.0 as i32)?;
+            let (_, base) = s.point_of(start, TA_BASELINE.0 as i32)?;
+            Some((RECT { left, top, right, bottom }, base))
+        });
+        Some(PlaceholderGeometry { placeholder, baseline, marker, caret_x })
+    }
+
+    /// The scroll position in pixels and the drawn thumb, after a paint (tests).
+    pub fn scroll_state(&self) -> (i32, Option<RECT>) {
+        let s = &*self.state;
+        // SAFETY: a synchronous repaint of our own control.
+        let _ = unsafe { RedrawWindow(Some(s.hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW) };
+        let (y, _, _) = s.scroll_metrics();
+        (y, s.hits.borrow().thumb.map(|(thumb, _)| thumb))
+    }
+
+    /// Is the caret inside the editor's visible area (tests)?
+    pub fn caret_visible(&self) -> bool {
+        let s = &*self.state;
+        let caret = s.selection_units().end;
+        let (x, y) = s.position(caret);
+        let mut client = RECT::default();
+        // SAFETY: same-thread window, writable local.
+        let _ = unsafe { GetClientRect(s.hwnd, &mut client) };
+        x >= client.left && x <= client.right && y >= client.top && y < client.bottom
+    }
+
+    /// Paints now and checks that every drawn checkbox sits on its own line (tests). `None` when
+    /// they all do, else what is off.
+    pub fn decos_aligned(&self) -> Option<String> {
+        let s = &*self.state;
+        // SAFETY: a synchronous repaint of our own control.
+        let _ = unsafe { RedrawWindow(Some(s.hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW) };
+        let layout = s.layout.borrow();
+        for (rect, line) in s.hits.borrow().checks.iter() {
+            let Some(deco) = layout.decos.iter().find(|deco| deco.line == *line) else {
+                return Some(format!("box for line {line} has no drawing"));
+            };
+            let (_, top) = s.position(deco.anchor);
+            let height = px(f64::from(deco.size) * 1.36, s.dpi.get());
+            let middle = (rect.top + rect.bottom) / 2;
+            if middle < top || middle > top + height {
+                return Some(format!(
+                    "box of line {line} at {middle}, its line spans {top}..{}",
+                    top + height
+                ));
+            }
+        }
+        None
     }
 
     /// Is any animation timer running?
@@ -1558,6 +1649,16 @@ impl Drop for Editor {
             }
         }
     }
+}
+
+/// Where a placeholder was drawn, against the marker before it (tests).
+#[derive(Clone, Copy, Debug)]
+pub struct PlaceholderGeometry {
+    pub placeholder: RECT,
+    pub baseline: i32,
+    /// The revealed marker's box and baseline, when the line shows one.
+    pub marker: Option<(RECT, i32)>,
+    pub caret_x: i32,
 }
 
 /// Keyboard and menu actions of the editor.
@@ -1680,6 +1781,10 @@ impl State {
 
     /// The control's text changed (typing, undo, paste, an edit of ours).
     fn text_changed(&self) {
+        if self.painting.get() {
+            self.post_resync();
+            return;
+        }
         if self.suppress.get() > 0 {
             return;
         }
@@ -1770,6 +1875,10 @@ impl State {
     }
 
     fn selection_changed(&self) {
+        if self.painting.get() {
+            self.post_resync();
+            return;
+        }
         if self.suppress.get() > 0 || self.composing.get() {
             return;
         }
@@ -1881,16 +1990,33 @@ impl State {
 
     fn relayout_decos_only(&self) {
         let layout = self.compute_layout();
-        self.layout.borrow_mut().decos = layout.decos;
+        if let Ok(mut current) = self.layout.try_borrow_mut() {
+            current.decos = layout.decos;
+        }
         self.invalidate();
     }
 
     /// Lays the note out and applies what changed.
     fn relayout(&self) {
+        if self.painting.get() {
+            self.post_resync();
+            return;
+        }
         let layout = self.compute_layout();
+        // The new layout is in place before formats are applied: applying can paint at once
+        // (Unfreeze), and a paint must never see drawings of an older text.
+        if let Ok(mut slot) = self.layout.try_borrow_mut() {
+            *slot = layout.clone();
+        }
         self.apply_layout(&layout);
-        *self.layout.borrow_mut() = layout;
         self.invalidate();
+    }
+
+    /// Runs the text and selection updates again after the current message (used when they
+    /// arrive while a paint is in progress).
+    fn post_resync(&self) {
+        // SAFETY: a scalar message to our own control.
+        let _ = unsafe { PostMessageW(Some(self.hwnd), RESYNC, WPARAM(0), LPARAM(0)) };
     }
 
     fn font_for(&self, fmt: Fmt) -> Option<ITextFont> {
@@ -2425,12 +2551,143 @@ impl State {
 
     // --- Animation clock -------------------------------------------------------------------
 
+    /// The scroll position, the text's full height and the visible height, pixels.
+    fn scroll_metrics(&self) -> (i32, i32, i32) {
+        let mut scroll = POINT::default();
+        self.send(EM_GETSCROLLPOS, 0, &mut scroll as *mut POINT as isize);
+        let total = self.units.borrow().len();
+        let (_, end_y) = self.position(total);
+        let content = end_y + scroll.y + px(22.0, self.dpi.get());
+        let mut client = RECT::default();
+        // SAFETY: same-thread window, writable local.
+        let _ = unsafe { GetClientRect(self.hwnd, &mut client) };
+        (scroll.y, content, client.bottom - client.top)
+    }
+
+    /// The drawn thumb and its track (client pixels), or `None` when the text fits.
+    fn thumb_rects(&self, client: RECT) -> Option<(RECT, RECT)> {
+        let s = |value: f64| px(value, self.dpi.get());
+        let (scroll, content, visible) = self.scroll_metrics();
+        if content <= visible + s(2.0) || visible <= 0 {
+            return None;
+        }
+        let track_len = (visible - s(4.0)).max(1);
+        let length = (i64::from(track_len) * i64::from(visible) / i64::from(content.max(1)))
+            .clamp(i64::from(s(18.0).min(track_len)), i64::from(track_len))
+            as i32;
+        let top = s(2.0)
+            + (i64::from(track_len - length) * i64::from(scroll.max(0))
+                / i64::from((content - visible).max(1))) as i32;
+        let thumb = RECT {
+            left: client.right - s(4.0),
+            top,
+            right: client.right - s(1.0),
+            bottom: top + length,
+        };
+        let track = RECT {
+            left: client.right - s(10.0),
+            top: s(2.0),
+            right: client.right,
+            bottom: s(2.0) + track_len,
+        };
+        Some((thumb, track))
+    }
+
+    fn set_scroll(&self, y: f64) {
+        let point = POINT { x: 0, y: y.round() as i32 };
+        self.send(EM_SETSCROLLPOS, 0, &point as *const POINT as isize);
+        self.invalidate();
+    }
+
+    /// Scrolls by `dy` pixels (positive is down), eased unless motion is off; clamped to the
+    /// text. A note shorter than its window does not move.
+    fn scroll_by(&self, dy: f64) {
+        let (current, content, visible) = self.scroll_metrics();
+        let limit = f64::from((content - visible).max(0));
+        let now = self.now();
+        let from = f64::from(current);
+        let base = self.scroll.get().map_or(from, |track| track.to);
+        let target = (base + dy).clamp(0.0, limit);
+        if (target - from).abs() < 0.5 && self.scroll.get().is_none() {
+            return;
+        }
+        if self.motion.get() && self.frozen.get().is_none() {
+            let mut track = Transition::at(from);
+            track.retarget(target, now, SCROLL_MS);
+            self.scroll.set(Some(track));
+            self.start_timer();
+        } else {
+            self.scroll.set(None);
+            self.set_scroll(target);
+        }
+    }
+
+    /// One wheel message: the system's lines per notch times a line's height, in pixels, so
+    /// high-resolution wheels (deltas below 120) scroll by their share.
+    fn wheel(&self, delta: i16, horizontal: bool) {
+        if horizontal {
+            return; // Text wraps: there is nothing to scroll sideways.
+        }
+        let mut lines: u32 = 3;
+        // SAFETY: SPI_GETWHEELSCROLLLINES writes one UINT into the local.
+        let _ = unsafe {
+            SystemParametersInfoW(
+                SPI_GETWHEELSCROLLLINES,
+                0,
+                Some((&mut lines as *mut u32).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+        };
+        let (_, _, visible) = self.scroll_metrics();
+        let notch = if lines == u32::MAX {
+            f64::from(visible) // "One screen at a time".
+        } else {
+            f64::from(lines.min(20)) * f64::from(px(BODY as f64 * 1.36, self.dpi.get()))
+        };
+        self.scroll_by(-f64::from(delta) / 120.0 * notch);
+    }
+
+    /// A press on the scroll track: drag the thumb, or page towards the press.
+    fn thumb_press(&self, x: i32, y: i32) -> bool {
+        let Some((thumb, track)) = self.hits.borrow().thumb else { return false };
+        if x < track.left || x >= track.right || y < track.top || y >= track.bottom {
+            return false;
+        }
+        if y >= thumb.top && y < thumb.bottom {
+            self.thumb_drag.set(Some(y - thumb.top));
+            // SAFETY: mouse capture for our own control while the button is down.
+            unsafe {
+                SetCapture(self.hwnd);
+            }
+            self.invalidate();
+        } else {
+            let (_, _, visible) = self.scroll_metrics();
+            let page = f64::from(visible) * 0.9;
+            self.scroll_by(if y < thumb.top { -page } else { page });
+        }
+        true
+    }
+
+    fn thumb_move(&self, y: i32) {
+        let Some(grab) = self.thumb_drag.get() else { return };
+        let Some((thumb, track)) = self.hits.borrow().thumb else { return };
+        let (_, content, visible) = self.scroll_metrics();
+        let room = (track.bottom - track.top) - (thumb.bottom - thumb.top);
+        if room <= 0 {
+            return;
+        }
+        let top = (y - grab - track.top).clamp(0, room);
+        self.scroll.set(None);
+        self.set_scroll(f64::from(top) * f64::from((content - visible).max(0)) / f64::from(room));
+    }
+
     fn any_active(&self, now: f64) -> bool {
         self.reveal.borrow().values().any(|track| track.active(now))
             || self.fade.get().is_some_and(|(_, track)| track.active(now))
             || self.check.get().is_some_and(|(_, track)| track.active(now))
             || self.hover.get().1.active(now)
             || self.images_in.borrow().values().any(|track| track.active(now))
+            || self.scroll.get().is_some()
             || self.slash.borrow().as_ref().is_some_and(|menu| {
                 menu.intro.active(now) || menu.highlight.active(now) || menu.closing
             })
@@ -2453,6 +2710,12 @@ impl State {
 
     fn tick(&self) {
         let now = self.now();
+        if let Some(track) = self.scroll.get() {
+            self.set_scroll(track.value(now));
+            if !track.active(now) {
+                self.scroll.set(None);
+            }
+        }
         let formats =
             self.reveal.borrow().values().any(|track| track.active(now) || track.to == 0.0)
                 || self.fade.get().is_some();
@@ -2495,7 +2758,24 @@ impl State {
         // SAFETY: same-thread window, writable local.
         let _ = unsafe { GetClientRect(self.hwnd, &mut client) };
         let (width, height) = (client.right.max(1) as u32, client.bottom.max(1) as u32);
-        let mut storage = self.surface.borrow_mut();
+        // A paint never nests (RichEdit can paint while formats are applied): a nested one
+        // only asks for another paint.
+        if self.painting.get() {
+            self.invalidate();
+            return;
+        }
+        let Ok(mut storage) = self.surface.try_borrow_mut() else {
+            self.invalidate();
+            return;
+        };
+        self.painting.set(true);
+        struct Painting<'a>(&'a Cell<bool>);
+        impl Drop for Painting<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _painting = Painting(&self.painting);
         if storage.as_ref().is_none_or(|surface| surface.width != width || surface.height != height)
         {
             *storage = Surface::new(width, height).ok();
@@ -2533,6 +2813,20 @@ impl State {
         }
     }
 
+    /// A point of the character at `unit` from TOM, client pixels: `align` is a TA_ value
+    /// (TA_BASELINE gives the baseline).
+    fn point_of(&self, unit: usize, align: i32) -> Option<(i32, i32)> {
+        let (mut x, mut y) = (0, 0);
+        // SAFETY: TOM calls on this thread's document with a range of our own.
+        unsafe {
+            let range = self.doc.Range(unit as i32, unit as i32).ok()?;
+            range
+                .GetPoint(tomConstants(tomStart.0 | tomClientCoord.0 | align), &mut x, &mut y)
+                .ok()?;
+        }
+        Some((x, y))
+    }
+
     fn position(&self, unit: usize) -> (i32, i32) {
         let mut point = windows::Win32::Foundation::POINTL::default();
         self.send(EM_POSFROMCHAR, &mut point as *mut _ as usize, unit as isize);
@@ -2540,7 +2834,7 @@ impl State {
     }
 
     fn paint_decos(&self, canvas: &mut Canvas<'_>, fonts: GdiFonts, client: RECT) {
-        let layout = self.layout.borrow();
+        let Ok(layout) = self.layout.try_borrow() else { return };
         let palette = self.palette.get();
         let dpi = self.dpi.get();
         let scale = f64::from(dpi) / 96.0;
@@ -2644,7 +2938,11 @@ impl State {
                     }
                     if last && let Some(top) = block_top.take() {
                         let bottom =
-                            y + if deco.revealed || lines[deco.line].block == Block::Code {
+                            y + if deco.revealed
+                                || lines
+                                    .get(deco.line)
+                                    .is_some_and(|line| line.block == Block::Code)
+                            {
                                 line_h
                             } else {
                                 s(2.0)
@@ -2673,45 +2971,36 @@ impl State {
                     hits.images.push((rect, path.clone()));
                 }
                 DecoKind::Placeholder(hint) => {
-                    let label = RECT { left: x, top: y, right: client.right, bottom: y + line_h };
-                    let font =
-                        if matches!(lines.get(deco.line).map(|l| l.block), Some(Block::Heading(_)))
-                        {
-                            fonts.heading(lines[deco.line].block)
-                        } else {
-                            fonts.body
-                        };
-                    canvas.label(
-                        label,
-                        hint,
-                        palette.faint,
-                        font,
-                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                    );
+                    // On the paragraph mark's own baseline, in the block's font, just after the
+                    // caret.
+                    let block = lines.get(deco.line).map_or(Block::Paragraph, |line| line.block);
+                    let font = match block {
+                        Block::Heading(_) => fonts.heading(block),
+                        _ => fonts.body,
+                    };
+                    let baseline = self
+                        .point_of(deco.anchor, TA_BASELINE.0 as i32)
+                        .map_or(y + line_h * 3 / 4, |(_, baseline)| baseline);
+                    let left = x + s(1.0).max(1) + 1;
+                    let (width, ascent, descent) = canvas.measure(hint, font);
+                    canvas.label_at_baseline(left, baseline, hint, palette.faint, font);
+                    hits.placeholder = Some((
+                        RECT {
+                            left,
+                            top: baseline - ascent,
+                            right: left + width,
+                            bottom: baseline + descent,
+                        },
+                        baseline,
+                    ));
                 }
             }
         }
         // A thin scroll thumb when the text is taller than the editor (no classic scrollbar).
-        let mut scroll = POINT::default();
-        self.send(EM_GETSCROLLPOS, 0, &mut scroll as *mut POINT as isize);
-        let total = self.units.borrow().len();
-        let (_, end_y) = self.position(total);
-        let content = end_y + scroll.y + s(22.0);
-        let visible = client.bottom - client.top;
-        if content > visible + s(2.0) && visible > 0 {
-            let track = visible - s(4.0);
-            let length = (i64::from(track) * i64::from(visible) / i64::from(content))
-                .max(i64::from(s(18.0))) as i32;
-            let top = s(2.0)
-                + (i64::from(track - length) * i64::from(scroll.y)
-                    / i64::from((content - visible).max(1))) as i32;
-            let thumb = RECT {
-                left: client.right - s(4.0),
-                top,
-                right: client.right - s(1.0),
-                bottom: top + length,
-            };
-            canvas.fill(thumb, s(1.5) as f32, palette.muted, 0.35);
+        if let Some((thumb, track)) = self.thumb_rects(client) {
+            let dragging = self.thumb_drag.get().is_some();
+            canvas.fill(thumb, s(1.5) as f32, palette.muted, if dragging { 0.6 } else { 0.35 });
+            hits.thumb = Some((thumb, track));
         }
         *self.hits.borrow_mut() = hits;
     }
@@ -3032,6 +3321,9 @@ unsafe extern "system" fn editor_proc(
                 return result;
             }
         }
+        WM_LBUTTONDOWN if s.thumb_press(i32::from(lp.0 as i16), i32::from((lp.0 >> 16) as i16)) => {
+            return LRESULT(0);
+        }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             let (x, y) = (i32::from(lp.0 as i16), i32::from((lp.0 >> 16) as i16));
             if let Some(line) = s.check_at(x, y) {
@@ -3053,6 +3345,23 @@ unsafe extern "system" fn editor_proc(
                 return LRESULT(0);
             }
             s.close_slash();
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            s.wheel((wp.0 >> 16) as u16 as i16, msg == WM_MOUSEHWHEEL);
+            return LRESULT(0);
+        }
+        WM_MOUSEMOVE if s.thumb_drag.get().is_some() => {
+            s.thumb_move(i32::from((lp.0 >> 16) as i16));
+            return LRESULT(0);
+        }
+        WM_LBUTTONUP | WM_CAPTURECHANGED if s.thumb_drag.get().is_some() => {
+            s.thumb_drag.set(None);
+            if msg == WM_LBUTTONUP {
+                // SAFETY: ends our own capture.
+                let _ = unsafe { ReleaseCapture() };
+            }
+            s.invalidate();
+            return LRESULT(0);
         }
         WM_MOUSEMOVE => {
             let (x, y) = (i32::from(lp.0 as i16), i32::from((lp.0 >> 16) as i16));
@@ -3081,6 +3390,18 @@ impl State {
     /// A hand over checkboxes, and over links while Ctrl is held.
     fn cursor_override(&self) -> bool {
         let Some((x, y)) = self.cursor_point() else { return false };
+        let over_track = self.hits.borrow().thumb.is_some_and(|(_, track)| {
+            x >= track.left && x < track.right && y >= track.top && y < track.bottom
+        });
+        if over_track || self.thumb_drag.get().is_some() {
+            // SAFETY: a shared system cursor.
+            unsafe {
+                if let Ok(cursor) = LoadCursorW(None, IDC_ARROW) {
+                    SetCursor(Some(cursor));
+                }
+            }
+            return true;
+        }
         let hand = self.check_at(x, y).is_some()
             || (key_down(VK_CONTROL) && self.link_at_point(x, y).is_some());
         if hand {
@@ -3727,6 +4048,8 @@ struct Label {
     ink: COLORREF,
     font: HFONT,
     format: DRAW_TEXT_FORMAT,
+    /// Drawn with its baseline at this point instead of inside `rect`.
+    baseline: Option<(i32, i32)>,
 }
 
 /// tiny-skia drawing on a DIB (BGRA, so colours are fed with red and blue swapped), plus GDI
@@ -3936,10 +4259,47 @@ impl Canvas<'_> {
         if rect.right <= rect.left || rect.bottom <= rect.top || text.is_empty() {
             return;
         }
-        self.labels.push(Label { rect, text: text.to_owned(), ink, font, format });
+        self.labels.push(Label { rect, text: text.to_owned(), ink, font, format, baseline: None });
     }
 
     /// Draws the queued labels with GDI (ClearType on the opaque background already there).
+    /// Text with its baseline at (x, baseline), as the text control draws its own.
+    pub fn label_at_baseline(
+        &mut self,
+        x: i32,
+        baseline: i32,
+        text: &str,
+        ink: COLORREF,
+        font: HFONT,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        self.labels.push(Label {
+            rect: RECT::default(),
+            text: text.to_owned(),
+            ink,
+            font,
+            format: DRAW_TEXT_FORMAT(0),
+            baseline: Some((x, baseline)),
+        });
+    }
+
+    /// Width, ascent and descent of a text in a font, pixels.
+    pub fn measure(&self, text: &str, font: HFONT) -> (i32, i32, i32) {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut size = SIZE::default();
+        let mut metrics = TEXTMETRICW::default();
+        // SAFETY: the surface's DC with a font selected for the queries, then restored.
+        unsafe {
+            let old = SelectObject(self.dc, font.into());
+            let _ = GetTextExtentPoint32W(self.dc, &units, &mut size);
+            let _ = GetTextMetricsW(self.dc, &mut metrics);
+            SelectObject(self.dc, old);
+        }
+        (size.cx, metrics.tmAscent, metrics.tmDescent)
+    }
+
     pub fn finish_labels(&mut self) {
         let labels = std::mem::take(&mut self.labels);
         if labels.is_empty() {
@@ -3953,6 +4313,12 @@ impl Canvas<'_> {
                 SelectObject(self.dc, label.font.into());
                 SetTextColor(self.dc, label.ink);
                 let mut units: Vec<u16> = label.text.encode_utf16().collect();
+                if let Some((x, baseline)) = label.baseline {
+                    SetTextAlign(self.dc, TA_LEFT | TA_BASELINE);
+                    let _ = TextOutW(self.dc, x, baseline, &units);
+                    SetTextAlign(self.dc, TA_LEFT | TA_TOP);
+                    continue;
+                }
                 let mut rect = label.rect;
                 DrawTextW(self.dc, &mut units, &mut rect, label.format | DT_NOPREFIX);
             }
