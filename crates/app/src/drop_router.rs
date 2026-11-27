@@ -4479,9 +4479,9 @@ impl LiveEnv {
         router.clipboard_changed(now, state, self);
     }
 
-    /// At quit: let the router put the user's clipboard back, waiting up to `timeout` for
-    /// the clipboard replies it needs, then stop the threads.
-    fn finish(&mut self, router: &mut Router<clipboard::Snapshot>, timeout: Duration) {
+    /// The router's quit: put the user's clipboard back if ours is still there, waiting up to
+    /// `timeout` for the clipboard replies. A second call finds nothing left to do.
+    fn restore(&mut self, router: &mut Router<clipboard::Snapshot>, timeout: Duration) {
         let until = Instant::now() + timeout;
         let mut waiting = router.quit(hook::now(), self);
         while let Some(ticket) = waiting {
@@ -4497,6 +4497,12 @@ impl LiveEnv {
             }
             waiting = router.quit_reply(convert_reply(reply), hook::now(), self);
         }
+    }
+
+    /// At quit: let the router put the user's clipboard back, waiting up to `timeout` for
+    /// the clipboard replies it needs, then stop the threads.
+    fn finish(&mut self, router: &mut Router<clipboard::Snapshot>, timeout: Duration) {
+        self.restore(router, timeout);
         // Dropping the clipboard stops its thread: it rolls back if our staging is still
         // there, else renders what we still own, so the clipboard stays valid.
         self.clip = None;
@@ -4863,6 +4869,23 @@ impl Drops {
 
     pub fn next_deadline(&self) -> Option<f64> {
         self.router.next_deadline()
+    }
+
+    /// The first step of [`Drop`], for session end: put the user's clipboard back if a paste
+    /// left ours there, waiting up to `within` for the clipboard replies. The workers keep
+    /// running; dropping `Drops` later finds nothing left to restore.
+    pub fn restore_clipboard(&mut self, within: Duration) {
+        if let Some(env) = &mut self.env {
+            env.restore(&mut self.router, within);
+        }
+    }
+
+    /// The second step of [`Drop`], for session end: stop the clipboard thread (bounded by its
+    /// own wait). It renders what we still own, so the clipboard stays valid after exit.
+    pub fn stop_clipboard(&mut self) {
+        if let Some(env) = &mut self.env {
+            env.clip = None;
+        }
     }
 
     /// A double-click is being handled or a delivery runs.

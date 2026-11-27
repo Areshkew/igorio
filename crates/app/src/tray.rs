@@ -38,8 +38,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_POPUP, MF_SEPARATOR, MF_STRING, MSGFLT_ALLOW, PostMessageW, RegisterClassExW,
     RegisterWindowMessageW, SM_CXSMICON, SM_MENUDROPALIGNMENT, SetForegroundWindow,
     SetWindowLongPtrW, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON,
-    TrackPopupMenuEx, WINDOW_STYLE, WM_APP, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_NCDESTROY, WM_NULL, WM_SETTINGCHANGE, WNDCLASSEXW, WS_EX_TOOLWINDOW,
+    TrackPopupMenuEx, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ENDSESSION, WM_NCDESTROY, WM_NULL, WM_QUERYENDSESSION, WM_SETTINGCHANGE,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW,
 };
 use windows::core::{Error, PCWSTR, Result, w};
 
@@ -87,6 +88,32 @@ impl MenuItem {
     }
 }
 
+/// A request to end the app that reached the tray window (see [`Tray::on_end`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndRequest {
+    /// WM_CLOSE: `taskkill` without /F, or any tool that closes the app's windows.
+    Close,
+    /// WM_QUERYENDSESSION: Windows asks whether the session may end. The tray answers yes.
+    QueryEndSession,
+    /// WM_ENDSESSION with wParam TRUE: the session ends. Windows may end the process as soon
+    /// as the handler returns.
+    EndSession,
+}
+
+/// The request a window message carries, if any. WM_ENDSESSION with wParam FALSE means the
+/// session end was cancelled: nothing to do.
+pub fn end_request(msg: u32, wparam: usize) -> Option<EndRequest> {
+    match msg {
+        WM_CLOSE => Some(EndRequest::Close),
+        WM_QUERYENDSESSION => Some(EndRequest::QueryEndSession),
+        WM_ENDSESSION if wparam != 0 => Some(EndRequest::EndSession),
+        _ => None,
+    }
+}
+
+/// Receives the [`EndRequest`]s, see [`Tray::on_end`].
+type OnEnd = Box<dyn FnMut(EndRequest)>;
+
 /// The tray icon. Not `Send`: it must be dropped on the thread that created it.
 pub struct Tray {
     inner: Rc<Inner>,
@@ -104,6 +131,7 @@ struct Inner {
     build_menu: RefCell<Box<dyn FnMut() -> Vec<MenuItem>>>,
     on_action: RefCell<Box<dyn FnMut(u32)>>,
     pending: RefCell<VecDeque<u32>>,
+    on_end: RefCell<Option<OnEnd>>,
     menu_open: Cell<bool>,
     closing: Cell<bool>,
 }
@@ -153,6 +181,7 @@ impl Tray {
             build_menu: RefCell::new(build_menu),
             on_action: RefCell::new(on_action),
             pending: RefCell::new(VecDeque::new()),
+            on_end: RefCell::new(None),
             menu_open: Cell::new(false),
             closing: Cell::new(false),
         });
@@ -220,6 +249,14 @@ impl Tray {
         };
         // SAFETY: `id` is a fully initialised identifier that outlives the call.
         unsafe { Shell_NotifyIconGetRect(&id) }
+    }
+
+    /// Hands WM_CLOSE, WM_QUERYENDSESSION and WM_ENDSESSION(TRUE) to `on_end` instead of the
+    /// default handling (which destroys the window on WM_CLOSE). It runs inside the window
+    /// procedure, so for [`EndRequest::EndSession`] it must finish its work before it returns.
+    /// The tray answers WM_QUERYENDSESSION with TRUE: it never blocks the session end.
+    pub fn on_end(&self, on_end: Box<dyn FnMut(EndRequest)>) {
+        *self.inner.on_end.borrow_mut() = Some(on_end);
     }
 
     /// The hidden window that owns the icon. Valid until the `Tray` is dropped.
@@ -303,6 +340,18 @@ impl Inner {
         if self.closing.get() {
             // SAFETY: forwarding the same arguments the system gave us.
             return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+        }
+        if let Some(request) = end_request(msg, wparam.0)
+            && self.on_end.try_borrow().is_ok_and(|on_end| on_end.is_some())
+        {
+            // Busy means a request is being handled further up the stack (it pumped
+            // messages); the quit it started covers this one too.
+            if let Ok(mut on_end) = self.on_end.try_borrow_mut()
+                && let Some(on_end) = on_end.as_mut()
+            {
+                on_end(request);
+            }
+            return LRESULT((request == EndRequest::QueryEndSession) as isize);
         }
         match msg {
             CALLBACK_MSG => {
@@ -930,6 +979,17 @@ mod tests {
             assert!((0..size).any(|x| alpha(x, 1) > 0), "size {size}");
             assert!((0..size).any(|x| alpha(x, size - 2) > 0), "size {size}");
         }
+    }
+
+    #[test]
+    fn end_requests_from_window_messages() {
+        assert_eq!(end_request(WM_CLOSE, 0), Some(EndRequest::Close));
+        assert_eq!(end_request(WM_QUERYENDSESSION, 0), Some(EndRequest::QueryEndSession));
+        assert_eq!(end_request(WM_ENDSESSION, 1), Some(EndRequest::EndSession));
+        // The session end was cancelled.
+        assert_eq!(end_request(WM_ENDSESSION, 0), None);
+        assert_eq!(end_request(WM_NULL, 1), None);
+        assert_eq!(end_request(CALLBACK_MSG, 0), None);
     }
 
     #[test]
