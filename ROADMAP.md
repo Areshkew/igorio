@@ -277,6 +277,30 @@ Out of scope: databases, pages in pages, drag handles, tables, columns, mentions
 Risk: this is built on the RichEdit control. If RichEdit cannot carry a part of it well,
 that part is left out or done more simply; a custom text view is a separate, larger job.
 
+## Hidden notes and the notes panel
+
+Not in the macOS app; the owner asked for it.
+
+- A note is shown, hidden or closed (put away). The header's hide button (left of delete)
+  saves the note at once and fades it out like a put-away note. A hidden note stays open
+  but off screen: it does not come back on the next start. A blank note is put away
+  instead.
+- The hidden state lives only in the app's windows file (`isHidden`, written only when
+  true), so the note files stay as the Mac app writes them and older files read as shown.
+- The tray's "Notes…" opens the notes panel next to the tray icon (the corner by the
+  taskbar when the icon is in the overflow area). It is a popup of the notes thread
+  (`notes/panel.rs`) in the settings window's style: every note, newest edit first, with
+  its title, a preview, when it changed and its state. A filter field at the top keeps the
+  notes whose title or text holds every typed word, ignoring case. Up and Down move, Enter
+  shows the note and brings it to the front, Esc clears the filter or closes the panel,
+  Ctrl+H shows or hides, Ctrl+Shift+Delete deletes (to the Recycle Bin, without asking,
+  as the note's own delete). Each row has the same two actions; "Hide all" hides the shown
+  notes and "Show all" shows the hidden ones (closed notes stay closed). The list follows
+  changes while the panel is open. The panel closes when another window takes the
+  foreground.
+- A shown-again note grows in like a new note. The tray's "Recent Notes" lists the five
+  notes changed last; choosing a hidden one shows it.
+
 ## Milestones
 
 Each one ends with a check that must pass before the next starts.

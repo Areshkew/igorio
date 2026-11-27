@@ -370,6 +370,7 @@ fn run() -> Result<bool> {
         origin: NoteOrigin::desktop(),
         frame: Rect::default(),
         is_open: false,
+        is_hidden: false,
     };
     fs::create_dir_all(root.join("Notes"))?;
     let mac_path = root.join("Notes").join("From the Mac.md");
@@ -967,7 +968,7 @@ fn run() -> Result<bool> {
         editor.set_focused(false);
         editor.set_text(SHOWCASE);
     });
-    notes.test_with(first, |note| note.hover_button(Some(1)));
+    notes.test_with(first, |note| note.hover_button(Some(2)));
     shot(&mut checks, hwnd_of(&notes, first), &pictures, "notes-header-close-hover.png")?;
     notes.test_with(first, |note| note.hover_button(None));
 

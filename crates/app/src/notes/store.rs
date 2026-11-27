@@ -289,6 +289,9 @@ pub struct Note {
     pub frame: Rect,
     /// On screen or put away (put-away notes stay listed in the menu).
     pub is_open: bool,
+    /// Open but hidden: the window is off screen until it is shown again (from the notes
+    /// panel or the menu). Not in the Swift app; kept in the windows file only.
+    pub is_hidden: bool,
 }
 
 impl Note {
@@ -501,6 +504,8 @@ fn is_reserved_device_name(stem: &str) -> bool {
 pub struct WindowState {
     pub frame: Rect,
     pub is_open: bool,
+    /// Open but hidden (see [`Note::is_hidden`]).
+    pub is_hidden: bool,
 }
 
 /// The on-disk form of a note, from `NoteFile` in Swift: a front matter block, then the
@@ -933,6 +938,7 @@ impl NoteStore {
             WindowState {
                 frame: note.frame,
                 is_open: note.is_open,
+                is_hidden: note.is_hidden,
             },
         );
         // Window state is beside the note, not in it; failing to save it must not lose text.
@@ -1059,6 +1065,7 @@ impl NoteStore {
                 origin: meta.origin,
                 frame: window.map_or_else(Rect::default, |state| state.frame),
                 is_open: window.is_some_and(|state| state.is_open),
+                is_hidden: window.is_some_and(|state| state.is_hidden),
             };
             result.push((note, path));
         }
@@ -1196,6 +1203,14 @@ struct WindowFile {
     frame: FrameFile,
     #[serde(rename = "isOpen")]
     is_open: bool,
+    /// Added by the Windows app; files written before it lack it and read as not hidden.
+    /// Readers that do not know it ignore it (serde skips unknown fields).
+    #[serde(rename = "isHidden", default, skip_serializing_if = "is_false")]
+    is_hidden: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl From<WindowState> for WindowFile {
@@ -1208,6 +1223,7 @@ impl From<WindowState> for WindowFile {
                 height: state.frame.height,
             },
             is_open: state.is_open,
+            is_hidden: state.is_hidden,
         }
     }
 }
@@ -1222,6 +1238,7 @@ impl From<WindowFile> for WindowState {
                 saved.frame.height,
             ),
             is_open: saved.is_open,
+            is_hidden: saved.is_hidden,
         }
     }
 }

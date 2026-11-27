@@ -53,6 +53,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, Result, w};
 
+use super::panel::{self, NoteState, Panel, PanelNote, PanelRequest};
 use super::editor::{
     self, Editor, EditorConfig, EditorEvent, GdiFonts, Palette, Surface, Transition, mix, px,
 };
@@ -81,6 +82,7 @@ pub const ORIGIN_ID: i32 = 101;
 pub const DELETE_ID: i32 = 102;
 pub const CLOSE_ID: i32 = 103;
 pub const EDITOR_ID: i32 = 104;
+pub const HIDE_ID: i32 = 105;
 
 const NOTE_CLASS: PCWSTR = w!("IgorioNote");
 const HUB_CLASS: PCWSTR = w!("IgorioNotesThread");
@@ -146,6 +148,8 @@ pub struct RecentNote {
     pub detail: String,
     pub updated_at: SystemTime,
     pub is_open: bool,
+    /// Hidden with the header's hide button (or from the notes panel).
+    pub is_hidden: bool,
 }
 
 /// What the notes thread tells the UI thread.
@@ -216,6 +220,12 @@ enum Command {
     Shutdown,
     /// Internal: a closed window finished fading out.
     Reap(NoteId),
+    Hide(NoteId),
+    /// Opens the notes panel next to the tray icon (`None`: the tray's corner), or closes it.
+    TogglePanel(Option<RECT>),
+    /// What the panel asked for (it runs on this thread; acting later keeps it out of its own
+    /// message handling).
+    Panel(PanelRequest),
 }
 
 struct Wake(HANDLE);
@@ -318,6 +328,34 @@ impl Notes {
     /// Shows a note from the recent list (or brings it forward and focuses it).
     pub fn reopen(&self, id: NoteId) {
         self.send(Command::Reopen(id));
+    }
+
+    /// Hides a note: saved first, then off screen until it is shown from the notes panel or the
+    /// menu, also after a restart.
+    pub fn hide(&self, id: NoteId) {
+        self.send(Command::Hide(id));
+    }
+
+    /// Opens the notes panel next to the tray icon at `anchor` (physical pixels; `None` when
+    /// the icon is in the overflow area), or closes it when it is open.
+    pub fn toggle_panel(&self, anchor: Option<RECT>) {
+        self.send(Command::TogglePanel(anchor));
+    }
+
+    /// Runs `f` on the notes thread with the open panel and waits for it (tests only).
+    #[doc(hidden)]
+    pub fn test_panel<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Panel) -> R + Send + 'static,
+    ) -> Option<R> {
+        let result = Arc::new(Mutex::new(None));
+        let out = result.clone();
+        self.run_test(Box::new(move |hub: &Hub| {
+            if let Some(panel) = hub.panel.borrow().as_ref() {
+                *out.lock().expect("test result") = Some(f(panel));
+            }
+        }));
+        result.lock().ok()?.take()
     }
 
     /// Takes a note off screen; a blank note is discarded (Swift `putAway`).
@@ -484,7 +522,8 @@ impl TestNote<'_> {
         self.window.freeze_appear(at);
     }
 
-    /// Shows the header buttons and hovers one (0 delete, 1 put away), as the pointer would.
+    /// Shows the header buttons and hovers one (0 hide, 1 delete, 2 put away), as the pointer
+    /// would.
     pub fn hover_button(&self, index: Option<usize>) {
         self.window.hovering.set(true);
         self.window.buttons_shown.set(Transition::at(1.0));
@@ -577,16 +616,20 @@ pub fn edited_label(created: SystemTime, updated: SystemTime, now: SystemTime) -
     } else {
         "Edited"
     };
+    format!("{verb} {}", ago(updated, now))
+}
+
+/// How long before `now` a note changed: "just now", "5 minutes ago", "yesterday".
+pub fn ago(updated: SystemTime, now: SystemTime) -> String {
     let ago = now.duration_since(updated).unwrap_or_default().as_secs();
-    let when = match ago {
+    match ago {
         0..60 => "just now".to_owned(),
         60..3600 => plural(ago / 60, "minute"),
         3600..86_400 => plural(ago / 3600, "hour"),
         86_400..172_800 => "yesterday".to_owned(),
         172_800..1_209_600 => plural(ago / 86_400, "day"),
         _ => plural(ago / 604_800, "week"),
-    };
-    format!("{verb} {when}")
+    }
 }
 
 fn plural(count: u64, unit: &str) -> String {
@@ -744,6 +787,7 @@ fn run(
         active: Cell::new(None),
         quitting: Cell::new(false),
         handling: Cell::new(false),
+        panel: RefCell::new(None),
     });
     // SAFETY: the hub outlives the message window (destroyed below before the box drops).
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, &*hub as *const Hub as isize) };
@@ -803,13 +847,16 @@ fn pump(hub: &Hub) {
         // SAFETY: windows of this thread; IsDialogMessage gives Tab and Enter to the buttons.
         unsafe {
             let root = GetAncestor(message.hwnd, GA_ROOT);
-            let note = hub.windows.borrow().values().any(|window| window.hwnd == root);
+            let note = hub.windows.borrow().values().any(|window| window.hwnd == root)
+                || hub.panel.borrow().as_ref().is_some_and(|panel| panel.hwnd() == root);
             if note
                 && matches!(message.message, WM_KEYDOWN)
                 && message.wParam.0 == usize::from(VK_RETURN.0)
             {
                 let focused = GetFocus();
-                if GetParent(focused).ok() == Some(root) && GetDlgCtrlID(focused) != EDITOR_ID {
+                if GetParent(focused).ok() == Some(root)
+                    && !matches!(GetDlgCtrlID(focused), EDITOR_ID | panel::FILTER_ID)
+                {
                     SendMessageW(focused, BM_CLICK, None, None);
                     continue;
                 }
@@ -847,6 +894,8 @@ pub struct Hub {
     active: Cell<Option<NoteId>>,
     quitting: Cell<bool>,
     handling: Cell<bool>,
+    /// The notes panel while it is open.
+    panel: RefCell<Option<Panel>>,
 }
 
 impl Hub {
@@ -881,9 +930,36 @@ impl Hub {
                 detail: note.origin.detail(),
                 updated_at: note.updated_at,
                 is_open: self.windows.borrow().contains_key(&note.id),
+                is_hidden: note.is_hidden,
             })
             .collect();
         self.emit(Event::Recent(recent));
+        if let Some(panel) = self.panel.borrow().as_ref() {
+            panel.set_notes(self.panel_notes());
+        }
+    }
+
+    /// Every note for the panel, newest edit first, with where it is.
+    fn panel_notes(&self) -> Vec<PanelNote> {
+        let windows = self.windows.borrow();
+        let mut notes: Vec<PanelNote> = self
+            .store
+            .borrow()
+            .notes()
+            .filter(|note| !note.is_blank() || windows.contains_key(&note.id))
+            .map(|note| {
+                let state = if windows.contains_key(&note.id) {
+                    NoteState::Shown
+                } else if note.is_hidden {
+                    NoteState::Hidden
+                } else {
+                    NoteState::Closed
+                };
+                PanelNote::new(note, state)
+            })
+            .collect();
+        panel::sort(&mut notes);
+        notes
     }
 
     fn idle(&self) -> bool {
@@ -957,13 +1033,10 @@ impl Hub {
             }
             match command {
                 Command::OpenNew { at, origin } => self.create(at, origin),
-                Command::Reopen(id) => {
-                    let note = self.store.borrow().note(id).cloned();
-                    if let Some(note) = note {
-                        self.show(note, false, true);
-                        self.publish_recent();
-                    }
-                }
+                Command::Reopen(id) => self.reveal(id, true),
+                Command::Hide(id) => self.hide(id),
+                Command::TogglePanel(anchor) => self.toggle_panel(anchor),
+                Command::Panel(request) => self.panel_request(request),
                 Command::PutAway(id) => self.put_away(id),
                 Command::PutAwayAll => {
                     self.hide_all();
@@ -1007,6 +1080,9 @@ impl Hub {
             return;
         }
         self.palette.set(palette);
+        if let Some(panel) = self.panel.borrow().as_ref() {
+            panel.set_palette(palette);
+        }
         let windows: Vec<_> = self.windows.borrow().values().cloned().collect();
         for window in windows {
             window.apply_palette(palette);
@@ -1032,8 +1108,14 @@ impl Hub {
 
     /// Swift `restore`: the notes that were up when the app quit come back, oldest first.
     fn restore(&self) {
-        let notes: Vec<Note> =
-            self.store.borrow().recent().into_iter().rev().filter(|note| note.is_open).collect();
+        let notes: Vec<Note> = self
+            .store
+            .borrow()
+            .recent()
+            .into_iter()
+            .rev()
+            .filter(|note| note.is_open && !note.is_hidden)
+            .collect();
         for note in notes {
             self.show(note, false, false);
         }
@@ -1053,6 +1135,7 @@ impl Hub {
             origin,
             frame,
             is_open: true,
+            is_hidden: false,
         };
         if let Err(error) = self.store.borrow_mut().insert(note.clone()) {
             self.error(format!("The note could not be saved: {error}"));
@@ -1096,6 +1179,109 @@ impl Hub {
         }
         window.appear(grows_in, focus);
         self.update_zones();
+    }
+
+    /// Shows a note from the menu or the panel and brings it to the front. A hidden note comes
+    /// back with the motion of a new note (out of a small pill at its corner); a note on
+    /// screen just comes forward.
+    fn reveal(&self, id: NoteId, focus: bool) {
+        let Some(note) = self.store.borrow().note(id).cloned() else { return };
+        let was_hidden = note.is_hidden;
+        if was_hidden {
+            self.update(id, |stored| stored.is_hidden = false);
+        }
+        let note = Note { is_hidden: false, ..note };
+        self.show(note, was_hidden, focus);
+        self.publish_recent();
+    }
+
+    /// Hides a shown note: its text is saved at once, it fades out like a put-away note, and
+    /// it stays open but hidden (also after a restart). A blank note is put away instead.
+    fn hide(&self, id: NoteId) {
+        let Some(window) = self.window(id) else { return };
+        window.sync_text();
+        if self.store.borrow().note(id).is_none_or(Note::is_blank) {
+            self.put_away(id);
+            return;
+        }
+        self.update(id, |note| {
+            note.is_open = true;
+            note.is_hidden = true;
+        });
+        if let Ok(mut store) = self.store.try_borrow_mut() {
+            let errors = store.flush();
+            drop(store);
+            self.report(errors);
+        }
+        self.schedule_save();
+        self.close_window(id, true);
+        self.publish_recent();
+    }
+
+    fn toggle_panel(&self, anchor: Option<RECT>) {
+        if self.panel.borrow_mut().take().is_some() {
+            return;
+        }
+        let sender = self.commands.clone();
+        let hub = self.hwnd.0 as isize;
+        let request = Box::new(move |request: PanelRequest| {
+            if sender.send(Command::Panel(request)).is_ok() {
+                // SAFETY: a scalar message to the notes thread's own message window.
+                let _ = unsafe {
+                    PostMessageW(Some(HWND(hub as *mut c_void)), COMMAND, WPARAM(0), LPARAM(0))
+                };
+            }
+        });
+        match Panel::open(
+            self.instance,
+            anchor,
+            self.panel_notes(),
+            self.palette.get(),
+            self.motion.get(),
+            self.test.dpi,
+            !self.test.no_activate,
+            request,
+        ) {
+            Ok(panel) => *self.panel.borrow_mut() = Some(panel),
+            Err(error) => self.error(format!("The notes panel could not open: {error}")),
+        }
+    }
+
+    fn panel_request(&self, request: PanelRequest) {
+        match request {
+            PanelRequest::Open(id) => self.reveal(id, true),
+            PanelRequest::Toggle(id) => {
+                if self.windows.borrow().contains_key(&id) {
+                    self.hide(id);
+                } else {
+                    self.reveal(id, false);
+                }
+            }
+            PanelRequest::Delete(id) => self.delete(id),
+            PanelRequest::HideAll => {
+                let ids: Vec<NoteId> = self.windows.borrow().keys().copied().collect();
+                for id in ids {
+                    self.hide(id);
+                }
+            }
+            PanelRequest::ShowAll => {
+                let ids: Vec<NoteId> = self
+                    .store
+                    .borrow()
+                    .recent()
+                    .into_iter()
+                    .rev()
+                    .filter(|note| note.is_hidden)
+                    .map(|note| note.id)
+                    .collect();
+                for id in ids {
+                    self.reveal(id, false);
+                }
+            }
+            PanelRequest::Close => {
+                self.panel.borrow_mut().take();
+            }
+        }
     }
 
     /// Swift `putAway`: off screen, still in the menu; a blank note is discarded.
@@ -1266,6 +1452,7 @@ impl Hub {
 
     /// Shutdown: text first (crash safety), then window states, then the windows.
     fn close_everything(&self) {
+        self.panel.borrow_mut().take();
         let ids: Vec<NoteId> = self.windows.borrow().keys().copied().collect();
         for id in &ids {
             let window = self.window(*id);
@@ -1382,7 +1569,8 @@ struct NoteWindow {
     hub: *const Hub,
     editor: RefCell<Option<Editor>>,
     editor_events: Rc<RefCell<Vec<EditorEvent>>>,
-    buttons: [HWND; 3],
+    /// Origin chip, hide, delete, put away.
+    buttons: [HWND; 4],
     tooltip: HWND,
     origin: RefCell<NoteOrigin>,
     dpi: Cell<u32>,
@@ -1391,8 +1579,8 @@ struct NoteWindow {
     hovering: Cell<bool>,
     buttons_shown: Cell<Transition>,
     hot: Cell<Option<usize>>,
-    /// Hover of the three header controls (origin, delete, close).
-    motion: RefCell<[Transition; 3]>,
+    /// Hover of the header controls (origin, hide, delete, close).
+    motion: RefCell<[Transition; 4]>,
     window_motion: Cell<Motion>,
     frozen: Cell<Option<f64>>,
     timer: Cell<bool>,
@@ -1467,6 +1655,7 @@ impl NoteWindow {
         let label = note.origin.label();
         let buttons = [
             make(ORIGIN_ID, &format!("From {label}"))?,
+            make(HIDE_ID, "Hide note")?,
             make(DELETE_ID, "Delete note")?,
             make(CLOSE_ID, "Put away")?,
         ];
@@ -1502,7 +1691,7 @@ impl NoteWindow {
             hovering: Cell::new(false),
             buttons_shown: Cell::new(Transition::at(0.0)),
             hot: Cell::new(None),
-            motion: RefCell::new([Transition::at(0.0); 3]),
+            motion: RefCell::new([Transition::at(0.0); 4]),
             window_motion: Cell::new(Motion::Still),
             frozen: Cell::new(None),
             timer: Cell::new(false),
@@ -1561,6 +1750,7 @@ impl NoteWindow {
         let origin = self.origin.borrow();
         let tips = [
             origin.detail(),
+            "Hide (find it again in Notes… in the tray menu)".to_owned(),
             "Delete note".to_owned(),
             "Put away (find it again in the tray menu)".to_owned(),
         ];
@@ -1656,7 +1846,7 @@ impl NoteWindow {
         px(value, self.dpi.get())
     }
 
-    fn button_rects(&self) -> [RECT; 3] {
+    fn button_rects(&self) -> [RECT; 4] {
         let client = self.client();
         let top = (self.s(HEADER) - self.s(BUTTON)) / 2;
         let close_right = client.right - self.s(8.0);
@@ -1672,10 +1862,16 @@ impl NoteWindow {
             right: close.left - self.s(6.0),
             bottom: close.bottom,
         };
+        let hide = RECT {
+            left: delete.left - self.s(6.0 + BUTTON),
+            top,
+            right: delete.left - self.s(6.0),
+            bottom: close.bottom,
+        };
         let label = self.origin.borrow().label();
         let fonts = self.fonts.get();
         let text_width =
-            text_width(fonts.semibold, &label).min(delete.left - self.s(60.0)).max(self.s(20.0));
+            text_width(fonts.semibold, &label).min(hide.left - self.s(60.0)).max(self.s(20.0));
         let chip_top = (self.s(HEADER) - self.s(22.0)) / 2;
         let origin = RECT {
             left: self.s(10.0),
@@ -1683,7 +1879,7 @@ impl NoteWindow {
             right: self.s(10.0 + 6.0 + 14.0 + 5.0 + 6.0 + 2.0) + text_width,
             bottom: chip_top + self.s(22.0),
         };
-        [origin, delete, close]
+        [origin, hide, delete, close]
     }
 
     fn editor_rect(&self) -> RECT {
@@ -2297,10 +2493,10 @@ impl NoteWindow {
                     };
                     canvas.fill(*rect, self.s(BUTTON / 2.0) as f32, fill, hover * visible);
                     let ink = mix(palette.paper, mix(palette.muted, palette.text, hover), visible);
-                    if index == 1 {
-                        trash_icon(&mut canvas, *rect, ink, self.dpi.get())
-                    } else {
-                        close_icon(&mut canvas, *rect, ink, self.dpi.get())
+                    match index {
+                        1 => hide_icon(&mut canvas, *rect, ink, self.dpi.get()),
+                        2 => trash_icon(&mut canvas, *rect, ink, self.dpi.get()),
+                        _ => close_icon(&mut canvas, *rect, ink, self.dpi.get()),
                     }
                     if focused == self.buttons[index] {
                         focus_ring(&mut canvas, *rect, self.s(BUTTON / 2.0), self.s(2.0), palette);
@@ -2457,7 +2653,7 @@ fn text_width(font: HFONT, text: &str) -> i32 {
 }
 
 /// The settings window's rounded focus ring: a ring around the shape with a gap.
-fn focus_ring(
+pub(super) fn focus_ring(
     canvas: &mut editor::Canvas<'_>,
     shape: RECT,
     radius: i32,
@@ -2474,7 +2670,7 @@ fn focus_ring(
     canvas.stroke(outer, (radius + gap + ring / 2) as f32, palette.text);
 }
 
-fn trash_icon(canvas: &mut editor::Canvas<'_>, rect: RECT, ink: COLORREF, dpi: u32) {
+pub(super) fn trash_icon(canvas: &mut editor::Canvas<'_>, rect: RECT, ink: COLORREF, dpi: u32) {
     let s = |v: f64| px(v, dpi);
     let (cx, cy) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
     let lid = RECT { left: cx - s(5.0), top: cy - s(4.5), right: cx + s(5.0), bottom: cy - s(3.5) };
@@ -2485,6 +2681,13 @@ fn trash_icon(canvas: &mut editor::Canvas<'_>, rect: RECT, ink: COLORREF, dpi: u
     let body =
         RECT { left: cx - s(3.8), top: cy - s(3.0), right: cx + s(3.8), bottom: cy + s(5.5) };
     canvas.stroke(body, s(1.5) as f32, ink);
+}
+
+/// The hide button: a short bar, as on a minimize button.
+pub(super) fn hide_icon(canvas: &mut editor::Canvas<'_>, rect: RECT, ink: COLORREF, dpi: u32) {
+    let s = |v: f64| px(v, dpi) as f32;
+    let (cx, cy) = ((rect.left + rect.right) as f32 / 2.0, (rect.top + rect.bottom) as f32 / 2.0);
+    canvas.line((cx - s(4.5), cy + s(0.5)), (cx + s(4.5), cy + s(0.5)), ink, s(1.5));
 }
 
 fn close_icon(canvas: &mut editor::Canvas<'_>, rect: RECT, ink: COLORREF, dpi: u32) {
@@ -2596,10 +2799,9 @@ unsafe extern "system" fn button_proc(
             let _ = unsafe { RemoveWindowSubclass(hwnd, Some(button_proc), id) };
         }
         WM_MOUSEMOVE => {
-            // SAFETY: control id of our child.
-            let index = (unsafe { GetDlgCtrlID(hwnd) } - ORIGIN_ID) as usize;
+            let index = window.buttons.iter().position(|button| *button == hwnd);
             window.pointer_moved();
-            window.set_hot(Some(index));
+            window.set_hot(index);
             let mut request = TRACKMOUSEEVENT {
                 cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
                 dwFlags: TME_LEAVE,
@@ -2791,6 +2993,9 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 let hub = window.hub();
                 match id {
                     ORIGIN_ID => open_origin(&window.origin.borrow()),
+                    HIDE_ID => {
+                        let _ = hub.commands.send(Command::Hide(window.id));
+                    }
                     // Swift deletes without asking (the file goes to the Trash, so it can come back).
                     DELETE_ID => {
                         let _ = hub.commands.send(Command::Delete(window.id));
