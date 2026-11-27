@@ -15,7 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use tiny_skia::{FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, Transform};
+use tiny_skia::{FillRule, Paint, Path, PathBuilder, Pixmap, Stroke, Transform};
 use windows::Win32::Foundation::{
     E_FAIL, E_INVALIDARG, ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
@@ -685,54 +685,82 @@ fn append(hmenu: HMENU, flags: MENU_ITEM_FLAGS, id: usize, label: Option<&str>) 
 // ---------------------------------------------------------------------------
 // Icon
 
-/// The mark's design space (1254 units, y down).
-const LOGO_STROKE_WIDTH: f32 = 96.0;
+/// The mark: a friendly mouse pointer as one closed, rounded outline with two happy
+/// closed eyes. Design space about 227 x 291 units, y down (assets/igorio-mark.svg).
+const MARK_START: (f32, f32) = (52.8, 9.0);
+/// The outline's cubic segments after `MARK_START`: two controls and the end point.
+const MARK_OUTLINE: [[f32; 6]; 12] = [
+    [29.0, 9.0, 19.5, 41.3, 16.0, 61.0],
+    [10.8, 90.5, 9.0, 128.5, 9.0, 161.0],
+    [9.0, 198.5, 17.8, 245.0, 44.0, 245.0],
+    [56.5, 245.0, 70.2, 230.5, 82.8, 230.5],
+    [91.5, 230.5, 93.8, 243.5, 94.8, 254.8],
+    [95.7, 266.0, 109.0, 281.8, 124.0, 281.8],
+    [139.0, 281.8, 151.5, 263.5, 151.5, 251.0],
+    [151.5, 239.8, 152.1, 212.3, 158.2, 208.0],
+    [167.5, 201.5, 187.9, 203.5, 199.0, 201.5],
+    [213.8, 198.9, 220.4, 185.8, 217.8, 171.0],
+    [215.1, 156.2, 164.8, 113.0, 136.5, 84.8],
+    [108.2, 56.5, 70.2, 9.0, 52.8, 9.0],
+];
+/// The eyes: upward arcs, given by the middle of each arc's base line.
+const MARK_EYES: [(f32, f32); 2] = [(52.7, 133.5), (115.5, 133.5)];
+/// Half the width of an eye's arc, and how far its controls lift above the base line.
+const MARK_EYE_HALF_WIDTH: f32 = 18.5;
+const MARK_EYE_LIFT: f32 = 21.0;
 
-fn logo_centerline() -> Path {
+/// Stroke widths (outline, eyes) in design units. Small icons get thicker strokes, so
+/// the lines stay solid.
+fn mark_strokes(size: u32) -> (f32, f32) {
+    match size {
+        0..=22 => (26.0, 13.0),
+        23..=40 => (19.0, 17.0),
+        _ => (17.5, 13.0),
+    }
+}
+
+/// The mark's blue on light backgrounds and taskbars (straight RGBA).
+pub const MARK_BLUE: [u8; 4] = [0x3b, 0x7b, 0xea, 255];
+/// The mark's lighter blue on dark backgrounds and taskbars.
+pub const MARK_BLUE_DARK: [u8; 4] = [0x6f, 0xa2, 0xf7, 255];
+
+fn mark_outline() -> Path {
     let mut p = PathBuilder::new();
-    p.move_to(618.0, 842.0);
-    p.cubic_to(570.0, 902.0, 535.0, 968.0, 479.0, 963.0);
-    p.cubic_to(420.0, 955.0, 404.0, 640.0, 419.0, 520.0);
-    p.cubic_to(428.0, 455.0, 480.0, 432.0, 545.0, 460.0);
-    p.cubic_to(660.0, 512.0, 792.0, 598.0, 864.0, 659.0);
-    p.cubic_to(922.0, 710.0, 880.0, 768.0, 774.0, 773.0);
-    p.finish().expect("logo centerline is not empty")
+    p.move_to(MARK_START.0, MARK_START.1);
+    for [x1, y1, x2, y2, x, y] in MARK_OUTLINE {
+        p.cubic_to(x1, y1, x2, y2, x, y);
+    }
+    p.close();
+    p.finish().expect("mark outline is not empty")
 }
 
-/// The two eyes: centres, and the size of each upright oval (design units).
-const LOGO_EYES: [(f32, f32); 2] = [(568.0, 683.0), (652.0, 658.0)];
-const LOGO_EYE_SIZE: (f32, f32) = (48.0, 80.0);
-
-/// Two upright ovals, leaning a touch toward the tip.
-fn logo_eyes() -> Vec<Path> {
-    let (w, h) = LOGO_EYE_SIZE;
-    LOGO_EYES
-        .into_iter()
-        .filter_map(|(x, y)| {
-            let rect = Rect::from_xywh(-w / 2.0, -h / 2.0, w, h)?;
-            let t = Transform::from_translate(x, y)
-                .pre_concat(Transform::from_rotate(-0.12f32.to_degrees()));
-            PathBuilder::from_oval(rect)?.transform(t)
-        })
-        .collect()
+/// One eye's arc over its base-line middle (`x`, `y`).
+fn mark_eye(x: f32, y: f32) -> Option<Path> {
+    let (w, lift) = (MARK_EYE_HALF_WIDTH, MARK_EYE_LIFT);
+    let mut p = PathBuilder::new();
+    p.move_to(x - w, y);
+    p.cubic_to(x - w, y - lift, x + w, y - lift, x + w, y);
+    p.finish()
 }
 
-/// The LogoMark (a cursor arrow as one thick, open, rounded stroke whose tail curls back
-/// in, with two eyes inside), filled with straight-alpha RGBA `color` and fitted, centred,
-/// into a `size` x `size` pixmap (premultiplied, like every tiny-skia pixmap).
+/// The mark in straight-alpha RGBA `color`, fitted and centred into a `size` x `size`
+/// pixmap (premultiplied, like every tiny-skia pixmap). Sizes up to 22 px use the
+/// thicker small-size outline.
 ///
-/// Below about 2 px per eye (sizes under ~26 px) the eyes are drawn as crisp blocks of
-/// whole pixels: anti-aliased ovals that small blur into one grey smear.
+/// Below 2.6 px per eye (sizes under about 22 px) the eyes are crisp whole pixels: a
+/// small arch three pixels wide, or a two-pixel dash under 2 px. Anti-aliased arcs that small blur
+/// into grey smears that touch the outline.
 pub fn logo_pixmap(size: u32, color: [u8; 4]) -> Pixmap {
     let size = size.max(1);
     let mut pixmap = Pixmap::new(size, size).expect("size is at least 1");
-    let stroke = Stroke {
-        width: LOGO_STROKE_WIDTH,
+    let (outline_width, eye_width) = mark_strokes(size);
+    let stroke = |width| Stroke {
+        width,
         line_cap: tiny_skia::LineCap::Round,
         line_join: tiny_skia::LineJoin::Round,
         ..Default::default()
     };
-    let Some(outline) = logo_centerline().stroke(&stroke, 1.0) else {
+    let Some(outline) = mark_outline().stroke(&stroke(outline_width), 1.0) else {
         return pixmap;
     };
     let Some(bounds) = outline.compute_tight_bounds() else {
@@ -751,35 +779,42 @@ pub fn logo_pixmap(size: u32, color: [u8; 4]) -> Pixmap {
     paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
     paint.anti_alias = true;
     pixmap.fill_path(&outline, &paint, FillRule::Winding, transform, None);
-
-    let (eye_w, eye_h) = (LOGO_EYE_SIZE.0 * scale, LOGO_EYE_SIZE.1 * scale);
-    if eye_w >= 2.0 {
-        for eye in logo_eyes() {
-            pixmap.fill_path(&eye, &paint, FillRule::Winding, transform, None);
+    let eye_px = 2.0 * MARK_EYE_HALF_WIDTH * scale;
+    if eye_px >= 2.6 {
+        for (x, y) in MARK_EYES {
+            if let Some(eye) = mark_eye(x, y).and_then(|eye| eye.stroke(&stroke(eye_width), 1.0)) {
+                pixmap.fill_path(&eye, &paint, FillRule::Winding, transform, None);
+            }
         }
         return pixmap;
     }
-    let (w, h) = (eye_w.round().max(1.0), eye_h.round().max(2.0));
     paint.anti_alias = false;
-    for (x, y) in LOGO_EYES {
-        let mut centre = tiny_skia::Point::from_xy(x, y);
-        transform.map_point(&mut centre);
-        let left = (centre.x - w / 2.0).round();
-        let top = (centre.y - h / 2.0).round();
-        if let Some(rect) = Rect::from_xywh(left, top, w, h) {
-            pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+    for (x, y) in MARK_EYES {
+        // The arc's middle height.
+        let mut middle = tiny_skia::Point::from_xy(x, y - 0.375 * MARK_EYE_LIFT);
+        transform.map_point(&mut middle);
+        // Pixels as (dx, dy, coverage): a two-pixel dash, or a three-pixel-wide arch whose
+        // top corners are half covered, so it reads round.
+        let (dots, left, top): (&[(f32, f32, f32)], f32, f32) = if eye_px < 2.0 {
+            (&[(0.0, 0.0, 1.0), (1.0, 0.0, 1.0)], (middle.x - 1.0).round(), (middle.y - 0.5).round())
+        } else {
+            let arch = &[(0.0, 0.0, 0.5), (1.0, 0.0, 1.0), (2.0, 0.0, 0.5), (0.0, 1.0, 1.0), (2.0, 1.0, 1.0)];
+            (arch, middle.x.floor() - 1.0, (middle.y - 1.0).round())
+        };
+        for &(dx, dy, coverage) in dots {
+            paint.set_color_rgba8(color[0], color[1], color[2], (f32::from(color[3]) * coverage) as u8);
+            if let Some(dot) = tiny_skia::Rect::from_xywh(left + dx, top + dy, 1.0, 1.0) {
+                pixmap.fill_rect(dot, &paint, Transform::identity(), None);
+            }
         }
     }
     pixmap
 }
 
-/// White on a dark taskbar, black on a light one.
+/// The mark's blue for the taskbar: the darker blue on a light taskbar, the lighter one
+/// on a dark taskbar.
 fn stroke_color(light_taskbar: bool) -> [u8; 4] {
-    if light_taskbar {
-        [0, 0, 0, 255]
-    } else {
-        [255, 255, 255, 255]
-    }
+    if light_taskbar { MARK_BLUE } else { MARK_BLUE_DARK }
 }
 
 /// The AND mask (1 bpp, rows padded to 16 bits, 1 = transparent) and the XOR bitmap
@@ -1016,7 +1051,7 @@ mod tests {
 
     #[test]
     fn stroke_color_contrasts_with_taskbar() {
-        assert_eq!(stroke_color(true), [0, 0, 0, 255]);
-        assert_eq!(stroke_color(false), [255, 255, 255, 255]);
+        assert_eq!(stroke_color(true), MARK_BLUE);
+        assert_eq!(stroke_color(false), MARK_BLUE_DARK);
     }
 }

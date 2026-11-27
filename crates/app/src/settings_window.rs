@@ -3423,8 +3423,8 @@ fn run_window(options: &Options, lifetime: &Lifetime) -> Result<()> {
         tooltip: Cell::new(HWND::default()),
         tips: RefCell::new(Default::default()),
         icons: [
-            settings_icon(instance, theme::TEXT),
-            settings_icon(instance, [234, 240, 252, 255]),
+            settings_icon(instance, crate::tray::MARK_BLUE),
+            settings_icon(instance, crate::tray::MARK_BLUE_DARK),
         ],
         drag: Cell::new(None),
         tool_icons: RefCell::new(None),

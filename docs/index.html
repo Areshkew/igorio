@@ -24,10 +24,11 @@
 </head>
 <body>
 <svg class="defs" aria-hidden="true" focusable="false">
-  <symbol id="logo" viewBox="346 400 612 612">
-    <path d="M618 842C570 902 535 968 479 963C420 955 404 640 419 520C428 455 480 432 545 460C660 512 792 598 864 659C922 710 880 768 774 773" fill="none" stroke="currentColor" stroke-width="96" stroke-linecap="round" stroke-linejoin="round"/>
-    <ellipse cx="568" cy="683" rx="24" ry="40" transform="rotate(-6.875 568 683)" fill="currentColor"/>
-    <ellipse cx="652" cy="658" rx="24" ry="40" transform="rotate(-6.875 652 658)" fill="currentColor"/>
+  <symbol id="logo" viewBox="-31.47 0.25 290.3 290.3">
+    <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M52.8 9C29 9 19.5 41.3 16 61C10.8 90.5 9 128.5 9 161C9 198.5 17.8 245 44 245C56.5 245 70.2 230.5 82.8 230.5C91.5 230.5 93.8 243.5 94.8 254.8C95.7 266 109 281.8 124 281.8C139 281.8 151.5 263.5 151.5 251C151.5 239.8 152.1 212.3 158.2 208C167.5 201.5 187.9 203.5 199 201.5C213.8 198.9 220.4 185.8 217.8 171C215.1 156.2 164.8 113 136.5 84.8C108.2 56.5 70.2 9 52.8 9Z" stroke-width="17.5"/><path d="M34.2 133.5C34.2 112.5 71.2 112.5 71.2 133.5" stroke-width="13"/><path d="M97 133.5C97 112.5 134 112.5 134 133.5" stroke-width="13"/></g>
+  </symbol>
+  <symbol id="logo-small" viewBox="-35.72 -4 298.8 298.8">
+    <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M52.8 9C29 9 19.5 41.3 16 61C10.8 90.5 9 128.5 9 161C9 198.5 17.8 245 44 245C56.5 245 70.2 230.5 82.8 230.5C91.5 230.5 93.8 243.5 94.8 254.8C95.7 266 109 281.8 124 281.8C139 281.8 151.5 263.5 151.5 251C151.5 239.8 152.1 212.3 158.2 208C167.5 201.5 187.9 203.5 199 201.5C213.8 198.9 220.4 185.8 217.8 171C215.1 156.2 164.8 113 136.5 84.8C108.2 56.5 70.2 9 52.8 9Z" stroke-width="26"/><path d="M34.2 133.5C34.2 112.5 71.2 112.5 71.2 133.5" stroke-width="17"/><path d="M97 133.5C97 112.5 134 112.5 134 133.5" stroke-width="17"/></g>
   </symbol>
   <symbol id="pic" viewBox="0 0 320 200" preserveAspectRatio="xMidYMid slice">
     <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
@@ -138,7 +139,7 @@
               <div class="apps"><span></span><span></span><span class="on"></span><span></span><span></span></div>
               <div class="tray">
                 <span class="chev"></span>
-                <svg class="tray-logo" id="trayLogo" aria-hidden="true"><use href="#logo"/></svg>
+                <svg class="tray-logo" id="trayLogo" aria-hidden="true"><use href="#logo-small"/></svg>
                 <span class="vol"></span>
                 <span class="clock">10:24</span>
               </div>
@@ -159,14 +160,18 @@
               <span class="rec-tool"><span class="stop-ico"></span></span>
             </div>
 
-            <div class="menu" id="menu">
-              <div class="menu-row hot"><span class="doc-ico"></span><span>New note</span></div>
-              <div class="menu-row"><span class="rec-ico"></span><span>Record screen</span><span class="mchips"><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>6</kbd></span></div>
-            </div>
+            <div class="pin" id="pin"><svg><use href="#pic"/></svg><span class="pin-x" id="pinX"></span></div>
 
             <div class="card" id="card1"><svg><use href="#pic"/></svg></div>
             <div class="card" id="card2"><svg><use href="#lines"/></svg></div>
             <div class="card" id="card3"><svg><use href="#pic"/></svg><span class="badge"><i></i>0:04</span></div>
+            <div class="card" id="card4"><svg><use href="#pic"/></svg></div>
+
+            <div class="menu" id="menu">
+              <div class="menu-row hot"><span class="doc-ico"></span><span>New note</span></div>
+              <div class="menu-row"><span class="rec-ico"></span><span>Record screen</span><span class="mchips"><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>6</kbd></span></div>
+              <div class="menu-row" id="pinRow" style="display:none"><svg class="pin-ico" viewBox="0 0 18 18" aria-hidden="true"><path d="M6.5 2.5h5M7.5 2.5 7 7.2 4.8 9.6h8.4L11 7.2l-.5-4.7M9 9.6v5.2"/></svg><span>Pin to screen</span></div>
+            </div>
 
             <div class="ripple" id="ripple1"></div>
             <div class="ripple" id="ripple2"></div>

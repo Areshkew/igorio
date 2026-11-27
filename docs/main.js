@@ -276,14 +276,15 @@ function starPopover(total) {
 // ---------------------------------------------------------------------------
 // The demo. Everything on the stage is a pure function of time: renderAt(t).
 
-const T = 35;
+const T = 43;
 
 const SCENES = [
   { title: 'Take a screenshot', keys: '[Win][Shift][S] or [PrtScn]', text: 'It turns into a small card that follows your cursor.', start: 0, end: 6.5, still: 4.6 },
   { title: 'Double-click to drop', keys: 'double-click', text: 'On a text box it pastes. On a folder or the desktop it saves a PNG.', start: 6.5, end: 11, still: 9.7 },
   { title: 'Shake to let go', keys: 'shake', text: 'Shake once to drop the top card. Keep shaking to drop them all.', start: 11, end: 16, still: 14.25 },
   { title: 'Notes', keys: 'hold [Alt]', text: 'Hold Alt anywhere except a text box, then pick New note. Notes take Markdown.', start: 16, end: 25, still: 22.8 },
-  { title: 'Record the screen', keys: '[Ctrl][Shift][6]', text: 'Records the screen under the cursor to MP4. Zoom with Alt + scroll, draw with Ctrl+Shift+7.', start: 25, end: 35, still: 29.9 },
+  { title: 'Pin to screen', keys: 'hold [Alt]', text: 'Keep a screenshot on top while you work. Drag to move, scroll to resize.', start: 25, end: 33, still: 31.95 },
+  { title: 'Record the screen', keys: '[Ctrl][Shift][6]', text: 'Records the screen under the cursor to MP4. Zoom with Alt + scroll, draw with Ctrl+Shift+7.', start: 33, end: 43, still: 37.9 },
 ];
 
 // Keys shown on the screen while they are pressed: [from, to, keys].
@@ -293,10 +294,13 @@ const HUD = [
   [11.0, 11.7, '[PrtScn]'],
   [13.2, 14.5, 'shake'],
   [16.85, 18.15, 'hold [Alt]'],
-  [25.85, 26.65, '[Ctrl][Shift][6]'],
-  [27.0, 28.05, '[Alt] + {wheel} scroll'],
-  [28.2, 28.95, '[Ctrl][Shift][7]'],
-  [30.3, 31.0, '[Ctrl][Shift][6]'],
+  [25.25, 25.95, '[PrtScn]'],
+  [27.85, 29.05, 'hold [Alt]'],
+  [31.05, 31.9, '{wheel} scroll'],
+  [33.85, 34.65, '[Ctrl][Shift][6]'],
+  [35.0, 36.05, '[Alt] + {wheel} scroll'],
+  [36.2, 36.95, '[Ctrl][Shift][7]'],
+  [38.3, 39.0, '[Ctrl][Shift][6]'],
 ];
 
 // --- Motion helpers ---------------------------------------------------------
@@ -325,10 +329,27 @@ const ZOOM_AT = { x: 300, y: 300 };
 const SNIPS = [
   { dimIn: 0.75, dragA: 1.95, dragB: 2.95, release: 3.0, from: [70, 198] },
   { dimIn: 11.1, dragA: 11.7, dragB: 12.28, release: 12.32, from: [392, 204] },
+  { dimIn: 25.45, dragA: 26.0, dragB: 26.6, release: 26.65, from: [110, 230] },
 ];
-const CLICKS = [8.22, 8.42, 17.85, 23.6];
+const CLICKS = [8.22, 8.42, 17.85, 23.6, 28.9, 32.55];
 const SHAKE = { a: 13.2, b: 14.6, release: 13.95, x: 720, y: 280 };
-const PEN = { a: 28.9, b: 30.1, from: 200, sweep: 380, rx: 38, ry: 30 };
+const PEN = { a: 36.9, b: 38.1, from: 200, sweep: 380, rx: 38, ry: 30 };
+// Pin to screen: the menu opens at `at`, the card is pinned centred there, then dragged by
+// about `drag` (pressed at `press`, let go at `release`), grown by two wheel notches (x1.1
+// each, around the cursor) and closed with its close button (`CLOSE` px, `CLOSE_INSET` from
+// the corner, as pins.rs).
+const PIN = {
+  at: { x: 680, y: 220 }, w: 256, h: 160, grow: 29.0,
+  grab: { x: 620, y: 190 }, press: 30.0, release: 30.85, drag: { x: -70, y: 50 },
+  wheel: [31.25, 31.65], step: 1.1, close: 32.55, CLOSE: 20, CLOSE_INSET: 8,
+};
+PIN.rect = { x: PIN.at.x - PIN.w / 2, y: PIN.at.y - PIN.h / 2, w: PIN.w, h: PIN.h, rot: 0 };
+PIN.wheelAt = { x: PIN.grab.x + PIN.drag.x, y: PIN.grab.y + PIN.drag.y };
+PIN.closeAt = (() => {
+  const k = PIN.step * PIN.step, c = PIN.wheelAt;
+  const x = c.x + (PIN.rect.x + PIN.drag.x - c.x) * k, y = c.y + (PIN.rect.y + PIN.drag.y - c.y) * k;
+  return { x: x + PIN.w * k - PIN.CLOSE_INSET - PIN.CLOSE / 2, y: y + PIN.CLOSE_INSET + PIN.CLOSE / 2 };
+})();
 
 // Where the cursor is asked to be: [time, x, y], eased between.
 const PATH = [
@@ -356,12 +377,26 @@ const PATH = [
   [22.75, 905, 372],
   [23.45, 828, 111],
   [25.0, 828, 111],
-  [25.8, ZOOM_AT.x, ZOOM_AT.y],
-  [28.45, ZOOM_AT.x, ZOOM_AT.y],
+  [25.75, 110, 230],
+  [26.0, 110, 230],
+  [26.6, 350, 380],
+  [26.75, 350, 380],
+  [27.6, PIN.at.x, PIN.at.y],
+  [28.4, PIN.at.x, PIN.at.y],
+  [28.7, PIN.at.x + 70, PIN.at.y + 72],
+  [29.05, PIN.at.x + 70, PIN.at.y + 72],
+  [29.7, PIN.grab.x, PIN.grab.y],
+  [PIN.press, PIN.grab.x, PIN.grab.y],
+  [PIN.press + 0.6, PIN.wheelAt.x, PIN.wheelAt.y],
+  [31.95, PIN.wheelAt.x, PIN.wheelAt.y],
+  [32.4, PIN.closeAt.x, PIN.closeAt.y],
+  [33.0, PIN.closeAt.x, PIN.closeAt.y],
+  [33.8, ZOOM_AT.x, ZOOM_AT.y],
+  [36.45, ZOOM_AT.x, ZOOM_AT.y],
   [PEN.a, ...penAt(0)],
   [PEN.b, ...penAt(1)],
-  [31.3, ...penAt(1)],
-  [32.5, 760, 300],
+  [39.3, ...penAt(1)],
+  [40.5, 760, 300],
   [T, 760, 300],
 ];
 
@@ -453,8 +488,18 @@ function snipRect(snip, t) {
   return { x: Math.min(fx, end.x), y: Math.min(fy, end.y), w: Math.abs(end.x - fx), h: Math.abs(end.y - fy), rot: 0 };
 }
 
+// The pin's frame at t: centred where the menu opened, moved by the drag (it follows the
+// cursor exactly), then grown by the wheel around the cursor.
+function pinRect(t) {
+  const a = sim(PIN.press), b = sim(clamp(t, PIN.press, PIN.release));
+  const x = PIN.rect.x + b.x - a.x, y = PIN.rect.y + b.y - a.y;
+  const k = Math.pow(PIN.step, inOut(ramp(t, PIN.wheel[0], PIN.wheel[0] + 0.12)) + inOut(ramp(t, PIN.wheel[1], PIN.wheel[1] + 0.12)));
+  const c = PIN.wheelAt;
+  return { x: c.x + (x - c.x) * k, y: c.y + (y - c.y) * k, w: PIN.w * k, h: PIN.h * k, rot: 0 };
+}
+
 function zoomRect(t) {
-  const z = 1 + 0.5 * inOut(ramp(t, 27.3, 27.5)) + 0.5 * inOut(ramp(t, 27.65, 27.85));
+  const z = 1 + 0.5 * inOut(ramp(t, 35.3, 35.5)) + 0.5 * inOut(ramp(t, 35.65, 35.85));
   const w = WHOLE.w / z, h = WHOLE.h / z;
   return {
     z,
@@ -501,7 +546,8 @@ function noteHTML(count, caret) {
 const $ = (id) => document.getElementById(id);
 const el = {
   screen: $('screen'), stage: $('stage'), cursor: $('cursor'), cross: $('cross'), pentip: $('pentip'),
-  region: $('region'), snipbar: $('snipbar'), card1: $('card1'), card2: $('card2'), card3: $('card3'),
+  region: $('region'), snipbar: $('snipbar'), card1: $('card1'), card2: $('card2'), card3: $('card3'), card4: $('card4'),
+  pin: $('pin'), pinX: $('pinX'), pinRow: $('pinRow'), menuRows: [...document.querySelectorAll('#menu .menu-row')],
   thumb: $('thumb'), placeholder: $('placeholder'), caret: $('caret'), menu: $('menu'), note: $('note'),
   noteBody: $('noteBody'), hideBtn: $('hideBtn'), trayLogo: $('trayLogo'), outline: $('outline'),
   strip: $('strip'), recTime: $('recTime'), recZoom: $('recZoom'), recPen: $('recPen'), ink: $('ink'),
@@ -573,10 +619,10 @@ function renderAt(time) {
   } else {
     el.card1.style.opacity = 0;
   }
-  const pasted = ramp(t, 8.95, 9.05) * (1 - ramp(t, 33.9, 34.6));
+  const pasted = ramp(t, 8.95, 9.05) * (1 - ramp(t, 41.9, 42.6));
   el.thumb.style.opacity = pasted;
-  el.placeholder.style.opacity = 0.8 * (1 - ramp(t, 8.7, 8.9)) + 0.8 * ramp(t, 34.0, 34.6);
-  const caretOn = t >= 9.05 && t < 33.9 && (t - 9.05) % 1 < 0.5;
+  el.placeholder.style.opacity = 0.8 * (1 - ramp(t, 8.7, 8.9)) + 0.8 * ramp(t, 42.0, 42.6);
+  const caretOn = t >= 9.05 && t < 41.9 && (t - 9.05) % 1 < 0.5;
   el.caret.style.opacity = caretOn ? 1 : 0;
   el.caret.style.left = '70px';
 
@@ -601,11 +647,38 @@ function renderAt(time) {
     el.card2.style.opacity = 0;
   }
 
+  // Card 4: the third screenshot, carried, then pinned where the tool menu opened.
+  const r4 = snipRect(SNIPS[2], SNIPS[2].dragB);
+  const pinR = pinRect(t);
+  if (t >= SNIPS[2].release && t < PIN.grow + 0.5) {
+    const carried = lerpRect(r4, hang(s), settle(ramp(t, SNIPS[2].release, SNIPS[2].release + 0.55)));
+    const q = settle(ramp(t, PIN.grow, PIN.grow + 0.45));
+    el.card4.style.padding = mix(3, 0, q) + 'px';
+    place(el.card4, lerpRect(carried, pinR, q), 1 - ramp(t, PIN.grow + 0.38, PIN.grow + 0.5));
+  } else {
+    el.card4.style.opacity = 0;
+  }
+
+  // The pin: shown once the card lands, follows the cursor while dragged, grows with the
+  // wheel, and shows its close button while hovered.
+  const pinOn = ramp(t, PIN.grow + 0.38, PIN.grow + 0.48) * (1 - ramp(t, PIN.close + 0.05, PIN.close + 0.3));
+  if (pinOn > 0) {
+    const shrink = 1 - 0.04 * ramp(t, PIN.close + 0.05, PIN.close + 0.3);
+    const r = pinR;
+    place(el.pin, { ...r, x: r.x + (r.w * (1 - shrink)) / 2, y: r.y + (r.h * (1 - shrink)) / 2, w: r.w * shrink, h: r.h * shrink }, pinOn);
+    const over = s.x >= r.x && s.x <= r.x + r.w && s.y >= r.y && s.y <= r.y + r.h;
+    el.pinX.style.opacity = over ? 1 : 0;
+    const cx = r.x + r.w - PIN.CLOSE_INSET - PIN.CLOSE / 2, cy = r.y + PIN.CLOSE_INSET + PIN.CLOSE / 2;
+    el.pinX.classList.toggle('hot', Math.hypot(s.x - cx, s.y - cy) <= PIN.CLOSE / 2 + 1);
+  } else {
+    el.pin.style.opacity = 0;
+  }
+
   // Card 3: the finished video.
-  const z = zoomRect(Math.min(t, 30.6));
-  if (t >= 30.65) {
-    const r = lerpRect(z, hang(s), settle(ramp(t, 30.65, 31.2)));
-    place(el.card3, r, 1 - ramp(t, 33.9, 34.6));
+  const z = zoomRect(Math.min(t, 38.6));
+  if (t >= 38.65) {
+    const r = lerpRect(z, hang(s), settle(ramp(t, 38.65, 39.2)));
+    place(el.card3, r, 1 - ramp(t, 41.9, 42.6));
   } else {
     el.card3.style.opacity = 0;
   }
@@ -623,11 +696,20 @@ function renderAt(time) {
     ring.style.transform = `translate(${c.x.toFixed(1)}px, ${c.y.toFixed(1)}px) scale(${(0.35 + 0.9 * p).toFixed(3)})`;
   });
 
-  // The tool menu, its first row under the cursor.
-  const menu = ramp(t, 17.2, 17.32) * (1 - ramp(t, 18.0, 18.1));
+  // The tool menu, its first row under the cursor. Pin to screen is offered only while a
+  // card is carried, so the notes scene shows two rows and the pin scene three.
+  const pinMenu = t >= 25;
+  const [mIn, mOut, mAt] = pinMenu ? [28.2, 28.95, PIN.at] : [17.2, 18.0, MENU_AT];
+  const menu = ramp(t, mIn, mIn + 0.12) * (1 - ramp(t, mOut, mOut + 0.1));
   el.menu.style.opacity = menu;
   if (menu > 0) {
-    el.menu.style.transform = `translate(${MENU_AT.x - 9}px, ${(MENU_AT.y - 16 + 4 * (1 - ramp(t, 17.2, 17.32))).toFixed(2)}px)`;
+    el.menu.style.transform = `translate(${mAt.x - 9}px, ${(mAt.y - 16 + 4 * (1 - ramp(t, mIn, mIn + 0.12))).toFixed(2)}px)`;
+    // The row under the cursor is lit (36 px rows, the first starting 11 px above the menu's point).
+    const row = pinMenu ? clamp(Math.floor((s.y - (mAt.y - 11)) / 36), 0, 2) : 0;
+    setOnce('menu', pinMenu + '|' + row, () => {
+      el.pinRow.style.display = pinMenu ? '' : 'none';
+      el.menuRows.forEach((r, j) => r.classList.toggle('hot', j === row));
+    });
   }
 
   // The note: grows from where New note was picked, is typed in, then hidden to the tray.
@@ -650,23 +732,23 @@ function renderAt(time) {
   el.trayLogo.style.transform = `scale(${(1 + 0.3 * bump).toFixed(3)})`;
 
   // Recording: the outline, the strip, zoom, the pen.
-  const recOn = ramp(t, 26.25, 26.45);
-  const recOff = ramp(t, 30.6, 30.8);
+  const recOn = ramp(t, 34.25, 34.45);
+  const recOff = ramp(t, 38.6, 38.8);
   const rec = recOn * (1 - recOff);
   place(el.outline, zoomRect(t), rec);
   el.strip.style.opacity = rec;
   if (rec > 0) {
     el.strip.style.transform = `translate(-50%, ${(-6 * (1 - recOn)).toFixed(2)}px)`;
-    const secs = Math.min(9, Math.floor(Math.max(0, t - 26.3)));
+    const secs = Math.min(9, Math.floor(Math.max(0, t - 34.3)));
     setOnce('rec', secs, (v) => { el.recTime.textContent = '0:0' + v; });
     const zoom = zoomRect(t).z;
     setOnce('zoom', zoom > 1.02 ? zoom.toFixed(1) + 'x' : '', (v) => {
       el.recZoom.textContent = v;
       el.recZoom.classList.toggle('show', !!v);
     });
-    el.recPen.classList.toggle('on', t >= 28.4);
+    el.recPen.classList.toggle('on', t >= 36.4);
   }
-  const inkAlpha = t >= PEN.a ? 1 - ramp(t, 30.6, 30.85) : 0;
+  const inkAlpha = t >= PEN.a ? 1 - ramp(t, 38.6, 38.85) : 0;
   if (inkAlpha > 0) {
     const pts = [];
     const end = Math.min(t, PEN.b + 0.05);
@@ -689,8 +771,9 @@ function renderAt(time) {
   el.hud.style.transform = `translateY(${(6 * (1 - Math.min(1, hudIn))).toFixed(2)}px)`;
 
   // The pointer: crosshair while snipping, the pen's tip while drawing, else the arrow.
-  const pen = t >= 28.42 && t < 30.62;
-  const down = [[8.22, 8.3], [8.42, 8.5], [17.85, 17.95], [23.6, 23.7]].some(([a, b]) => t >= a && t < b);
+  const pen = t >= 36.42 && t < 38.62;
+  const down = [[8.22, 8.3], [8.42, 8.5], [17.85, 17.95], [23.6, 23.7], [28.9, 28.98], [PIN.press, PIN.release], [32.55, 32.63]]
+    .some(([a, b]) => t >= a && t < b);
   const arrowScale = (1 + 0.3 * rec) * (down ? 0.86 : 1);
   const lean = clamp(s.vx * 0.011, -12, 12);
   el.cursor.style.opacity = snipping || pen ? 0 : 1;

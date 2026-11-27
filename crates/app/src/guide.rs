@@ -549,6 +549,9 @@ pub fn test_client_size(dpi: u32) -> (i32, i32) {
 
 const GREEN_LIGHT: COLORREF = rgb(0x1a7f37);
 const GREEN_DARK: COLORREF = rgb(0x6fd78f);
+/// The app's mark on the light and the dark theme (`tray::MARK_BLUE`, `MARK_BLUE_DARK`).
+const MARK_LIGHT: COLORREF = rgb(0x3b7bea);
+const MARK_DARK: COLORREF = rgb(0x6fa2f7);
 
 /// [big name, page title, heading, body, chip]
 struct Fonts([HFONT; 5]);
@@ -1183,20 +1186,20 @@ impl Window<'_> {
         let amount = frame.intro * frame.content;
         let page = self.pages[self.page.get()];
         if page == Page::Welcome {
-            self.paint_welcome(canvas, amount, p);
+            self.paint_welcome(canvas, amount, p, mix(MARK_LIGHT, MARK_DARK, frame.theme));
         } else {
             self.paint_step(canvas, frame, amount, p);
         }
         canvas.dx = 0;
     }
 
-    fn paint_welcome(&self, canvas: &mut Canvas<'_>, amount: f64, p: Palette) {
+    fn paint_welcome(&self, canvas: &mut Canvas<'_>, amount: f64, p: Palette, mark: COLORREF) {
         let dpi = self.dpi.get();
         let px = |v| scale(v, dpi);
         let fade = |ink| mix(p.paper, ink, amount);
         let fonts = self.fonts.borrow().0;
         let center = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
-        self.paint_logo(canvas, scaled(LOGO, dpi), p.text, amount);
+        self.paint_logo(canvas, scaled(LOGO, dpi), mark, amount);
         canvas.text(scaled(NAME, dpi), "Igorio", fade(p.text), center, fonts[BIG]);
         // Two lines, broken after the colon.
         let line = self.views[0].line.replacen(": ", ":
@@ -1218,7 +1221,7 @@ impl Window<'_> {
             right: tray.left + px(36) + icon,
             bottom: (tray.top + tray.bottom + icon) / 2,
         };
-        self.paint_logo(canvas, icon_rect, p.text, amount);
+        self.paint_logo(canvas, icon_rect, mark, amount);
         let clock = RECT { left: tray.left + px(62), right: tray.right - px(6), ..tray };
         canvas.text(clock, "12:30", fade(p.text), center, fonts[BODY]);
         let text = RECT { left: tray.right + px(16), top: box_.top + px(14), right: box_.right - px(16), bottom: box_.top + px(34) };
@@ -1622,7 +1625,7 @@ fn run_window(options: &Options, shared: &Shared) -> Result<()> {
         timer: Cell::new(false),
         started: Cell::new(false),
         surface: RefCell::new(None),
-        icons: [settings_icon(instance, igorio_kit::theme::TEXT), settings_icon(instance, [234, 240, 252, 255])],
+        icons: [settings_icon(instance, crate::tray::MARK_BLUE), settings_icon(instance, crate::tray::MARK_BLUE_DARK)],
         menu: RefCell::new(None),
         logo: RefCell::new(None),
     });
