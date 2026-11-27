@@ -1,5 +1,5 @@
-//! Try the tool menu: hold Alt (or Ctrl+Alt) over empty space, a small menu of tools opens
-//! under the cursor, click a row and the tool "runs" (printed here as
+//! Try the tool menu: hold Alt (or Ctrl+Alt) anywhere but over a text field, a small menu of
+//! tools opens under the cursor, click a row and the tool "runs" (printed here as
 //! `TOOL <id> at x,y: origin`; no note window, no recording). Every state change, every
 //! lookup, every swallowed click and every injected key is printed.
 //!
@@ -122,7 +122,7 @@ fn run(modifier: Modifier, tools: &[ToolId], seconds: Option<f64>) -> Result<(),
     summoner.set_shortcuts(&Shortcuts::defaults());
     let names: Vec<&str> = tools.iter().map(|t| t.id()).collect();
     println!(
-        "Hold {} over empty space; the menu offers [{}]. Click a row. Ctrl+C stops.",
+        "Hold {} anywhere but a text field; the menu offers [{}]. Click a row. Ctrl+C stops.",
         modifier.label(),
         names.join(", ")
     );

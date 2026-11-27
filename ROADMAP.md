@@ -239,9 +239,12 @@ settings window. Stored as `shortcuts` in `settings.json`; a change applies at o
 
 ## Tool menu at the cursor
 
-Holding Alt over empty space does not open a note directly. It opens a small menu of
-tools under the cursor, so users do not have to guess what the gesture does.
+Holding Alt does not open a note directly. It opens a small menu of tools under the
+cursor, so users do not have to guess what the gesture does.
 
+- The menu opens anywhere except over a text field, a password field or a terminal (they
+  take typed text). The first version opened it only over empty space, as in Swift; that
+  proved hard to find (holding Alt over a button or text did nothing), so it changed.
 - The menu lists tools only: **New note** and **Record screen** today. Everything else
   (restore, discard, settings, recent notes) stays in the tray menu.
 - Each row shows the tool's keyboard shortcut, so users learn the direct way.
@@ -379,8 +382,11 @@ elevated window.
 
 ### M7. Notes
 
-Summoner (hold `Alt` on empty space, click), note windows, markdown editor, store,
-recent notes menu, drop screenshots into a note.
+Summoner (hold `Alt`, click), note windows, markdown editor, store, recent notes menu,
+drop screenshots into a note.
+
+The tool menu opens anywhere except over text fields. This was chosen after the Swift rule
+(empty space only) proved hard to discover.
 
 Open point: a lone `Alt` tap focuses the menu bar on Windows. The keyboard hook must
 swallow it, or the modifier changes to `Ctrl+Alt`.

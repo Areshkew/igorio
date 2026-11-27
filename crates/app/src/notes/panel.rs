@@ -1009,7 +1009,7 @@ impl State {
         let notes = self.notes.borrow();
         if shown.is_empty() {
             let message = if notes.is_empty() {
-                "No notes yet. Hold Alt on empty space and choose New note."
+                "No notes yet. Hold Alt and choose New note."
             } else {
                 "No notes match the filter."
             };

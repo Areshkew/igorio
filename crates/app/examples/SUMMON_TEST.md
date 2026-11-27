@@ -5,12 +5,13 @@ It offers one tool, New note, as the app does today. Add `-- --tools note,record
 rows (steps 3 and 4), `-- --modifier ctrl-alt` for step 18. Every state change, lookup,
 swallowed click and injected key is printed (`FAIRY_DEBUG ...`), and every chosen tool as
 `TOOL <id> at x,y: label | detail`. "Menu" means the small rounded list of tools that opens
-under the cursor.
+under the cursor. It opens anywhere except over a text field, a password field or a
+terminal.
 
 ## The menu
 
-1. **One row, default under the cursor.** Minimise windows, hold Alt over empty desktop
-   (not on an icon) for half a second. Must: a menu with one row, "New note", opens with
+1. **One row, default under the cursor.** Minimise windows, hold Alt over the desktop
+   (between icons) for half a second. Must: a menu with one row, "New note", opens with
    its row under the cursor (the arrow sits in the row's left gutter, before the icon), the
    row is highlighted; `menu open ... with [note]`, `injected mask key vkE8` and `gate armed`
    are printed. The cursor did not have to move. Click without moving. Must: the row
@@ -30,7 +31,7 @@ under the cursor.
    and click. Must: the menu closes, no `TOOL` line, no `swallowed press` line, and the
    desktop gets the click (it deselects its icons; press and drag instead and a selection
    rectangle starts, so the app got the press and, on letting go, the release). Repeat in a
-   Notepad window: hold Alt over its status bar gap until the menu opens (if it does), then
+   Notepad window: hold Alt over its status bar until the menu opens, then
    click into the text: the caret moves there. Also click just outside the menu's rounded
    edge, in its shadow: that click passes too. A click on the card's padding above the first
    row or below the last runs that row.
@@ -48,29 +49,33 @@ under the cursor.
 ## The gesture rules (unchanged)
 
 8. **Notepad (classic menu bar), menu bar check.** In a Notepad with a menu bar, hold Alt
-   over a blank part of the window that is not text (if a menu opens there), release without
-   clicking. Must: the menu bar is NOT active afterwards (typing a letter types it, no menu
+   over the menu bar or the status bar until the menu opens, release without clicking. Must: the menu bar is NOT active afterwards (typing a letter types it, no menu
    item is highlighted). Then tap Alt quickly. Must: the menu bar IS active as usual (`Esc`
    to leave), and the demo printed no `injected` and no `gate armed` line for that tap.
-9. **Notepad text.** Hold Alt over the text for a second. Must: no menu, `empty false`.
+9. **Notepad text.** Hold Alt over the text for a second. Must: no menu, `allowed false`.
    Release: the menu bar activates as usual (this was an ordinary Alt use). Notepad keeps
-   its caret and focus whenever the menu showed.
-10. **Chromium browser page.** Hold Alt over a page margin. Must: the menu; a click on New
-    note makes `TOOL note ... <host>` with the URL in the detail. Over a link, a text field
-    or the tab strip: no menu. Hold over the margin until the menu opens, release without a
+   its caret and focus whenever the menu showed. Same over a terminal window (Windows
+   Terminal, cmd) and a password field: no menu.
+10. **Chromium browser page.** Hold Alt over a page margin, then over page text, a link, a
+    button and the tab strip. Must: the menu every time; a click on New note over the page
+    makes `TOOL note ... <host>` with the URL in the detail. Over a text field (a search box,
+    the address bar): no menu. Hold over the page until the menu opens, release without a
     click. Must: the browser menu button is not focused, the address bar does not take focus.
 11. **Alt+click while no menu.** In the browser, Alt+click a link quickly (before the menu
-    could open, or over the link itself where none opens). Must: the browser does its own
+    could open, under 0.3 s). Must: the browser does its own
     Alt+click (download the link); no `swallowed` line.
-12. **Leave empty space.** Hold Alt over a page margin until the menu opens, move off the
-    menu onto a link: the menu closes (`gate disarmed`). Alt+click the link now. Must: the
-    browser gets the click (no `swallowed` line, no `TOOL`).
+12. **Move onto a text field.** Hold Alt over page text until the menu opens, move off the
+    menu onto a text field: the menu closes (`gate disarmed`). Click into the field now.
+    Must: the field gets the click (no `swallowed` line, no `TOOL`). Move off the menu onto a
+    link or a button instead: the menu stays. Back from a text field onto page text: the
+    menu opens again there.
 13. **File Explorer.** Hold Alt over the empty part of a folder's file list. Must: the menu;
     New note makes `TOOL note ... File Explorer` with the folder in the detail; no item is
-    selected. Over a file: no menu. Hold until the menu opens, release: the command bar's
+    selected. Over a file or the command bar: the menu too. Over the address bar or the
+    search box: no menu. Hold until the menu opens, release: the command bar's
     key tips / menu do not appear.
-14. **Office (if installed)**, Word or Excel: hold Alt over the grey area around the page or
-    below the sheet until a menu opens (if one does), release. Must: no key tips appear. A
+14. **Office (if installed)**, Word or Excel: hold Alt over the ribbon or the grey area
+    around the page until the menu opens, release. Must: no key tips appear. A
     quick Alt tap still shows the key tips.
 15. **Visual Studio Code.** Hold Alt over an empty editor area (no file open) until the menu
     opens, release. Must: the menu bar does not toggle or take focus. A quick Alt tap still

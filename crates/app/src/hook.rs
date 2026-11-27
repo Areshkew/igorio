@@ -1534,7 +1534,7 @@ mod tests {
         let gate = ClickGate::new();
         let held = gate.disarm();
         assert!(gate.arm(held, Button::Left));
-        gate.withdraw(); // the cursor left empty space
+        gate.withdraw(); // the cursor moved over a text field
         assert!(!gate.is_armed());
         assert!(!gate.on_press(Button::Left, false, false, 0, 0));
         assert!(gate.arm(held, Button::Left)); // and came back

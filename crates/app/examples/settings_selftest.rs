@@ -201,7 +201,7 @@ fn verify_controls(
                 (ScreenshotDetail, "Use Win+Shift+S or PrtScn and your cursor carries the shot."),
                 (KeepTitle, "Keep every screenshot"),
                 (NotesTitle, "Notes"),
-                (NotesKeys, "Hold Alt and click on empty space"),
+                (NotesKeys, "Hold Alt and click"),
                 (NotesDetail, "A sticky note opens where you click, saved as Markdown."),
                 (RecordingTitle, "Screen recording"),
                 (RecordingKeys, recording_keys.as_str()),

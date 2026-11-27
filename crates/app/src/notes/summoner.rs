@@ -1,8 +1,9 @@
-//! The tool menu at the cursor: hold Alt on its own over empty space (the desktop, a page
-//! margin, a window background) and a small menu of tools opens under the cursor (New note,
-//! Record screen; [`TOOLS`]). Its first row sits under the cursor, so "hold Alt, click" still
-//! makes a note in one click; moving to another row and clicking runs that tool. The click is
-//! swallowed, so the app underneath never sees an Alt+click. Releasing Alt closes the menu.
+//! The tool menu at the cursor: hold Alt on its own anywhere except over a text field (a
+//! button, a link, page text, the desktop, a window background) and a small menu of tools
+//! opens under the cursor (New note, Record screen; [`TOOLS`]). Its first row sits under the
+//! cursor, so "hold Alt, click" still makes a note in one click; moving to another row and
+//! clicking runs that tool. The click is swallowed, so the app underneath never sees an
+//! Alt+click. Releasing Alt closes the menu.
 //! It replaces the summon pill of `NoteSummoner.swift` (the gesture is the same; the direct
 //! action is now a menu, `ROADMAP.md` "Tool menu at the cursor").
 //!
@@ -86,9 +87,11 @@
 //!   ([`Phase::Cancelled`]): no menu until the modifier is released and pressed again.
 //! - The feature is enabled and nothing blocks it ([`Summoner::set_blocked`]: a paste
 //!   delivery, a screenshot capture, a recording, the app paused).
-//! - A UI Automation lookup at the cursor says the spot is empty
-//!   ([`super::context::is_empty_space`]). The lookup runs once the hold delay has passed,
-//!   not on every move.
+//! - A UI Automation lookup at the cursor says the spot allows the menu
+//!   ([`super::context::allows_menu`]): anywhere except a text field, a password field or a
+//!   terminal (they take typed text), our own windows and elevated windows. A lookup that
+//!   times out or fails allows it: a wrong open costs little. The lookup runs once the hold
+//!   delay has passed, not on every move.
 //! - At least one tool is offered ([`offered`], from the [`ToolContext`] the app passes in
 //!   and the kind of spot the lookup found). No tool: the menu does not open, nothing is
 //!   armed or injected, and the hold is used up.
@@ -96,12 +99,11 @@
 //! # While the menu shows
 //!
 //! - It stays where it opened. The pointer over the menu keeps it open: the menu is our own
-//!   window, which the empty-space rule would call "not empty", so no lookup runs while the
-//!   pointer is inside the menu's card. Outside the card the spot is checked again at most
-//!   every [`RECHECK_GAP`]: over empty space the menu stays; over anything else (text, a
-//!   control) the menu closes and the gate is disarmed, so a click there is the app's. Back
-//!   on empty space the menu opens again at the new spot (no second mask key). A lookup
-//!   that times out means "not empty".
+//!   window, which the rule would not allow, so no lookup runs while the pointer is inside
+//!   the menu's card. Outside the card the spot is checked again at most every
+//!   [`RECHECK_GAP`], by the same rule: over a text field the menu closes and the gate is
+//!   disarmed, so a click there is the app's; anywhere else the menu stays. Back on an
+//!   allowed spot the menu opens again at the new spot (no second mask key).
 //! - The row under the pointer is highlighted.
 //! - A click on a row runs that tool ([`SummonerEvent::ToolChosen`]); the point given is
 //!   where the menu opened. The card's padding counts as the nearest row. A click outside the
@@ -208,7 +210,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
-use super::context::{self, AppNames, facts_at, is_empty_space};
+use super::context::{self, AppNames, allows_menu, facts_at};
 use super::editor::{
     GdiFonts, Palette, Surface, Transition, animation_effects, mix, px, system_dark,
 };
@@ -331,7 +333,7 @@ impl Modifier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SummonConfig {
     pub modifier: Modifier,
-    /// The settings switch ("Hold Alt on empty space for a note").
+    /// The settings switch ("Hold Alt and click").
     pub enabled: bool,
     /// Emit [`SummonerEvent::Log`] lines (`FAIRY_DEBUG=1`).
     pub debug: bool,
@@ -408,7 +410,7 @@ pub enum Icon {
     RecordDot,
 }
 
-/// What kind of spot the menu opens over (from the lookup that found it empty).
+/// What kind of spot the menu opens over (from the lookup that allowed it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Spot {
     /// Not known (the menu opened by a shortcut, or no lookup).
@@ -851,7 +853,7 @@ pub enum Phase {
     Idle,
     /// The modifier is held alone; waiting for [`HOLD_DELAY`].
     Held,
-    /// The delay passed; waiting for a lookup to say the spot is empty (no menu).
+    /// The delay passed; waiting for a lookup to allow the spot (no menu).
     Looking,
     /// The menu shows; the click gate is armed.
     Showing,
@@ -871,10 +873,11 @@ pub enum Input {
     /// The mouse buttons down now (`GetAsyncKeyState`), read before a hold may start, so a
     /// lost release in the feed cannot block the gesture for good.
     Buttons(u8),
-    /// The answer to [`Action::Ask`]: is the spot empty, and what kind of spot it is.
+    /// The answer to [`Action::Ask`]: may the menu open at the spot, and what kind of spot
+    /// it is.
     Answer {
         ask: u64,
-        empty: bool,
+        allowed: bool,
         spot: Spot,
     },
     /// The click gate swallowed a press here.
@@ -906,7 +909,7 @@ pub enum Input {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Action {
-    /// Look up whether the spot at `point` is empty; answer with [`Input::Answer`].
+    /// Look up whether the spot at `point` allows the menu; answer with [`Input::Answer`].
     Ask {
         ask: u64,
         point: (i32, i32),
@@ -974,8 +977,8 @@ pub struct Gesture {
     asked_point: (i32, i32),
     /// The cursor moved since the spot was last asked about.
     dirty: bool,
-    /// The latest lookup that found the spot empty (any answer for a free menu).
-    empty_ask: Option<u64>,
+    /// The latest lookup that allowed the spot (any answer for a free menu).
+    allowed_ask: Option<u64>,
     /// The mask key was requested in this hold.
     masked: bool,
     /// The menu that shows, or showed last (a click the gate took just before the menu
@@ -1002,7 +1005,7 @@ impl Gesture {
             asked_at: f64::NEG_INFINITY,
             asked_point: (0, 0),
             dirty: false,
-            empty_ask: None,
+            allowed_ask: None,
             masked: false,
             menu: None,
         }
@@ -1069,7 +1072,7 @@ impl Gesture {
             Input::Key(key) => self.key(key, now, &mut out),
             Input::Mouse(event) => self.mouse(event, now, &mut out),
             Input::Buttons(bits) => self.buttons = bits,
-            Input::Answer { ask, empty, spot } => self.answer(ask, empty, spot, now, &mut out),
+            Input::Answer { ask, allowed, spot } => self.answer(ask, allowed, spot, now, &mut out),
             Input::ClickTaken { x, y } => self.click_taken((x, y), now, &mut out),
             Input::Blocked(blocked) => {
                 self.blocked = blocked;
@@ -1181,7 +1184,7 @@ impl Gesture {
                         self.since = now;
                         self.epoch = key.epoch;
                         self.masked = false;
-                        self.empty_ask = None;
+                        self.allowed_ask = None;
                         self.pending = None;
                         self.asked_at = f64::NEG_INFINITY;
                     }
@@ -1222,7 +1225,7 @@ impl Gesture {
                         menu.seen = now;
                     }
                 } else if self.inside() {
-                    // Over the menu: our own window, never "empty"; no lookup.
+                    // Over the menu: our own window, never allowed; no lookup.
                     self.dirty = false;
                 } else if matches!(self.phase, Phase::Looking | Phase::Showing) {
                     let (ax, ay) = self.asked_point;
@@ -1267,7 +1270,7 @@ impl Gesture {
                 tool,
                 row,
                 point: anchor,
-                ask: self.empty_ask,
+                ask: self.allowed_ask,
             });
         }
         if showing {
@@ -1282,22 +1285,22 @@ impl Gesture {
         self.after_hold(now);
     }
 
-    fn answer(&mut self, ask: u64, empty: bool, spot: Spot, now: f64, out: &mut Vec<Action>) {
+    fn answer(&mut self, ask: u64, allowed: bool, spot: Spot, now: f64, out: &mut Vec<Action>) {
         if self.pending != Some(ask) {
             return;
         }
         self.pending = None;
         if self.is_free() {
             // A free menu asked only for the origin of a note.
-            self.empty_ask = Some(ask);
+            self.allowed_ask = Some(ask);
             return;
         }
         match self.phase {
-            Phase::Looking if empty => self.open(ask, spot, now, out),
-            Phase::Showing if empty => self.empty_ask = Some(ask),
+            Phase::Looking if allowed => self.open(ask, spot, now, out),
+            Phase::Showing if allowed => self.allowed_ask = Some(ask),
             Phase::Showing if self.inside() => {}
             Phase::Showing => {
-                // The cursor left empty space: the menu closes, and a click now is the app's.
+                // The cursor is over a text field: the menu closes, and a click now is the app's.
                 out.push(Action::Disarm);
                 out.push(Action::Close { animate: true });
                 self.phase = Phase::Looking;
@@ -1309,7 +1312,7 @@ impl Gesture {
         }
     }
 
-    /// The spot is empty: open the menu with the tools offered here, or use the hold up when
+    /// The spot allows the menu: open it with the tools offered here, or use the hold up when
     /// there is none.
     fn open(&mut self, ask: u64, spot: Spot, now: f64, out: &mut Vec<Action>) {
         let tools = offered(&ToolContext {
@@ -1321,7 +1324,7 @@ impl Gesture {
             self.after_hold(now);
             return;
         }
-        self.empty_ask = Some(ask);
+        self.allowed_ask = Some(ask);
         // Placed first (the gate needs the card), then armed, then the mask key.
         out.push(Action::Open { point: self.cursor });
         out.push(Action::Arm { epoch: self.epoch });
@@ -1350,7 +1353,7 @@ impl Gesture {
         self.cursor = point;
         self.epoch = epoch;
         self.masked = true; // no modifier is held: never a mask key
-        self.empty_ask = None;
+        self.allowed_ask = None;
         out.push(Action::Open { point });
         out.push(Action::Arm { epoch });
         self.menu = Some(Menu {
@@ -2287,9 +2290,9 @@ struct Driver {
     view: MenuView,
     hook: Option<KeyHook>,
     asks: HashMap<RequestId, Purpose>,
-    /// The latest lookup that found the spot empty (or any, for a free menu), for the origin
-    /// of a chosen tool.
-    empty: Option<(u64, Outcome)>,
+    /// The latest lookup that allowed the spot (or any, for a free menu), for the origin of a
+    /// chosen tool.
+    allowed: Option<(u64, Outcome)>,
     names: AppNames,
     taken_seen: u64,
     next_health: f64,
@@ -2344,7 +2347,7 @@ fn run(
         view,
         hook: Some(hook),
         asks: HashMap::new(),
-        empty: None,
+        allowed: None,
         names: AppNames::default(),
         taken_seen: CLICK_GATE.taken().count,
         next_health: now + HEALTH_CHECK,
@@ -2629,14 +2632,14 @@ impl Driver {
                     ask,
                 } => {
                     self.view.choose(row, now);
-                    let empty = self.empty.take();
+                    let allowed = self.allowed.take();
                     let none = Outcome::Failed("no lookup".into());
-                    let outcome = match (&empty, ask) {
+                    let outcome = match (&allowed, ask) {
                         (Some((id, outcome)), Some(ask)) if *id == ask => outcome,
                         _ => &none,
                     };
                     let origin = self.origin_at(point, outcome);
-                    self.empty = empty;
+                    self.allowed = allowed;
                     self.emit_chosen(tool, point, origin, now);
                 }
             }
@@ -2677,22 +2680,22 @@ impl Driver {
             };
             match self.asks.remove(&id) {
                 Some(Purpose::Gesture(ask)) => {
-                    let empty = is_empty_space(&outcome);
+                    let allowed = allows_menu(&outcome);
                     self.log(&format!(
-                        "lookup {ask}: {} -> empty {empty}",
+                        "lookup {ask}: {} -> allowed {allowed}",
                         describe(&outcome)
                     ));
                     let mut spot = Spot::Unknown;
-                    if empty || self.gesture.is_free() {
+                    if allowed || self.gesture.is_free() {
                         // Read the window facts now (the exe's name is cached), so the
                         // click finds them ready; they also name the kind of spot.
                         if let Outcome::Found(s) = &outcome {
                             let point = s.point;
                             spot = Spot::from_kind(self.origin_at(point, &outcome).kind);
                         }
-                        self.empty = Some((ask, outcome));
+                        self.allowed = Some((ask, outcome));
                     }
-                    self.step(Input::Answer { ask, empty, spot });
+                    self.step(Input::Answer { ask, allowed, spot });
                 }
                 Some(Purpose::Hotkey { point, time }) => {
                     let origin = self.origin_at(point, &outcome);
@@ -3276,13 +3279,13 @@ mod tests {
         }
 
         /// Answers the newest ask.
-        fn answer(&mut self, t: f64, empty: bool) -> &mut Script {
+        fn answer(&mut self, t: f64, allowed: bool) -> &mut Script {
             let ask = self.last_ask().expect("an ask to answer");
             self.at(
                 t,
                 Input::Answer {
                     ask,
-                    empty,
+                    allowed,
                     spot: Spot::Desktop,
                 },
             )
@@ -3335,8 +3338,8 @@ mod tests {
             self.arms() == 0 && self.masks() == 0 && self.opens() == 0 && self.chooses() == 0
         }
 
-        /// The modifier down at 0, held past the delay over empty space at [`AT`]: the menu
-        /// shows.
+        /// The modifier down at 0, held past the delay over an allowed spot at [`AT`]: the
+        /// menu shows.
         fn showing_with(modifier: Modifier, context: ToolContext) -> Script {
             let mut s = Script::with(modifier, context);
             if modifier == Modifier::CtrlAlt {
@@ -3502,7 +3505,7 @@ mod tests {
     #[test]
     fn a_click_outside_the_menu_closes_it_and_passes_through() {
         let mut s = Script::showing_with(Modifier::Alt, both());
-        // Outside the card but still over empty space (the re-check says so).
+        // Outside the card but still over an allowed spot (the re-check says so).
         s.moved(0.4, 600, 600);
         s.tick_to(0.55);
         s.answer(0.56, true);
@@ -3582,7 +3585,7 @@ mod tests {
         s.tick_to(2.0);
         assert_eq!(s.asks(), 1);
         assert_eq!(s.g.phase(), Phase::Showing);
-        // A late "not empty" answer (the menu is our own window) while the pointer is inside
+        // A late "not allowed" answer (the menu is our own window) while the pointer is inside
         // does not close it either.
         let mut s = Script::showing(Modifier::Alt);
         s.moved(0.4, 600, 600);
@@ -3593,7 +3596,7 @@ mod tests {
             0.57,
             Input::Answer {
                 ask,
-                empty: false,
+                allowed: false,
                 spot: Spot::Unknown,
             },
         );
@@ -3761,9 +3764,9 @@ mod tests {
     }
 
     #[test]
-    fn leaving_empty_space_closes_the_menu_and_a_click_then_is_not_taken() {
+    fn moving_over_a_text_field_closes_the_menu_and_a_click_then_is_not_taken() {
         let mut s = Script::showing(Modifier::Alt);
-        // Move over a text field outside the menu: a re-check after the gap says not empty.
+        // Move over a text field outside the menu: a re-check after the gap says not allowed.
         s.moved(0.40, 600, 600);
         s.tick_to(0.55);
         assert_eq!(s.asks(), 2);
@@ -3779,7 +3782,29 @@ mod tests {
     }
 
     #[test]
-    fn back_on_empty_space_the_menu_opens_again_without_a_second_mask() {
+    fn a_recheck_over_a_button_keeps_the_menu_and_its_lookup_names_the_origin() {
+        let mut s = Script::showing(Modifier::Alt);
+        // Move over a button outside the menu: the re-check allows it.
+        s.moved(0.40, 600, 600);
+        s.tick_to(0.55);
+        assert_eq!(s.asks(), 2);
+        s.answer(0.56, true);
+        assert_eq!(s.g.phase(), Phase::Showing);
+        assert_eq!((s.disarms(), s.closes()), (0, 0));
+        // A click on the row runs the tool with the newest allowed lookup.
+        s.at(0.6, Input::ClickTaken { x: AT.0, y: AT.1 });
+        assert!(s.actions.iter().any(|(_, a)| matches!(
+            a,
+            Action::Choose {
+                tool: ToolId::NewNote,
+                ask: Some(2),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn back_on_an_allowed_spot_the_menu_opens_again_without_a_second_mask() {
         let mut s = Script::showing(Modifier::Alt);
         s.moved(0.40, 600, 600);
         s.tick_to(0.55);
@@ -3803,7 +3828,7 @@ mod tests {
                     0.37 + f64::from(i) * 0.005 + 0.001,
                     Input::Answer {
                         ask,
-                        empty: true,
+                        allowed: true,
                         spot: Spot::Desktop,
                     },
                 );
@@ -3837,14 +3862,14 @@ mod tests {
     }
 
     #[test]
-    fn a_lookup_timeout_means_no_menu() {
+    fn a_lookup_timeout_opens_the_menu() {
         let mut s = Script::new(Modifier::Alt);
         s.key(0.0, LALT, true);
         s.tick_to(0.35);
-        // The worker answers TimedOut at its deadline: the driver reports "not empty".
-        s.answer(0.5, false);
-        s.tick_to(2.0);
-        assert!(s.untouched());
+        // The worker answers TimedOut at its deadline: the driver reports "allowed".
+        s.answer(0.5, true);
+        assert_eq!(s.g.phase(), Phase::Showing);
+        assert_eq!((s.arms(), s.masks(), s.opens()), (1, 1, 1));
         // A lost answer is given up on, and a move asks again.
         let mut s = Script::new(Modifier::Alt);
         s.key(0.0, LALT, true);
@@ -4078,7 +4103,7 @@ mod tests {
                 .any(|(_, a)| *a == Action::Arm { epoch: s.epoch })
         );
         assert_eq!(s.g.phase(), Phase::Showing);
-        // Any answer names the origin, even "not empty" (the cursor may be over a window).
+        // Any answer names the origin, even "not allowed" (the cursor may be over a field).
         s.answer(0.1, false);
         assert_eq!(s.g.phase(), Phase::Showing);
         // A click on the second row runs it, with the origin's lookup.

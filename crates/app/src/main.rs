@@ -923,7 +923,7 @@ impl NotesFeature {
             })
             .collect();
         if items.is_empty() {
-            items.push(MenuItem::Label("No notes yet — hold Alt on empty space".into()));
+            items.push(MenuItem::Label("No notes yet — hold Alt and choose New note".into()));
         }
         vec![
             MenuItem::action(MENU_NOTES_PANEL, "Notes…"),
