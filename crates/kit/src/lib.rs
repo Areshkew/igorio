@@ -1,4 +1,4 @@
-//! Shared types for the app and its capabilities, from `fairy-cursor/sources/kit`.
+//! Shared types for the app and its capabilities.
 //! No Windows API here.
 
 pub mod held;

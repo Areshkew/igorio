@@ -1,10 +1,10 @@
-//! Translated from `fairy-cursor/tests/core/LegacyShakeTests.swift`.
+//! The first shake detector, kept as a model of what the current one must not do.
 
 use std::f64::consts::PI;
 
 use igorio_core::shake::ShakeDetector;
 
-/// The detector Fairy Cursor shipped with (verbatim logic): reversals counted per axis, 18 pt
+/// The first shake detector (verbatim logic): reversals counted per axis, 18 pt
 /// swing, 4 reversals in 1 s. Kept here to document which ordinary movements it mistook for a
 /// shake — each of these silently discarded a carried screenshot.
 struct LegacyShakeDetector {

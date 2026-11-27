@@ -2,7 +2,7 @@
 
 //! Wires the modules together: one UI thread owns the overlay, the tray, the state and the
 //! drop router. `igorio --demo N` starts with N generated screenshots on the pile.
-//! `FAIRY_DEBUG=1` logs every drop decision (see `drop_router::DebugLog`).
+//! `IGORIO_DEBUG=1` logs every drop decision (see `drop_router::DebugLog`).
 
 use std::cell::{Cell, RefCell, RefMut};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
@@ -30,7 +30,7 @@ use igorio_app::settings::{self, DefaultFolders, Settings};
 use igorio_app::settings_window::{LiveSettings, SettingsWindow, ShortcutService};
 use igorio_app::shortcuts::{Action, Hotkeys, Registration, display_for_layout};
 use igorio_app::snip::{Snip, SnipEvent};
-use igorio_app::state::{FairyState, Hidden};
+use igorio_app::state::{IgorioState, Hidden};
 use igorio_app::tray::{EndRequest, MenuItem, Tray};
 use igorio_app::uia::Requester;
 use igorio_core::geom::Point;
@@ -71,8 +71,7 @@ const MENU_GUIDE: u32 = 10;
 const MENU_NOTE_BASE: u32 = 100;
 /// How long stopping the notes may take: saving the text and closing the windows.
 const NOTES_STOP: Duration = Duration::from_secs(2);
-/// How long the normal quit waits for a recording in progress to be finished (the Swift app
-/// waits 3 s too). Bounded by the recorder's own shutdown wait.
+/// How long the normal quit waits for a recording in progress to be finished. Bounded by the recorder's own shutdown wait.
 const RECORDING_STOP: Duration = Duration::from_secs(3);
 /// At session end Windows may end the process a few seconds after WM_ENDSESSION, so the quit
 /// does only what matters, most important first, within 4.0 s in all: the clipboard restore
@@ -98,7 +97,7 @@ const FRAME: f64 = 0.008;
 const HEALTH_CHECK: f64 = 1.0;
 
 struct App {
-    state: FairyState,
+    state: IgorioState,
     shake: ShakeGate,
     follower: Follower,
     renderer: Renderer,
@@ -159,7 +158,7 @@ impl App {
         self.hide(Hidden::CaptureUi, shown, time);
     }
 
-    /// One reason to hide the fairy comes or goes (`setCaptureUIVisible(_:owner:)`): the
+    /// One reason to hide the pile comes or goes: the
     /// screenshot UI, or a pen in hand while recording. It is hidden while any reason holds;
     /// the shake gate follows the overall edge.
     fn hide(&mut self, reason: Hidden, hidden: bool, time: f64) {
@@ -693,7 +692,7 @@ impl NotesFeature {
                 .map_or_else(|| Err("no UI Automation".to_string()), Drops::requester);
             let summon = SummonConfig {
                 debug: self.log.enabled(),
-                capturable: std::env::var_os("FAIRY_CAPTURABLE").is_some_and(|v| v == "1"),
+                capturable: std::env::var_os("IGORIO_CAPTURABLE").is_some_and(|v| v == "1"),
                 ..SummonConfig::default()
             };
             let settings = settings.clone();
@@ -707,7 +706,7 @@ impl NotesFeature {
     }
 
     /// Switch off: the gesture stops, open notes are put away with their text saved and come
-    /// back when the switch goes on again (Swift `deactivate` and `hideAll`).
+    /// back when the switch goes on again.
     fn stop(&mut self, drops: Option<&mut Drops>) {
         if let Some(running) = self.active.take() {
             if let Some(drops) = drops {
@@ -779,7 +778,7 @@ impl NotesFeature {
     /// the gesture. Returns true when the pile changed.
     fn pass(
         &mut self,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         drops: Option<&mut Drops>,
         recording: RecordingFacts,
         now: f64,
@@ -816,7 +815,7 @@ impl NotesFeature {
                     let (x, y) = chosen.point;
                     match chosen.tool {
                         // `new_note_frame` puts the card's top-left half a pill up and left of
-                        // the point, as `NotesController.create` does.
+                        // the point, as a note made from the pill would be.
                         ToolId::NewNote => {
                             running.notes.open_new(Point::new(f64::from(x), f64::from(y)), chosen.origin.clone());
                             self.log.line(
@@ -912,7 +911,7 @@ impl NotesFeature {
         }
     }
 
-    /// The tray menu's notes section (`NotesController.appendMenuItems`): "Notes…" (the
+    /// The tray menu's notes section: "Notes…" (the
     /// panel), "Recent Notes" with the five last changed, open ones checked, and "Open Notes
     /// Folder". Shows the last known list; the refresh it asks for answers before the next
     /// opening.
@@ -1258,7 +1257,7 @@ fn menu_text(text: &str) -> String {
     text.replace('&', "&&").replace('\t', " ")
 }
 
-/// The tray menu's recording section (`RecordingCapability.menuItems`): "Record Screen" or
+/// The tray menu's recording section: "Record Screen" or
 /// "Stop Recording" with the shortcut in the key column, and while recording the Pen and
 /// Highlighter, the one in hand checked. Nothing while the capability is off.
 fn recording_menu(recording: &RecordingFeature) -> Vec<MenuItem> {
@@ -1360,7 +1359,13 @@ fn main() -> windows::core::Result<()> {
     igorio_app::crash::install();
     overlay::ensure_dpi_awareness();
     let settings_path = settings::default_settings_path();
-    let settings = LiveSettings::from(Settings::load(&settings_path).unwrap_or_default());
+    let loaded = Settings::load(&settings_path);
+    let mut settings = loaded.as_ref().cloned().unwrap_or_default();
+    // Before anything creates the default notes folder. Saved only when the file was read.
+    if settings.keep_old_notes_folder(&DefaultFolders::from_system()) && loaded.is_ok() {
+        let _ = settings.save(&settings_path);
+    }
+    let settings = LiveSettings::from(settings);
     // Note window positions live next to the settings.
     let notes = Rc::new(RefCell::new(NotesFeature::new(
         settings_path.with_file_name("note-windows.json"),
@@ -1371,11 +1376,11 @@ fn main() -> windows::core::Result<()> {
         .duration_since(UNIX_EPOCH)
         .map_or(1, |d| d.as_nanos() as u64 | 1);
     let mut overlay = Overlay::new()?;
-    if std::env::var_os("FAIRY_CAPTURABLE").is_some_and(|v| v == "1") {
+    if std::env::var_os("IGORIO_CAPTURABLE").is_some_and(|v| v == "1") {
         overlay.set_capturable(true)?;
     }
     let app = Rc::new(RefCell::new(App {
-        state: FairyState::new(seed),
+        state: IgorioState::new(seed),
         shake: ShakeGate::new(),
         follower: Follower::new(),
         renderer: Renderer::new(),
@@ -1640,7 +1645,7 @@ fn main() -> windows::core::Result<()> {
                     eprintln!("{hint} ({error})");
                 }
             }
-            // While a pen is in hand the fairy steps aside, like for the screenshot UI.
+            // While a pen is in hand the pile steps aside, like for the screenshot UI.
             app.hide(Hidden::Drawing, recording.borrow().drawing(), now);
             // Treat the whole batch as capture input if visibility changed during
             // it. A shown/gone pair can arrive together with the selection clicks.

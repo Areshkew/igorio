@@ -60,7 +60,7 @@ impl Node {
         self
     }
 
-    /// The same element: pointer equality of the inner handle, like Swift's `===`.
+    /// The same element: pointer equality of the inner handle.
     fn same(&self, other: &Node) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
     }
@@ -121,7 +121,7 @@ fn test_chromium_editable_ancestor_attribute() {
 
 #[test]
 fn test_custom_text_view_with_generic_role() {
-    // SwiftUI/Catalyst/canvas editors: a group whose value is settable text.
+    // Custom-drawn and canvas editors: a group whose value is settable text.
     assert!(is_text_input(
         &Node::new(Some("AXGroup")).with_settable_text()
     ));

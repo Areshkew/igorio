@@ -1,4 +1,4 @@
-//! Pure text logic of the macOS Markdown note editor (`MarkdownEditor.swift`), ported to Rust.
+//! Pure text logic of the Markdown note editor.
 //!
 //! Styling is a second pass: [`style`] returns byte-range spans a widget can paint. List
 //! continuation, screenshot insertion and UTF-16/UTF-8 range conversion are plain functions too.
@@ -8,10 +8,10 @@ use std::ops::Range;
 
 use igorio_kit::theme::{self, Rgba};
 
-/// The colour of Markdown punctuation: `MUTED` at 50%, the Swift `markColor`.
+/// The colour of Markdown punctuation: `MUTED` at 50%.
 pub const MARK: Rgba = [0x5a, 0x64, 0x78, 0x80];
 
-/// What a span is, with exactly the kinds the Swift styler distinguishes.
+/// What a span is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Body,
@@ -31,7 +31,7 @@ pub enum Kind {
 /// `marker` is true for the Markdown punctuation itself (the `#` prefix, the `**`, the brackets
 /// around a link, ...). Draw marker spans with [`MARK`] instead of the look's colour; the look's
 /// size, weight and monospace flag still apply. [`Kind::ListMarker`] is punctuation by definition
-/// and its look already has the muted colour the Swift code uses, so keep that colour for it.
+/// and its look already has the muted colour, so keep that colour for it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
     pub range: Range<usize>,
@@ -46,11 +46,11 @@ pub enum Weight {
     Semibold,
 }
 
-/// Concrete visual values, taken from `MarkdownStyler` in the Swift file.
+/// Concrete visual values for one kind of span.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Look {
     pub weight: Weight,
-    /// Logical pixels, as the Swift point sizes.
+    /// Logical pixels.
     pub size: f32,
     pub colour: Rgba,
     pub monospace: bool,
@@ -65,7 +65,7 @@ pub fn look(kind: Kind) -> Look {
             colour: theme::TEXT,
             monospace: false,
         },
-        // Swift: [20, 17, 15.5][level - 1], semibold.
+        // Levels 1 to 3: 20, 17 and 15.5 px, semibold.
         Kind::Heading(1) => Look {
             weight: Weight::Semibold,
             size: 20.0,
@@ -112,8 +112,8 @@ pub fn look(kind: Kind) -> Look {
             colour: theme::ACCENT,
             monospace: false,
         },
-        // Bullet marker: muted and semibold. Task markers become medium in Swift, which one
-        // kind cannot also express; see the module notes in the report.
+        // Bullet marker: muted and semibold. Task markers use the same look (one kind cannot
+        // also express a medium weight for them).
         Kind::ListMarker => Look {
             weight: Weight::Semibold,
             size: 14.0,
@@ -185,7 +185,7 @@ pub fn style(text: &str) -> Vec<Span> {
             .group(2)
             .is_some_and(|done| &text[done.0..done.1] != " ");
         if let Some(content) = m.group(3).filter(|_| checked) {
-            // Swift: a checked box's content is muted and struck through.
+            // A checked box's content is muted and struck through.
             paint(&mut cells, content, Kind::Strikethrough, Mark::Clear);
         }
     }
@@ -277,7 +277,7 @@ enum Mark {
 
 fn paint(cells: &mut [Cell], (start, end): (usize, usize), kind: Kind, mark: Mark) {
     for cell in &mut cells[start..end] {
-        // Swift's embolden keeps a heading's size, and headings are already semibold, so a bold
+        // Bold keeps a heading's size, and headings are already semibold, so a bold
         // run inside one looks the same as the heading; keeping the heading kind preserves the
         // size instead of shrinking it to body size. The same reasoning holds for italic/strike
         // inside a heading, where only the slant/strike would be lost (the kind set cannot stack).
@@ -320,10 +320,9 @@ fn cells_to_spans(text: &str, cells: &[Cell]) -> Vec<Span> {
 // ---------------------------------------------------------------------------
 // Scanners
 //
-// Each scanner accepts the language of one NSRegularExpression in `MarkdownStyler`. The Swift
-// pattern is quoted above its scanner. `^` and `$` follow `.anchorsMatchLines`; `.` and `\S`
-// follow ICU defaults (dot does not cross a line terminator). Matches are enumerated leftmost
-// first and non-overlapping, like `enumerateMatches`.
+// Each scanner accepts the language of one regular expression, quoted above it. `^` and `$`
+// match at line starts and ends; `.` does not cross a line terminator. Matches are found
+// leftmost first and do not overlap.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -882,19 +881,19 @@ fn scan_bare_url(text: &str) -> Vec<Found> {
 // List continuation
 // ---------------------------------------------------------------------------
 
-/// Reproduces `continueList` for an empty selection at `cursor`.
+/// List continuation on Return, for an empty selection at `cursor`.
 ///
 /// A list item gets `\n` plus the same indent and the next marker; a task item starts unchecked;
 /// numbers increase. An item whose text before the cursor is empty loses its marker and does not
-/// add a line (the Swift code replaces the prefix with `""`). Returns `None` when Swift lets the
-/// default Return happen, including when the selection is not empty (the Swift guard bails out).
+/// add a line (the prefix is replaced with `""`). Returns `None` when the default Return should
+/// happen, including when the selection is not empty.
 pub fn on_return(text: &str, cursor: usize) -> Option<Edit> {
     if cursor > text.len() || !text.is_char_boundary(cursor) {
         return None;
     }
     let line_start = line_start(text, cursor);
     let head = &text[line_start..cursor];
-    // `$` can match before a final CR; the capture before it is what Swift sees as group 6.
+    // `$` can match before a final CR; the text before it is the item.
     let head = head.strip_suffix('\r').unwrap_or(head);
     let item = list_item(head)?;
 
@@ -1025,7 +1024,7 @@ fn line_start(text: &str, cursor: usize) -> usize {
 // Screenshots
 // ---------------------------------------------------------------------------
 
-/// The Markdown a double-click inserts when the fairy carries screenshots (`NoteTextView.mouseDown`).
+/// The Markdown a double-click inserts when the pile carries screenshots.
 ///
 /// Images go on their own lines: a newline is added before unless the caret is at the start of the
 /// text or after a newline, and after unless the caret is at the end or before a newline. The caret
@@ -1110,7 +1109,7 @@ fn ceil_boundary(text: &str, mut byte: usize) -> usize {
 // Small helpers
 // ---------------------------------------------------------------------------
 
-/// Lines without their terminators, as `anchorsMatchLines` sees them. CRLF is one terminator.
+/// Lines without their terminators, as `^` and `$` see them. CRLF is one terminator.
 fn lines(text: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut start = 0;
@@ -1945,7 +1944,7 @@ pub fn set_block(text: &str, sel: Range<usize>, command: BlockCommand) -> Change
 fn insert_divider(text: &str, lines: &[Line], index: usize) -> Change {
     let line = &lines[index];
     // `---` right under a line of text makes that line a heading in other Markdown apps, so a
-    // divider after text is written `***` (the Swift styler takes both).
+    // divider after text is written `***` (the styler takes both).
     let under_text = |above: Option<&Line>| {
         above.is_some_and(|above| {
             above.block == Block::Paragraph && !text[above.range.clone()].trim().is_empty()

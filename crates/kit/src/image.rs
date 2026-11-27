@@ -1,4 +1,4 @@
-/// A bitmap in memory. Stands in for `CGImage`. Share it as `Arc<Image>`; never clone pixels.
+/// A bitmap in memory. Share it as `Arc<Image>`; never clone pixels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image {
     pub width: u32,

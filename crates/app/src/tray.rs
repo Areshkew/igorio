@@ -1,9 +1,8 @@
-//! The notification area (tray) icon and its menu. Port of the status item in
-//! `AppDelegate.swift` and the mark in `LogoMark.swift`.
+//! The notification area (tray) icon and its menu, and the app's mark drawn as the icon.
 //!
 //! The icon lives on a hidden top-level window owned by the thread that calls
 //! [`Tray::new`]. That thread must pump messages. The menu is rebuilt from
-//! `build_menu` every time it opens, like `menuNeedsUpdate` on macOS.
+//! `build_menu` every time it opens, so it always shows the current state.
 //!
 //! Identity: the icon is identified by HWND + uID ([`TRAY_UID`]), not by a GUID.
 //! Windows keys the user's "show in tray" choice on the exe path plus the uID, so the
@@ -686,7 +685,7 @@ fn append(hmenu: HMENU, flags: MENU_ITEM_FLAGS, id: usize, label: Option<&str>) 
 // ---------------------------------------------------------------------------
 // Icon
 
-/// The design space of `LogoMark.swift` (1254 pt, y down).
+/// The mark's design space (1254 units, y down).
 const LOGO_STROKE_WIDTH: f32 = 96.0;
 
 fn logo_centerline() -> Path {
@@ -739,7 +738,7 @@ pub fn logo_pixmap(size: u32, color: [u8; 4]) -> Pixmap {
     let Some(bounds) = outline.compute_tight_bounds() else {
         return pixmap;
     };
-    // Fit like `LogoMark.path(fitting:)`, on the stroke's box (the eyes are inside it).
+    // Fit the mark to the icon on the stroke's box (the eyes are inside it).
     let scale = size as f32 / bounds.width().max(bounds.height());
     let transform = Transform::from_translate(size as f32 / 2.0, size as f32 / 2.0)
         .pre_scale(scale, scale)

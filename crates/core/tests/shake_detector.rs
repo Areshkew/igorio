@@ -1,4 +1,4 @@
-//! Translated from `fairy-cursor/tests/core/ShakeDetectorTests.swift`.
+//! The shake detector and the two-stage shake gesture.
 
 use std::f64::consts::PI;
 

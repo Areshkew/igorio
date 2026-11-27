@@ -2174,9 +2174,9 @@ impl Controller {
     }
 }
 
-/// Location of the optional tuning log. The detector appends only with FAIRY_DEBUG=1.
+/// Location of the optional tuning log. The detector appends only with IGORIO_DEBUG=1.
 pub fn debug_log_path() -> Option<PathBuf> {
-    if std::env::var_os("FAIRY_DEBUG").as_deref() == Some(std::ffi::OsStr::new("1")) {
+    if std::env::var_os("IGORIO_DEBUG").as_deref() == Some(std::ffi::OsStr::new("1")) {
         Some(
             PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
                 .join("Igorio")

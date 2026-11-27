@@ -1,4 +1,4 @@
-//! Shake detection, translated from `fairy-cursor/sources/core/ShakeDetector.swift`.
+//! Shake detection.
 //! All times are seconds and all distances are points, taken as parameters so the code stays
 //! pure.
 
@@ -181,9 +181,6 @@ impl ShakeDetector {
 }
 
 /// What one cursor sample meant for the two-stage gesture.
-///
-/// Swift nests this as `ShakeGesture.Result`; Rust has no nested types, so the enum lives at
-/// module level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShakeResult {
     None,
@@ -246,7 +243,7 @@ impl ShakeGesture {
 }
 
 /// Feeds cursor movement to the shake gesture only when a shake can mean "discard": something
-/// is held and the system screenshot UI is not up. While the user aims the ⌘⇧4 crosshair or
+/// is held and the system screenshot UI is not up. While the user aims the Win+Shift+S crosshair or
 /// sweeps across windows in window-pick mode, the pile is invisible — that movement used to
 /// count, and quietly shook screenshots off.
 #[derive(Debug, Clone)]
@@ -288,7 +285,7 @@ impl ShakeGate {
         self.gesture.reset();
     }
 
-    /// Swift's `move`; renamed because `move` is a Rust keyword.
+    /// Feeds one cursor sample. Named `move_` because `move` is a Rust keyword.
     pub fn move_(&mut self, x: f64, y: f64, t: f64, holding: bool) -> ShakeResult {
         if !holding || self.capture_ui_visible {
             return ShakeResult::None;

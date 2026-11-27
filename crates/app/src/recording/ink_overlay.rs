@@ -1,4 +1,4 @@
-//! The pen and highlighter while recording (`InkOverlay.swift`), and the thread that drives
+//! The pen and highlighter while recording, and the thread that drives
 //! everything a recording shows on screen ([`RecordingUi`]: the ink window, the outline and
 //! the pill of `frame`, the keys and wheel of `input`).
 //!
@@ -6,8 +6,8 @@
 //!
 //! One layered, topmost window over the recorded monitor, in its physical pixels. It is *in*
 //! the video (no `WDA_EXCLUDEFROMCAPTURE`): the ink is for the viewer. It never activates and
-//! never takes the keyboard focus (`WS_EX_NOACTIVATE`, `MA_NOACTIVATE`), like the Swift panel
-//! that can never become key: the recorded app keeps looking active in the video.
+//! never takes the keyboard focus (`WS_EX_NOACTIVATE`, `MA_NOACTIVATE`): the recorded app
+//! keeps looking active in the video.
 //!
 //! - No tool: `WS_EX_TRANSPARENT` and `HTTRANSPARENT`, so every click goes to the app below.
 //!   With no ink on screen the window is hidden, and its big buffers are only made the first
@@ -18,9 +18,9 @@
 //!   video). The cursor is the tool's tip (`ink_draw::tool_cursor`, set on `WM_SETCURSOR`).
 //!   A press starts a stroke, moves extend it, the release ends it. The press captures the
 //!   mouse, so a stroke dragged off the window still ends; a lost capture
-//!   (`WM_CAPTURECHANGED`) ends it too (Swift's timer that looks for a lost mouse-up).
+//!   (`WM_CAPTURECHANGED`) ends it too, so a lost mouse-up never leaves a stroke open.
 //! - Put down: click-through at once, and the ink fades away over 0.25 s, eased out, then is
-//!   cleared at 0.3 s (`fadeAway`). The fade changes only the window's constant alpha, so
+//!   cleared at 0.3 s. The fade changes only the window's constant alpha, so
 //!   it costs no drawing. Reduced motion clears at once.
 //!
 //! # Latency
@@ -100,7 +100,7 @@ use crate::overlay::{LayeredSurface, MonitorBounds, cursor_pos};
 
 const CLASS: PCWSTR = w!("IgorioInk");
 
-/// The ink's fade when the pen is put down (`fadeAway`: 0.25 s ease-out, cleared at 0.3 s).
+/// The ink's fade when the pen is put down (0.25 s ease-out, cleared at 0.3 s).
 pub const INK_FADE: f64 = 0.25;
 pub const INK_CLEAR: f64 = 0.3;
 /// Animation frame interval while something fades.
@@ -751,9 +751,9 @@ pub struct RecordingUiConfig {
     pub take_mouse: bool,
     /// Install the keyboard hook (drawing keys, the modifier). Off only for that timing run.
     pub key_hook: bool,
-    /// Let screenshots see the outline and the pill (`FAIRY_CAPTURABLE=1`, for demos).
+    /// Let screenshots see the outline and the pill (`IGORIO_CAPTURABLE=1`, for demos).
     pub capturable: bool,
-    /// Emit [`UiEvent::Log`] lines (`FAIRY_DEBUG=1`).
+    /// Emit [`UiEvent::Log`] lines (`IGORIO_DEBUG=1`).
     pub debug: bool,
     /// Show "Hold Alt and scroll to zoom" under the strip for a few seconds after it appears.
     /// The app decides (the first recordings only).
@@ -785,7 +785,7 @@ pub enum UiEvent {
     Follow { on: bool, cursor: (i32, i32) },
     /// `RecordingViewport::reset()`: back to the whole screen.
     ResetZoom,
-    /// The tool in hand changed (`setCaptureUIVisible`: the fairy steps aside while drawing).
+    /// The tool in hand changed (the pile steps aside while drawing).
     ToolChanged(Option<InkTool>),
     /// The stop button on the strip was clicked: stop the recording (as the toggle would,
     /// but never start one).
@@ -1457,7 +1457,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_ink_fades_out_eased_and_is_cleared_after_the_swift_delay() {
+    fn the_ink_fades_out_eased_and_is_cleared_after_the_delay() {
         assert_eq!(ink_fade_opacity(0.0), Some(1.0));
         let early = ink_fade_opacity(0.05).unwrap();
         let mid = ink_fade_opacity(0.125).unwrap();

@@ -53,8 +53,8 @@ use crate::shortcuts::{
     chord_from_key_event, display_for_layout, held_for_message,
 };
 
-const SCREENSHOTS: &str = "fairy.screenshots";
-const NOTES: &str = "fairy.notes";
+const SCREENSHOTS: &str = "igorio.screenshots";
+const NOTES: &str = "igorio.notes";
 const RECORDING: &str = crate::recording::feature::CAPABILITY;
 /// Parts of a capability's key line drawn as plain text, not as key chips.
 const PLAIN_WORDS: &[&str] = &["or", "Hold", "and click"];

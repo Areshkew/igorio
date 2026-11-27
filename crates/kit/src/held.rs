@@ -8,7 +8,7 @@ use igorio_core::pile::HasCardId;
 use crate::image::Image;
 
 /// One card on the pile: a screenshot, or a screen recording (then `image` is its poster
-/// frame and `movie` the file it stands for). From `HeldScreenshot.swift`. Cheap to clone.
+/// frame and `movie` the file it stands for). Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct HeldCard {
     pub id: CardId,

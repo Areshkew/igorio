@@ -1,5 +1,4 @@
 //! The overlay window: a small layered, click-through, topmost popup that shows the pile.
-//! From `FairyPanel.swift` and the visibility parts of `Follower.swift`.
 //!
 //! This module only owns the window. `draw` paints the pixmap, `follower` picks the origin.
 //! All coordinates are physical pixels with a top-left origin, so the process must be
@@ -213,8 +212,7 @@ impl Overlay {
 
     /// Call when the foreground window or the display configuration changed: if the
     /// overlay should be visible, shows it again and puts it back on top of the topmost
-    /// band (another topmost window may have come above it). Like `reassertVisibility`
-    /// in `Follower.swift`.
+    /// band (another topmost window may have come above it).
     pub fn reassert(&mut self) {
         if self.wanted_visible {
             self.place(true);
@@ -230,7 +228,7 @@ impl Overlay {
     }
 
     /// Default false: `WDA_EXCLUDEFROMCAPTURE`. True: `WDA_NONE`, for debugging
-    /// (`FAIRY_CAPTURABLE=1` in the Swift app).
+    /// (`IGORIO_CAPTURABLE=1`).
     pub fn set_capturable(&mut self, capturable: bool) -> Result<()> {
         let affinity = if capturable {
             WDA_NONE

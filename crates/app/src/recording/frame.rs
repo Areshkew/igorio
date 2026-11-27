@@ -1,6 +1,6 @@
 //! What the user sees while recording, and the video never shows: a blue outline around the
 //! area being recorded (it shrinks and slides as the user zooms) and a small control strip at
-//! the top of the screen. From `RecordingFrame.swift`, with the strip redone for Windows.
+//! the top of the screen.
 //!
 //! # The outline
 //!
@@ -84,18 +84,18 @@ use crate::overlay::{LayeredSurface, MonitorBounds, Overlay};
 // Constants
 // ---------------------------------------------------------------------------------------
 
-/// The outline line, DIPs (`outline.lineWidth`).
+/// The outline line, DIPs.
 pub const OUTLINE_WIDTH: f64 = 2.0;
-/// Corner radius, DIPs (`cornerWidth`).
+/// Corner radius, DIPs.
 pub const OUTLINE_RADIUS: f64 = 10.0;
-/// The outline sits this far inside the area, DIPs (`insetBy(dx: 1, dy: 1)`).
+/// The outline sits this far inside the area, DIPs.
 pub const OUTLINE_INSET: f64 = 1.0;
-/// How far the glow reaches from the line, DIPs (`shadowRadius`).
+/// How far the glow reaches from the line, DIPs.
 pub const GLOW: f64 = 6.0;
-/// The line's opacity (`alpha: 0.9`).
+/// The line's opacity.
 const LINE_ALPHA: f32 = 0.9;
-/// The glow's opacity next to the line. Swift's `shadowOpacity` 0.45 applies to a 6 pt blur
-/// of a 2 pt line, whose peak is about a third of that.
+/// The glow's opacity next to the line: a shadow opacity of 0.45 on a 6 DIP blur of a 2 DIP
+/// line peaks at about a third of that.
 const GLOW_ALPHA: f32 = 0.16;
 
 /// The strip, DIPs: height, side padding, dot, the gap after the dot and after the time.
@@ -1264,7 +1264,7 @@ impl TipSchedule {
 // Motion (pure)
 // ---------------------------------------------------------------------------------------
 
-/// Core Animation's `easeOut` (cubic Bézier 0, 0, 0.58, 1) at `t` in 0...1.
+/// The standard ease-out curve (cubic Bézier 0, 0, 0.58, 1) at `t` in 0...1.
 pub fn ease_out(t: f64) -> f64 {
     if t.is_nan() || t <= 0.0 {
         return 0.0;

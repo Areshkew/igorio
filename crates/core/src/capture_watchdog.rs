@@ -1,10 +1,9 @@
-//! Stale screenshot-session detection, translated from
-//! `fairy-cursor/sources/core/CaptureWatchdog.swift`.
+//! Stale screenshot-session detection.
 
-/// The fairy hides while the system screenshot UI is up. ScreenshotMonitorKit ends an
-/// interactive (⌘⇧4 / ⌘⇧5) session on capture, Esc or a 3-minute timeout — but a selection
+/// The pile hides while the system screenshot UI is up. The screenshot detector ends an
+/// interactive (Win+Shift+S) session on capture, Esc or a 3-minute timeout — but a selection
 /// session cancelled any other way (a click without a drag, switching away) stays "open", so the
-/// fairy and its screenshots stayed invisible for up to three minutes, and the stale session
+/// pile and its screenshots stayed invisible for up to three minutes, and the stale session
 /// would turn the next ordinary drag into a phantom capture.
 ///
 /// This watches whether the screenshot UI's overlay is actually on screen. Only once it has been

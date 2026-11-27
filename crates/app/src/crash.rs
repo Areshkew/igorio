@@ -1,6 +1,6 @@
 //! A crash log for the whole app: when a thread panics, or the process dies of an unhandled
 //! Windows exception, one block goes to `%LOCALAPPDATA%\Igorio\crash.log` (always, not only
-//! with `FAIRY_DEBUG`), and the process then ends as it would have.
+//! with `IGORIO_DEBUG`), and the process then ends as it would have.
 //!
 //! The handlers run in a process that may be broken, so they do little:
 //!

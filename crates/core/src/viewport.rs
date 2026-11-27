@@ -1,12 +1,12 @@
 //! The part of the display a screen recording shows: the output video is this area scaled to the
 //! full frame, so a smaller area reads as zooming in.
 //!
-//! ⌥ + scroll sets a target zoom; the actual zoom eases toward it, so a flick of the wheel becomes
-//! one smooth push in rather than a jump. The area moves only while ⌥ is held: then it glides to
-//! centre on the cursor. Let go of ⌥ and it stays where it is, wherever the cursor wanders.
+//! Alt + scroll sets a target zoom; the actual zoom eases toward it, so a flick of the wheel becomes
+//! one smooth push in rather than a jump. The area moves only while Alt is held: then it glides to
+//! centre on the cursor. Let go of Alt and it stays where it is, wherever the cursor wanders.
 //!
-//! Geometry is in global points with a top-left origin (CoreGraphics / CGEvent space), the same
-//! space as `display`. Pure and value-typed; the recorder steps it once per output frame.
+//! Geometry is in global screen coordinates with a top-left origin, the same space as
+//! `display`. Pure and value-typed; the recorder steps it once per output frame.
 
 use crate::geom::{Point, Rect, Size};
 
@@ -69,7 +69,7 @@ impl RecordingViewport {
         self.target_zoom = self.max_zoom.min(self.min_zoom.max(self.target_zoom * amount.exp()));
     }
 
-    /// Back to the whole display, with the usual ease (double-tap ⌥).
+    /// Back to the whole display, with the usual ease (double-tap Alt).
     pub fn reset(&mut self) {
         self.target_zoom = self.min_zoom;
     }
@@ -79,10 +79,10 @@ impl RecordingViewport {
         self.area_at(self.zoom, self.center)
     }
 
-    /// Advance by `dt` seconds with the cursor at `cursor`. `following` (⌥ held) lets the area
+    /// Advance by `dt` seconds with the cursor at `cursor`. `following` (Alt held) lets the area
     /// move to the cursor; otherwise it stays put and only the zoom keeps easing.
     pub fn step(&mut self, cursor: Point, following: bool, dt: f64) {
-        // `max(0, min(dt, 0.25))`: NaN counts as 0, like Swift's `max`/`min`.
+        // Clamp to 0..=0.25; NaN counts as 0.
         let dt = if dt > 0.25 { 0.25 } else if dt > 0.0 { dt } else { 0.0 };
         self.zoom = self.approach(self.zoom, self.target_zoom, self.zoom_response, dt);
         if (self.zoom - self.target_zoom).abs() < 0.0005 {
@@ -91,7 +91,7 @@ impl RecordingViewport {
 
         let size = self.area_size(self.zoom);
         // Following: glide toward the cursor. Not following: stop right where it is (no drift
-        // toward wherever the cursor was when ⌥ was let go).
+        // toward wherever the cursor was when Alt was let go).
         self.target_center = if following { cursor } else { self.center };
         self.target_center = self.clamped_center(self.target_center, size);
         self.center = Point::new(

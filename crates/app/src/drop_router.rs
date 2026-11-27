@@ -1,8 +1,7 @@
-//! Turns a double-click into one of the fairy's deliveries: paste the pile into a text field,
-//! a terminal (as a file path), a canvas or a page-drawn document. From `DropRouter.swift`
-//! (the routing), `PasteTarget.swift` (one paste: clipboard, keys, outcome, restore) and the
-//! hover hint in `AppDelegate.swift`. The decisions are the core's (`drop_policy`,
-//! `paste_policy`, `editable`); this module sequences them.
+//! Turns a double-click into one of the app's deliveries: paste the pile into a text field,
+//! a terminal (as a file path), a canvas or a page-drawn document, or save it into a folder.
+//! Also the hover hint. The decisions are the core's (`drop_policy`, `paste_policy`,
+//! `editable`); this module sequences them.
 //!
 //! # Shape
 //!
@@ -10,7 +9,7 @@
 //! every input (a hook event, a UI Automation answer, a clipboard reply, a saved PNG) and
 //! every [`Router::tick`] either finishes a step at once or leaves the router waiting for
 //! the next input or deadline. [`Router::next_deadline`] says when it must run again, like
-//! `FairyState::next_deadline`.
+//! `IgorioState::next_deadline`.
 //!
 //! It reaches the outside only through the [`Env`] trait: UI Automation requests, clipboard
 //! requests and facts, the PNG saver, the foreground check and the keystrokes. [`LiveEnv`] is
@@ -18,23 +17,22 @@
 //!
 //! # One double-click, step by step
 //!
-//! 1. First mouse-down of a possible double-click while holding: remember the clipboard
-//!    (`PasteTarget.rememberClipboard`): its sequence number and time, and a snapshot when
-//!    none is kept for that sequence yet.
+//! 1. First mouse-down of a possible double-click while holding: remember the clipboard:
+//!    its sequence number and time, and a snapshot when none is kept for that sequence yet.
 //! 2. Second mouse-down (`click_count == 2`): ask UI Automation what is at the point, then
 //!    gather the facts and call `drop_policy::decide`.
 //! 3. `Paste`: deliver now. `CheckFocusAfterMouseUp`: wait for the release and a settle
-//!    delay, look again with focus, and confirm a text input or a canvas as
-//!    `resolveAfterMouseUp` does. `SaveToFinder`: save into the folder, see below.
-//! 4. Delivery (`deliverPaste` and `pasteRest`): the whole pile, top card first, one paste
-//!    per card, 0.45 s apart. Per card (`PasteJob`): payload ready (a terminal gets a PNG
+//!    delay, look again with focus, and confirm a text input or a canvas
+//!    ([`Confirmed`]). `SaveToExplorer`: save into the folder, see below.
+//! 4. Delivery: the whole pile, top card first, one paste per card, 0.45 s apart. Per
+//!    card: payload ready (a terminal gets a PNG
 //!    saved to `Settings::pasted_dir` and its quoted path) and the user's clipboard saved,
 //!    wait for the mouse-up, check the foreground, press Right / Escape, stage the clipboard,
 //!    check again and press Ctrl+V, then watch the reads until `OutcomeRules` decides.
 //! 5. Restore: when the delivery is over, `RestoreRules` decides when to put the user's
 //!    clipboard back; overwrites are handled with `overwrite_step` meanwhile.
 //!
-//! # Saving into a folder (`saveToFinder`)
+//! # Saving into a folder
 //!
 //! A double-click on the empty background of a File Explorer folder view or of the desktop
 //! ([`shell_drop_spot`]) saves the pile there. The steps of the saving phase:
@@ -50,39 +48,38 @@
 //!    finished (the saver never leaves half a file). A card shaken off before its own write
 //!    is skipped; a capture that lands meanwhile is not taken (the pile is fixed at the
 //!    double-click, top card first, as `deliverable` gives it).
-//! 4. Done: the saved cards are delivered at once with "saved to <folder>" (Swift: one
-//!    `deliver` with every saved id), and [`Env::reveal`] selects the last file written.
-//!    A write error stops the rest. With nothing saved the card wobbles with a hint naming
-//!    the problem; otherwise that hint follows the "saved" one after [`SAVE_FAIL_STEP`] per
-//!    saved card (Swift's "couldn't save N").
+//! 4. Done: the saved cards are delivered at once, together, with "saved to <folder>", and
+//!    [`Env::reveal`] selects the last file written. A write error stops the rest. With
+//!    nothing saved the card wobbles with a hint naming the problem; otherwise that hint
+//!    follows the "saved" one after [`SAVE_FAIL_STEP`] per saved card.
 //!
-//! # Windows differences
+//! # Windows details
 //!
-//! - `KeyRoute::Process` has no Windows form: `SendInput` reaches only the foreground window.
-//!   So the keys are sent only while the target is in front; when it does not come to the
-//!   front within `ACTIVATION_TIMEOUT` the paste fails (the Swift code activates the app; a
-//!   background process cannot reliably do that on Windows, and pasting into whatever else
-//!   is in front would be wrong).
+//! - `KeyRoute::Process` is not used: `SendInput` reaches only the foreground window. So the
+//!   keys are sent only while the target is in front; when it does not come to the front
+//!   within `ACTIVATION_TIMEOUT` the paste fails (a background process cannot reliably
+//!   bring another app to the front on Windows, and pasting into whatever else is in front
+//!   would be wrong).
 //! - No acceptance probe: the uia module does not read element values, so the outcome comes
-//!   from clipboard reads only (`OutcomeRules::new(false, ..)`). Windows tells us every
-//!   render of a delayed format, which macOS does not for single-line fields.
+//!   from clipboard reads only (`OutcomeRules::new(false, ..)`). Windows reports every
+//!   render of a delayed format, so reads alone are a good signal.
 //! - Terminal paths are quoted for Windows shells ([`quoted_path`]): the core's
 //!   `shell_quoted` uses POSIX single quotes, which cmd.exe does not understand.
-//! - Canvas apps are matched by exe name ([`windows_app_id`]), since the core's list holds
-//!   macOS bundle ids.
+//! - Canvas apps are matched by exe name ([`windows_app_id`]), mapped to the app ids in the
+//!   core's list.
 //! - UI Automation answers late or not at all in slow apps (Qt, games). A terminal that does
 //!   not answer is still a terminal (`silent_terminal`). Any other app that does not answer
 //!   gets the re-check after the mouse-up with a longer deadline ([`SLOW_DEADLINE`]); if
-//!   that also times out, the fairy says so and keeps the card. It never pastes into a
+//!   that also times out, the app says so and keeps the card. It never pastes into a
 //!   window it knows nothing about.
 //!
 //! # Notes
 //!
-//! A note window is one of the app's own windows, and it takes the pile itself (Swift: the
-//! note's `DropZone`). A double-click over a note ([`Env::note_at`]) is never looked up and
+//! A note window is one of the app's own windows, and it takes the pile itself (the note's
+//! drop zone). A double-click over a note ([`Env::note_at`]) is never looked up and
 //! never pasted: the carried cards, top first, go to the note ([`Env::give_to_note`]) and stay
 //! on the pile until the notes thread says which it took ([`Router::note_took`]); with no
-//! answer within [`NOTE_TIMEOUT`] the fairy keeps them and says so. While the cursor rests over
+//! answer within [`NOTE_TIMEOUT`] the pile keeps them and says so. While the cursor rests over
 //! a note the hover hint is the note's own ([`DROP_HINT`]), with no lookup.
 
 use std::collections::HashSet;
@@ -115,32 +112,32 @@ use crate::input::{self, Batch, Key, Modifier, Sent};
 use crate::notes::window::{DROP_HINT, DropZones};
 use crate::saver;
 use crate::settings::{DefaultFolders, Settings};
-use crate::state::FairyState;
+use crate::state::IgorioState;
 use crate::uia::{
     self, ElementInfo, Lookup, Outcome, Probe, Requester, Shell, Snapshot, Target, Uia, UiaNode,
 };
 
 // MARK: Constants
 
-/// The cursor must rest this long before the hover hint looks under it (`AppDelegate`).
+/// The cursor must rest this long before the hover hint looks under it.
 pub const HOVER_REST: f64 = 0.22;
 /// At most one hover lookup per this long: 4 a second.
 pub const HOVER_MIN_GAP: f64 = 0.25;
-/// Deadline of an ordinary lookup, as in `AXNode.swift`.
+/// Deadline of an ordinary lookup.
 pub const LOOKUP_DEADLINE: f64 = 0.25;
 /// Deadline of the re-check after the mouse-up when the double-click's lookup timed out.
 pub const SLOW_DEADLINE: f64 = 1.0;
 /// The router stops waiting for an answer this long after the lookup's deadline (a replaced
 /// request gets no answer; the uia controller answers every other one at its deadline).
 pub const LOOKUP_GRACE: f64 = 1.0;
-/// Settle after the release before the re-check (`checkFocusAfterMouseUp`).
+/// Settle after the release before the re-check.
 pub const SETTLE_AFTER_UP: f64 = 0.1;
 pub const SETTLE_AFTER_UP_CHROMIUM: f64 = 0.2;
-/// Between two cards of a pile (`pasteRest`).
+/// Between two cards of a pile.
 pub const PILE_STEP: f64 = 0.45;
-/// How often the foreground is checked while waiting for the target (Swift: 0.03).
+/// How often the foreground is checked while waiting for the target.
 pub const ACTIVATION_POLL: f64 = 0.03;
-/// How often the outcome is evaluated (Swift: 0.05) and the restore (Swift: 0.1).
+/// How often the outcome is evaluated and the restore.
 pub const OUTCOME_POLL: f64 = 0.05;
 pub const RESTORE_POLL: f64 = 0.1;
 /// While the user holds Shift, Alt or Win, keys are retried this often, for this long.
@@ -161,13 +158,12 @@ pub const UNANSWERED_LIMIT: f64 = 10.0;
 /// At quit, how long to wait for the clipboard replies that put the user's clipboard back.
 pub const QUIT_WAIT: Duration = Duration::from_secs(1);
 
-/// After the paste keys, the acceptance probe looks at the field this often
-/// (`PasteJob.pollOutcome`: 0.2 s).
+/// After the paste keys, the acceptance probe looks at the field this often.
 pub const PROBE_INTERVAL: f64 = 0.2;
 
 /// Roles of a field that holds one line (`AXTextField` is also a web `<textarea>`: UI
 /// Automation has no multi-line flag, and neither takes images). Pastes into these are
-/// verified by the acceptance probe, as `PasteTarget.swift` verifies single-line fields.
+/// verified by the acceptance probe.
 pub const SINGLE_LINE_ROLES: &[&str] = &["AXTextField", "AXSearchField", "AXComboBox"];
 
 /// Class tokens that mark a terminal in web content (Chromium reports the HTML class
@@ -245,7 +241,7 @@ pub const ACTIVATING_ROLES: &[&str] = &[
     "AXIncrementor",
 ];
 
-// Hints. The Swift texts, plus the Windows-only refusals.
+// Hints shown on the card.
 pub const HINT_PASTED: &str = "pasted";
 pub const HINT_PASTED_PATH: &str = "pasted path";
 pub const HINT_PASTE_FAILED: &str = "couldn't paste · still holding it";
@@ -259,7 +255,7 @@ pub const HINT_HOVER_SAVE: &str = "double-click to save here";
 pub const HINT_ELEVATED: &str = "can't reach this window";
 pub const HINT_CLIPBOARD: &str = "can't save your clipboard · still holding it";
 pub const HINT_SLOW: &str = "this app didn't answer · still holding it";
-/// Saving into a folder (`saveToFinder`). The success hints are [`saved_hint`] and
+/// Saving into a folder. The success hints are [`saved_hint`] and
 /// [`HINT_ALREADY_SAVED`]; [`not_a_folder_hint`] names a place that is not a folder.
 pub const HINT_SAVE_FAILED: &str = "can't save here · still holding it";
 pub const HINT_READ_ONLY: &str = "this folder is read-only · still holding it";
@@ -279,7 +275,7 @@ pub const NOTE_TIMEOUT: f64 = 10.0;
 pub const HINT_UNCERTAIN: &str = "check the paste · still holding it";
 /// How long after the paste keys the probe may still confirm a paste (`OutcomeRules`).
 pub const PROBE_TIMEOUT: f64 = 3.0;
-/// The keyboard focus is not in the target field (Swift's canvas text, used for "the paste
+/// The keyboard focus is not in the target field (the canvas text, used for "the paste
 /// would go nowhere").
 pub const HINT_NOT_FOCUSED: &str = HINT_CANVAS_FAILED;
 
@@ -289,11 +285,11 @@ pub const FOLDER_DEADLINE: f64 = 0.5;
 /// drive); the saver thread may still finish that file later.
 pub const SAVE_TIMEOUT: f64 = 15.0;
 /// After a partial save, the failure hint follows the "saved" one after this long per
-/// saved card (Swift: `0.4 * saved.count`).
+/// saved card.
 pub const SAVE_FAIL_STEP: f64 = 0.4;
 
-/// "saved to Pictures", "saved 3 to Pictures" (`saveToFinder`: "saved" or "saved N", then
-/// "to" and the folder's name). A drive root has no name, so it is shown whole.
+/// "saved to Pictures", "saved 3 to Pictures" ("saved" or "saved N", then "to" and the
+/// folder's name). A drive root has no name, so it is shown whole.
 pub fn saved_hint(count: usize, folder: &Path) -> String {
     let name = folder.file_name().map_or_else(
         || folder.display().to_string(),
@@ -452,7 +448,7 @@ pub fn lines(field_role: Option<&str>) -> &'static str {
     }
 }
 
-/// A UI Automation snapshot reduced to the facts the router decides from (`DropSpotInfo`).
+/// A UI Automation snapshot reduced to the facts the router decides from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spot {
     pub target: Target,
@@ -460,7 +456,7 @@ pub struct Spot {
     pub pid: u32,
     /// For the log.
     pub role: String,
-    /// The hit or one of its ancestors takes text (`uiElementIsEditableText`).
+    /// The hit or one of its ancestors takes text.
     pub editable_hit: bool,
     /// The hit, an ancestor or an editable element under its placeholder takes text.
     pub editable: bool,
@@ -534,7 +530,7 @@ impl Spot {
         self.target.shell.is_some()
     }
 
-    /// Canvas facts that count (Swift fills them only when nothing editable was found).
+    /// Canvas facts that count (only when nothing editable was found).
     pub fn canvas_here(&self) -> CanvasFacts {
         if self.editable {
             CanvasFacts::default()
@@ -543,7 +539,7 @@ impl Spot {
         }
     }
 
-    /// `DropSpotInfo.surface`.
+    /// What a paste here goes into.
     pub fn surface(&self) -> Surface {
         if self.web_terminal || self.target.is_terminal {
             return Surface::Terminal;
@@ -571,7 +567,7 @@ pub enum Seen {
     Failed(String),
 }
 
-/// What the paste goes into (`PasteTarget.Surface`).
+/// What the paste goes into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Surface {
     Field,
@@ -774,7 +770,7 @@ pub trait Env {
     /// the clipboard, the window, its process, its focused control, the modifiers) and the
     /// keys with nothing in between. Returns the focused control seen.
     fn send(&mut self, batch: Batch, guard: SendGuard) -> (Sent, Option<isize>);
-    /// One debug line. Only written when `FAIRY_DEBUG=1`.
+    /// One debug line. Only written when `IGORIO_DEBUG=1`.
     fn log(&mut self, now: f64, line: &str);
     /// One of our note windows is at `point` (from the notes' drop zones, no lookup).
     fn note_at(&self, point: (i32, i32)) -> bool;
@@ -785,8 +781,8 @@ pub trait Env {
 
 // MARK: Pure helpers
 
-/// macOS bundle ids for Windows canvas apps, so the core's `CANVAS_BUNDLE_PREFIXES` match
-/// them (the core rule names macOS apps; this is the Windows workaround).
+/// The app id of a canvas app from its exe name, so the core's `CANVAS_BUNDLE_PREFIXES` match
+/// it.
 pub fn windows_app_id(exe: Option<&str>) -> Option<&'static str> {
     const APPS: &[(&str, &str)] = &[
         ("figma.exe", "com.figma.Desktop"),
@@ -817,7 +813,7 @@ pub fn quoted_path(path: &Path) -> String {
     }
 }
 
-/// `FinderTarget.copy`'s check: is `parent` the folder (Windows paths ignore case and a
+/// Is `parent` the folder (Windows paths ignore case and a
 /// trailing separator)?
 pub fn same_folder(parent: Option<&Path>, folder: &Path) -> bool {
     let key = |p: &Path| {
@@ -886,7 +882,7 @@ pub const ITEMS_VIEW_CLASS: &str = "UIItemsView";
 /// (`SysListView32`); with desktop icons hidden the list is hidden and the view is the hit.
 pub const DESKTOP_VIEW_CLASS: &str = "SHELLDLL_DefView";
 
-/// `FinderTarget.isDropSpot` for Windows: is the hit the empty background of a folder view?
+/// Is the hit the empty background of a folder view?
 ///
 /// The core's role rule alone is not enough here. Windows 11 Explorer shows the navigation
 /// pane as a `Pane` (`SysTreeView32`), and the title bar area, the tab strip's free space,
@@ -926,7 +922,7 @@ pub fn shell_drop_spot(chain: &[UiaNode], shell: Shell) -> bool {
     drop_policy::is_drop_spot(Some(e.role), &ancestors) || (view == 1 && e.role == "AXStaticText")
 }
 
-/// `DropSpotInfo.resolve`, on a snapshot.
+/// The facts of the spot under `point`, from a UI Automation snapshot.
 pub fn spot_from_snapshot(snapshot: &Snapshot, point: (i32, i32)) -> Spot {
     let hit = snapshot.hit.clone();
     let chain: Vec<UiaNode> = std::iter::successors(Some(hit.clone()), |n| n.parent())
@@ -968,8 +964,8 @@ pub fn spot_from_snapshot(snapshot: &Snapshot, point: (i32, i32)) -> Spot {
         return spot;
     }
     // A terminal's text area (Windows Terminal, conhost) has a Text pattern but no Value
-    // pattern, so UI Automation does not call it editable; it still takes pasted text, as
-    // iTerm's `AXTextArea` does on macOS. Its tabs and title bar have no Text pattern.
+    // pattern, so UI Automation does not call it editable; it still takes pasted text. Its
+    // tabs and title bar have no Text pattern.
     let terminal_text = snapshot.target.is_terminal && e.text_pattern;
     let field = if terminal_text {
         Some(hit.clone())
@@ -1079,7 +1075,7 @@ pub enum Verdict {
 ///   Read by the target (or probably the target) and unchanged by [`PROBE_TIMEOUT`]:
 ///   refused. Read only by others: uncertain. Not read at all: failed. If no probe answers
 ///   by then, or the probe cannot tell, the reads decide as below.
-/// - Otherwise (multi-line composers are trusted, as in Swift): a read by the target or
+/// - Otherwise (multi-line composers are trusted): a read by the target or
 ///   probably the target is acceptance. Read only by others: the probe may still confirm
 ///   until [`PROBE_TIMEOUT`], then uncertain. Not read at all: failed.
 /// - A delivery the user stopped (another press, a key) never ends as refused or failed
@@ -1186,7 +1182,7 @@ pub fn seen_from_outcome(outcome: Outcome, point: (i32, i32)) -> Seen {
     }
 }
 
-/// The hover hint for a lookup's answer (`applyHover`).
+/// The hover hint for a lookup's answer.
 pub fn hover_hint(seen: &Seen) -> Option<&'static str> {
     match seen {
         Seen::Elevated { .. } => Some(HINT_ELEVATED),
@@ -1197,7 +1193,7 @@ pub fn hover_hint(seen: &Seen) -> Option<&'static str> {
     }
 }
 
-/// `resolveAfterMouseUp`: what to do once the button is up and the app was asked again.
+/// What to do once the button is up and the app was asked again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confirmed {
     Ignore,
@@ -1348,7 +1344,7 @@ enum Phase {
     },
 }
 
-/// A save into a folder (`saveToFinder`); see the module comment.
+/// A save into a folder; see the module comment.
 struct FolderSave {
     click: Click,
     /// The window to reveal the file in: the Explorer window, or the desktop's.
@@ -1406,7 +1402,7 @@ struct Delivery {
     cancelled: Option<&'static str>,
 }
 
-/// The acceptance probe of the first card (`AcceptanceProbe`).
+/// The acceptance probe of the first card.
 #[derive(Debug, Default)]
 struct ProbeState {
     /// The fingerprint taken with the focus check, before the paste keys.
@@ -1564,7 +1560,7 @@ enum Rem<S> {
     Failed,
 }
 
-/// The clipboard at the first mouse-down (`rememberClipboard`): the sequence number and the
+/// The clipboard at the first mouse-down: the sequence number and the
 /// time, and a snapshot only when that click was in a terminal (see `remember_clipboard`).
 struct Remembered<S> {
     sequence: u32,
@@ -1727,7 +1723,7 @@ impl<S: Clone> Router<S> {
         }
     }
 
-    /// A double-click is being handled or a delivery runs (`DropRouter.busy`).
+    /// A double-click is being handled or a delivery runs.
     pub fn busy(&self) -> bool {
         !matches!(self.phase, Phase::Idle)
     }
@@ -1747,7 +1743,7 @@ impl<S: Clone> Router<S> {
         )
     }
 
-    /// True once after the router changed the `FairyState` (redraw).
+    /// True once after the router changed the `IgorioState` (redraw).
     pub fn take_state_changed(&mut self) -> bool {
         std::mem::take(&mut self.state_changed)
     }
@@ -1758,7 +1754,7 @@ impl<S: Clone> Router<S> {
     pub fn mouse<E: Env<Snap = S>>(
         &mut self,
         event: MouseEvent,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         match event {
@@ -1825,7 +1821,7 @@ impl<S: Clone> Router<S> {
         id: u64,
         outcome: Outcome,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         let Some(point) = self.lookups.iter().find(|p| p.id == id).map(|p| p.point) else {
@@ -1840,7 +1836,7 @@ impl<S: Clone> Router<S> {
         id: u64,
         seen: Seen,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         let Some(index) = self.lookups.iter().position(|p| p.id == id) else {
@@ -1865,7 +1861,7 @@ impl<S: Clone> Router<S> {
         &mut self,
         reply: ClipReply<S>,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         self.on_clip_reply(reply, now, state, env);
@@ -1878,7 +1874,7 @@ impl<S: Clone> Router<S> {
         job: u64,
         result: Result<PathBuf, String>,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         if let Phase::Delivering(d) = &mut self.phase
@@ -1903,7 +1899,7 @@ impl<S: Clone> Router<S> {
     pub fn clipboard_changed<E: Env<Snap = S>>(
         &mut self,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         if self.busy() || self.restore.is_some() {
@@ -1911,7 +1907,7 @@ impl<S: Clone> Router<S> {
         }
     }
 
-    pub fn tick<E: Env<Snap = S>>(&mut self, now: f64, state: &mut FairyState, env: &mut E) {
+    pub fn tick<E: Env<Snap = S>>(&mut self, now: f64, state: &mut IgorioState, env: &mut E) {
         let expired: Vec<u64> = self
             .lookups
             .iter()
@@ -1932,7 +1928,7 @@ impl<S: Clone> Router<S> {
         ids: &[CardId],
         hint: &str,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         if matches!(self.phase, Phase::Note { .. }) {
@@ -1949,11 +1945,11 @@ impl<S: Clone> Router<S> {
     }
 
     /// The notes thread reported an error. While a note is being given the cards, the wait
-    /// ends and the fairy keeps them; returns true then.
+    /// ends and the pile keeps them; returns true then.
     pub fn note_failed<E: Env<Snap = S>>(
         &mut self,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) -> bool {
         if !matches!(self.phase, Phase::Note { .. }) {
@@ -2088,7 +2084,7 @@ impl<S: Clone> Router<S> {
 
     // MARK: Double-click
 
-    /// `rememberClipboard`, on the first mouse-down. Only the sequence number and the time
+    /// Remembers the clipboard on the first mouse-down. Only the sequence number and the time
     /// are kept: a snapshot here would make apps render large formats on every plain click.
     ///
     /// The exception is a click in a terminal. With copy-on-select, the terminal writes the
@@ -2185,7 +2181,7 @@ impl<S: Clone> Router<S> {
         point: (i32, i32),
         now: f64,
         window: isize,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         // A2: both presses on the same top-level window, known.
@@ -2273,7 +2269,7 @@ impl<S: Clone> Router<S> {
         id: u64,
         seen: Seen,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         if self.hover.in_flight == Some(id) {
@@ -2330,7 +2326,7 @@ impl<S: Clone> Router<S> {
         click: Click,
         seen: Seen,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         let mut facts = DoubleClick {
@@ -2365,8 +2361,8 @@ impl<S: Clone> Router<S> {
                     );
                     return;
                 }
-                facts.is_finder = spot.is_shell();
-                facts.finder_drop_spot = spot.drop_spot;
+                facts.is_explorer = spot.is_shell();
+                facts.explorer_drop_spot = spot.drop_spot;
                 facts.editable_under_cursor = spot.editable_hit;
                 first = Some(First {
                     aim: Aim {
@@ -2434,10 +2430,10 @@ impl<S: Clone> Router<S> {
                 return;
             }
             Seen::TimedOut { target } => {
-                // A terminal too busy to answer is still a terminal (`silentTerminal`),
+                // A terminal too busy to answer is still a terminal (`silent_terminal`),
                 // when the point is its text area.
                 facts.silent_terminal = target.is_terminal;
-                facts.is_finder = target.shell.is_some();
+                facts.is_explorer = target.shell.is_some();
                 first = Some(First {
                     aim: Aim::new(target, target.pid, click.point),
                     pid: None,
@@ -2480,7 +2476,7 @@ impl<S: Clone> Router<S> {
             ),
         );
         match (action, first) {
-            (Action::SaveToFinder, _) => {
+            (Action::SaveToExplorer, _) => {
                 if let Seen::Spot(spot) = &seen {
                     self.save_to_folder(spot, click, now, state, env);
                 }
@@ -2499,14 +2495,14 @@ impl<S: Clone> Router<S> {
         }
     }
 
-    /// SaveToFinder (`DropRouter.saveToFinder`): ask Explorer for the folder of the
+    /// SaveToExplorer: ask Explorer for the folder of the
     /// double-clicked window, or the desktop's. The rest runs in [`Router::save_step`].
     fn save_to_folder<E: Env<Snap = S>>(
         &mut self,
         spot: &Spot,
         click: Click,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         let ids: Vec<CardId> = state.deliverable().iter().map(|c| c.id).collect();
@@ -2544,7 +2540,7 @@ impl<S: Clone> Router<S> {
         id: u64,
         outcome: FolderOutcome,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         let Phase::Saving(f) = &mut self.phase else {
@@ -2604,7 +2600,7 @@ impl<S: Clone> Router<S> {
         job: u64,
         result: Result<PathBuf, SaveFail>,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         let Phase::Saving(mut f) = std::mem::replace(&mut self.phase, Phase::Idle) else {
@@ -2645,7 +2641,7 @@ impl<S: Clone> Router<S> {
         &mut self,
         f: &mut FolderSave,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) -> Flow {
         if !f.writing() && env.key_presses() != f.click.keys {
@@ -2757,7 +2753,7 @@ impl<S: Clone> Router<S> {
         f: &mut FolderSave,
         failed: Option<SaveProblem>,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) -> Flow {
         let hint = failed.map(SaveProblem::hint);
@@ -2802,14 +2798,14 @@ impl<S: Clone> Router<S> {
         }
     }
 
-    /// `resolveAfterMouseUp`.
+    /// The re-check once the button is up: confirm a text input or a canvas, or give up.
     fn after_up<E: Env<Snap = S>>(
         &mut self,
         click: Click,
         first: First,
         seen: Seen,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         let spot = match seen {
@@ -2921,7 +2917,7 @@ impl<S: Clone> Router<S> {
         &mut self,
         seen: Seen,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         let Phase::Delivering(mut d) = std::mem::replace(&mut self.phase, Phase::Idle) else {
@@ -2987,7 +2983,7 @@ impl<S: Clone> Router<S> {
 
     // MARK: Delivery
 
-    /// `deliverPaste`: the whole pile, top card first.
+    /// Starts delivering the whole pile, top card first.
     #[allow(clippy::too_many_arguments)]
     fn start_delivery<E: Env<Snap = S>>(
         &mut self,
@@ -2997,7 +2993,7 @@ impl<S: Clone> Router<S> {
         click: Click,
         clicked_at: f64,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         let ids: Vec<CardId> = state.deliverable().iter().map(|c| c.id).collect();
@@ -3005,7 +3001,7 @@ impl<S: Clone> Router<S> {
             return;
         };
         let terminal = surface == Surface::Terminal;
-        // The user's clipboard (`currentClipboard`).
+        // The user's clipboard.
         let clip = if let Some(restore) = self.restore.as_mut() {
             // An earlier paste still has a screenshot on the clipboard: its copy of the
             // user's clipboard is the real one. Its restore is taken over.
@@ -3137,7 +3133,7 @@ impl<S: Clone> Router<S> {
         id: CardId,
         first: bool,
         started: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
         now: f64,
     ) -> bool {
@@ -3186,7 +3182,7 @@ impl<S: Clone> Router<S> {
         hint: Option<&str>,
         why: &str,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) -> Flow {
         env.log(
@@ -3215,7 +3211,7 @@ impl<S: Clone> Router<S> {
         hint: &str,
         why: &str,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) -> Flow {
         self.end(d, Some(hint), why, now, state, env)
@@ -3233,7 +3229,7 @@ impl<S: Clone> Router<S> {
         &mut self,
         d: &mut Delivery,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) -> Flow {
         if !matches!(d.job.step, Step::Watch(_) | Step::Next(_)) {
@@ -3682,7 +3678,7 @@ impl<S: Clone> Router<S> {
         batch: Batch,
         stage: Option<u64>,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) -> Result<Sent, Flow> {
         let why = if let Some(why) = d.cancelled {
@@ -3722,7 +3718,7 @@ impl<S: Clone> Router<S> {
         &mut self,
         d: &mut Delivery,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) -> Flow {
         while d.index + 1 < d.ids.len() {
@@ -3735,8 +3731,7 @@ impl<S: Clone> Router<S> {
         Flow::Done
     }
 
-    /// Counts the target's reads, then `reconcileClipboard`: someone else wrote the
-    /// clipboard after we did.
+    /// Counts the target's reads, then handles a write by someone else after ours.
     fn reconcile<E: Env<Snap = S>>(&mut self, facts: &ClipFacts, now: f64, env: &mut E) {
         let Some(restore) = self.restore.as_mut() else {
             return;
@@ -3810,7 +3805,7 @@ impl<S: Clone> Router<S> {
         &mut self,
         reply: ClipReply<S>,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         let ticket = reply.ticket;
@@ -3994,7 +3989,7 @@ impl<S: Clone> Router<S> {
         &mut self,
         why: &str,
         now: f64,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         env: &mut E,
     ) {
         let Some(restore) = self.restore.as_mut() else {
@@ -4018,7 +4013,7 @@ impl<S: Clone> Router<S> {
 
     // MARK: Driving
 
-    fn run<E: Env<Snap = S>>(&mut self, now: f64, state: &mut FairyState, env: &mut E) {
+    fn run<E: Env<Snap = S>>(&mut self, now: f64, state: &mut IgorioState, env: &mut E) {
         self.advance(now, state, env);
         self.advance_restore(now, state, env);
         self.advance_hover(now, state, env);
@@ -4028,7 +4023,7 @@ impl<S: Clone> Router<S> {
         }
     }
 
-    fn advance<E: Env<Snap = S>>(&mut self, now: f64, state: &mut FairyState, env: &mut E) {
+    fn advance<E: Env<Snap = S>>(&mut self, now: f64, state: &mut IgorioState, env: &mut E) {
         self.phase_wake = None;
         loop {
             match std::mem::replace(&mut self.phase, Phase::Idle) {
@@ -4157,8 +4152,8 @@ impl<S: Clone> Router<S> {
         env.log(now, "delivery over");
     }
 
-    /// `pollRestore`, once the delivery is over.
-    fn advance_restore<E: Env<Snap = S>>(&mut self, now: f64, state: &mut FairyState, env: &mut E) {
+    /// Puts the user's clipboard back when the rules say so, once the delivery is over.
+    fn advance_restore<E: Env<Snap = S>>(&mut self, now: f64, state: &mut IgorioState, env: &mut E) {
         self.restore_wake = None;
         if self.busy() {
             return;
@@ -4273,9 +4268,9 @@ impl<S: Clone> Router<S> {
         }
     }
 
-    /// `scheduleHoverHint` and `resolveHover`: one lookup at a time, only while holding,
-    /// after the cursor rested, at most 4 a second.
-    fn advance_hover<E: Env<Snap = S>>(&mut self, now: f64, state: &mut FairyState, env: &mut E) {
+    /// The hover hint: one lookup at a time, only while holding, after the cursor rested, at
+    /// most 4 a second.
+    fn advance_hover<E: Env<Snap = S>>(&mut self, now: f64, state: &mut IgorioState, env: &mut E) {
         self.hover_wake = None;
         if self.busy() || !state.is_holding() || state.hidden_for_capture() {
             return;
@@ -4291,7 +4286,7 @@ impl<S: Clone> Router<S> {
             self.hover_wake = Some(rested);
             return;
         }
-        // Over a note: its own hint and no lookup (the drop zones of `scheduleHoverHint`).
+        // Over a note: its own hint and no lookup.
         if env.note_at(point) {
             self.hover.resolved = true;
             if state.hint() != Some(DROP_HINT) {
@@ -4314,7 +4309,7 @@ impl<S: Clone> Router<S> {
         self.hover.last_request = Some(now);
     }
 
-    fn apply_hover(&mut self, seen: &Seen, now: f64, state: &mut FairyState) {
+    fn apply_hover(&mut self, seen: &Seen, now: f64, state: &mut IgorioState) {
         // The cursor moved on since: a newer lookup will follow.
         if !self.hover.resolved || self.busy() || !state.is_holding() {
             return;
@@ -4329,7 +4324,7 @@ impl<S: Clone> Router<S> {
 
 // MARK: Debug log
 
-/// `FAIRY_DEBUG=1`: one line per router step on stderr and in
+/// `IGORIO_DEBUG=1`: one line per router step on stderr and in
 /// `%LOCALAPPDATA%\Igorio\debug.log`. Nothing without the variable.
 pub struct DebugLog {
     enabled: bool,
@@ -4338,7 +4333,7 @@ pub struct DebugLog {
 
 impl DebugLog {
     pub fn from_env() -> DebugLog {
-        let enabled = std::env::var_os("FAIRY_DEBUG").is_some_and(|v| v == "1");
+        let enabled = std::env::var_os("IGORIO_DEBUG").is_some_and(|v| v == "1");
         let file = enabled
             .then(|| {
                 let folder = PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Igorio");
@@ -4502,7 +4497,7 @@ impl LiveEnv {
     }
 
     /// Feeds every answer, reply and saved file to the router.
-    fn pump(&mut self, router: &mut Router<clipboard::Snapshot>, state: &mut FairyState, now: f64) {
+    fn pump(&mut self, router: &mut Router<clipboard::Snapshot>, state: &mut IgorioState, now: f64) {
         let mut answers = Vec::new();
         if let Some(uia) = &self.uia {
             while let Some((id, outcome)) = uia.poll() {
@@ -4916,7 +4911,7 @@ impl Drops {
 
     /// One pass of the UI loop: the hook events, then every answer and reply, then the
     /// deadline. Returns true when the state changed (redraw).
-    pub fn run(&mut self, events: &[MouseEvent], state: &mut FairyState, now: f64) -> bool {
+    pub fn run(&mut self, events: &[MouseEvent], state: &mut IgorioState, now: f64) -> bool {
         let Some(env) = self.env.as_mut() else {
             return false;
         };
@@ -4984,7 +4979,7 @@ impl Drops {
         &mut self,
         ids: &[CardId],
         hint: &str,
-        state: &mut FairyState,
+        state: &mut IgorioState,
         now: f64,
     ) -> bool {
         let Some(env) = self.env.as_mut() else {
@@ -4996,7 +4991,7 @@ impl Drops {
 
     /// The notes thread's `Error`. True when it ended a wait for a note (the router showed
     /// its hint).
-    pub fn note_failed(&mut self, state: &mut FairyState, now: f64) -> bool {
+    pub fn note_failed(&mut self, state: &mut IgorioState, now: f64) -> bool {
         let Some(env) = self.env.as_mut() else {
             return false;
         };

@@ -1,7 +1,6 @@
 //! The first-run guide: one card window in the settings window's style that shows each
 //! gesture with a looping picture, its keys, and a "Try it now" line that turns into a green
-//! "Done" when the user does the gesture. Ported from `GuideWindow.swift`; Windows needs no
-//! permissions page.
+//! "Done" when the user does the gesture.
 //!
 //! It opens on start until settings.json says `guide_seen`, and from the tray's "Guide…" any
 //! time. Like the settings window it runs on its own thread with its own message loop, so it
@@ -92,7 +91,7 @@ impl Features {
     }
 }
 
-/// The pages for what is switched on, in order (`GuideStep.steps`). Dropping and shaking need
+/// The pages for what is switched on, in order. Dropping and shaking need
 /// something to carry: a screenshot or a recording.
 pub fn pages(features: Features) -> Vec<Page> {
     let mut pages = vec![Page::Welcome];
@@ -1199,7 +1198,7 @@ impl Window<'_> {
         let center = DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX;
         self.paint_logo(canvas, scaled(LOGO, dpi), p.text, amount);
         canvas.text(scaled(NAME, dpi), "Igorio", fade(p.text), center, fonts[BIG]);
-        // Two lines, broken after the colon as in the Swift app.
+        // Two lines, broken after the colon.
         let line = self.views[0].line.replacen(": ", ":
 ", 1);
         canvas.text(scaled(TAGLINE, dpi), line, fade(p.muted), DT_CENTER | DT_WORDBREAK | DT_NOPREFIX, fonts[BODY]);
@@ -1923,8 +1922,8 @@ mod tests {
         let on = Features::of(&settings);
         assert!(on.screenshots && on.notes);
         assert_eq!(on.recording, Action::ToggleRecording.available());
-        settings.set_enabled("fairy.notes", false);
-        settings.set_enabled("fairy.screenshots", false);
+        settings.set_enabled("igorio.notes", false);
+        settings.set_enabled("igorio.screenshots", false);
         let off = Features::of(&settings);
         assert!(!off.notes && !off.screenshots);
     }

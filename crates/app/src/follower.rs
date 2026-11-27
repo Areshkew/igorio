@@ -1,18 +1,14 @@
-//! Moves the panel after the cursor with exponential smoothing.
-//! Ported from `Follower.swift`, math only (no AppKit timers or windows).
+//! Moves the panel after the cursor with exponential smoothing. Math only (no timers or
+//! windows).
 //!
-//! Coordinates here are Windows-style: physical pixels, origin at the top-left of the
-//! virtual desktop, y grows DOWN. Swift uses points with y growing UP. The conversion is
-//! a sign flip on the y offsets only:
+//! Coordinates are physical pixels, origin at the top-left of the virtual desktop, y grows
+//! DOWN:
 //!
-//! - Swift's "below the cursor" is `mouse.y - offset.y`; below the cursor in top-left
-//!   coordinates is `mouse.y + offset.y`.
-//! - Swift's "above the cursor" is `mouse.y + offset.y + contentH` (top edge); above the
-//!   cursor in top-left coordinates is `mouse.y - offset.y - contentH` because the content
+//! - Below the cursor is `mouse.y + offset.y`.
+//! - Above the cursor is `mouse.y - offset.y - contentH` (top edge), because the content
 //!   grows downward from its top edge.
-//! - Swift's panel origin is the bottom-left, so it adds the inset and subtracts the panel
-//!   height. The Windows window origin is the top-left, and the content top-left is inset
-//!   from it on both axes: `origin = contentTopLeft - (inset_x, INSET)`.
+//! - The window origin is the top-left, and the content top-left is inset from it on both
+//!   axes: `origin = contentTopLeft - (inset_x, INSET)`.
 //!
 //! All logical values (offset, the card size, `INSET`) are multiplied by `scale`, the
 //! monitor's physical pixels per logical pixel, before they meet physical mouse/work-area
@@ -72,10 +68,9 @@ impl Follower {
         if x + content_w > work_area.max_x() {
             x = mouse.x - offset_x - content_w;
         }
-        // Swift tests `contentTopLeft.y - contentH < f.minY` (content bottom below the
-        // screen bottom in y-up coordinates). In top-left coordinates the same situation
-        // is `contentTopLeft.y + contentH > f.maxY`, and the flipped top edge is above the
-        // cursor: `mouse.y - offset.y - contentH`.
+        // The content's bottom would be below the work area's bottom
+        // (`contentTopLeft.y + contentH > f.maxY`): flip it above the cursor, with its top
+        // edge at `mouse.y - offset.y - contentH`.
         if y + content_h > work_area.max_y() {
             y = mouse.y - offset_y - content_h;
         }

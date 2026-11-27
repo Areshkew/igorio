@@ -1,4 +1,4 @@
-//! Translated from `fairy-cursor/tests/core/HeldPileTests.swift`.
+//! The pile of held cards.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,7 +17,7 @@ impl HasCardId for Card {
     }
 }
 
-/// Swift's `let id = UUID()`: every card gets its own id.
+/// Every card gets its own id.
 fn card(name: &str) -> Card {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     Card {

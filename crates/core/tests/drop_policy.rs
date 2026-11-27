@@ -71,7 +71,7 @@ fn test_triple_click_ignored() {
 #[test]
 fn test_own_note_ignored() {
     // Notes take the pile through their own double-click handler; the router must not also
-    // paste into them (double delivery, ⌘V into ourselves).
+    // paste into them (double delivery, Ctrl+V into ourselves).
     assert_eq!(
         decide(&DoubleClick {
             is_holding: true,
@@ -84,25 +84,25 @@ fn test_own_note_ignored() {
 }
 
 #[test]
-fn test_finder_drop_spot_saves() {
+fn test_explorer_drop_spot_saves() {
     assert_eq!(
         decide(&DoubleClick {
             is_holding: true,
-            is_finder: true,
-            finder_drop_spot: true,
+            is_explorer: true,
+            explorer_drop_spot: true,
             ..Default::default()
         }),
-        Action::SaveToFinder
+        Action::SaveToExplorer
     );
 }
 
 #[test]
-fn test_finder_item_or_search_field_ignored() {
+fn test_explorer_item_or_search_field_ignored() {
     assert_eq!(
         decide(&DoubleClick {
             is_holding: true,
-            is_finder: true,
-            finder_drop_spot: false,
+            is_explorer: true,
+            explorer_drop_spot: false,
             ..Default::default()
         }),
         Action::Ignore
@@ -110,8 +110,8 @@ fn test_finder_item_or_search_field_ignored() {
     assert_eq!(
         decide(&DoubleClick {
             is_holding: true,
-            is_finder: true,
-            finder_drop_spot: false,
+            is_explorer: true,
+            explorer_drop_spot: false,
             editable_under_cursor: true,
             ..Default::default()
         }),
@@ -227,10 +227,10 @@ fn test_late_hit_or_nearby_confirms() {
     ));
 }
 
-// MARK: Finder
+// MARK: Explorer
 
 #[test]
-fn test_finder_background_roles() {
+fn test_explorer_background_roles() {
     for role in [
         "AXScrollArea",
         "AXGroup",
@@ -245,7 +245,7 @@ fn test_finder_background_roles() {
 }
 
 #[test]
-fn test_finder_items_are_not_drop_spots() {
+fn test_explorer_items_are_not_drop_spots() {
     for role in [
         "AXImage",
         "AXTextField",
@@ -459,7 +459,7 @@ fn test_canvas_drop_needs_typing_not_to_be_going_elsewhere() {
     assert!(confirm_canvas_drop(point, true, false, false, None));
     assert!(
         !confirm_canvas_drop(point, true, false, true, Some(composer)),
-        "a visible focused field would receive the ⌘V instead"
+        "a visible focused field would receive the Ctrl+V instead"
     );
     assert!(
         confirm_canvas_drop(
@@ -477,8 +477,8 @@ fn test_canvas_drop_needs_typing_not_to_be_going_elsewhere() {
 
 #[test]
 fn test_a_file_url_with_a_triple_slash_finds_the_host() {
-    // Swift's `split(separator:)` drops empty pieces, so the leading "/" of `file:///…` does
-    // not hide the host.
+    // Empty path pieces are skipped, so the leading "/" of `file:///…` does not hide the
+    // host.
     assert!(is_known_canvas_app(None, Some("file:///figma.com/x")));
 }
 

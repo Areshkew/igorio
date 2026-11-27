@@ -162,10 +162,10 @@ fn verify_controls(
 ) -> Result<()> {
     let mut expected = Settings::load(path)?;
     for (id, name, state, available) in [
-        (Screenshots, "Screenshots", expected.is_enabled("fairy.screenshots"), true),
+        (Screenshots, "Screenshots", expected.is_enabled("igorio.screenshots"), true),
         (Keep, "Keep every screenshot", expected.keep_every_screenshot, true),
-        (Notes, "Notes", expected.is_enabled("fairy.notes"), true),
-        (Recording, "Screen recording", expected.is_enabled("fairy.screen-recording"), true),
+        (Notes, "Notes", expected.is_enabled("igorio.notes"), true),
+        (Recording, "Screen recording", expected.is_enabled("igorio.screen-recording"), true),
         (Small, "Small", false, true),
         (Medium, "Medium", true, true),
         (Large, "Large", false, true),
@@ -228,7 +228,7 @@ fn verify_controls(
     );
     checks.check(
         "initial folder paths and Medium dimensions",
-        text(child(hwnd, NotesPath)).ends_with("Fairy Notes")
+        text(child(hwnd, NotesPath)).ends_with("Igorio Notes")
             && text(child(hwnd, CapturesPath)).ends_with("Screenshots")
             && text(child(hwnd, CardDimensions)) == "96 × 72 px",
     );
@@ -242,7 +242,7 @@ fn verify_controls(
 
     for on in [true, false, true] {
         click(hwnd, Screenshots);
-        expected.set_enabled("fairy.screenshots", on);
+        expected.set_enabled("igorio.screenshots", on);
         checks.check(
             &format!("Screenshots {on} saves and publishes"),
             disk(controller, path, &expected) && checked(child(hwnd, Screenshots)) == on,
@@ -255,18 +255,18 @@ fn verify_controls(
         disk(controller, path, &expected) && !checked(child(hwnd, Keep)),
     );
     for _ in 0..2 {
-        let on = !expected.is_enabled("fairy.notes");
+        let on = !expected.is_enabled("igorio.notes");
         click(hwnd, Notes);
-        expected.set_enabled("fairy.notes", on);
+        expected.set_enabled("igorio.notes", on);
         checks.check(
             &format!("Notes {on} saves and publishes"),
             disk(controller, path, &expected) && checked(child(hwnd, Notes)) == on,
         );
     }
     for _ in 0..2 {
-        let on = !expected.is_enabled("fairy.screen-recording");
+        let on = !expected.is_enabled("igorio.screen-recording");
         click(hwnd, Recording);
-        expected.set_enabled("fairy.screen-recording", on);
+        expected.set_enabled("igorio.screen-recording", on);
         checks.check(
             &format!("Screen recording {on} saves and publishes"),
             disk(controller, path, &expected) && checked(child(hwnd, Recording)) == on,
@@ -1214,7 +1214,7 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
     let root = fs::canonicalize(root)?;
     let path = root.join("settings.json");
     let defaults = TestMode {
-        notes: root.join("Documents").join("Fairy Notes"),
+        notes: root.join("Documents").join("Igorio Notes"),
         captures: root.join("Pictures").join("Screenshots"),
         dark: true,
         dpi: 96,
@@ -1238,7 +1238,7 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
         captures_folder: Some(defaults.captures.clone()),
         ..Settings::default()
     };
-    baseline.set_enabled("fairy.screenshots", false);
+    baseline.set_enabled("igorio.screenshots", false);
     baseline.save(&path)?;
     let mut controller = SettingsWindow::for_test(path.clone(), defaults.clone())?;
     report_memory("before first open")?;
@@ -1352,7 +1352,7 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
     drop(locked);
     checks.check(
         "locked-file window cannot overwrite after the file unlocks",
-        Settings::load(&path)?.is_enabled("fairy.screenshots")
+        Settings::load(&path)?.is_enabled("igorio.screenshots")
             && controller.saved(None, &Shortcuts::default()).is_empty(),
     );
     checks.check("locked-file window closes within one second", close(&mut controller, hwnd));

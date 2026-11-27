@@ -14,7 +14,7 @@ use igorio_app::drop_router::*;
 use igorio_app::explorer::{FolderOutcome, FolderRequest};
 use igorio_app::hook::{Button, MouseEvent};
 use igorio_app::input::{Batch, Key, Modifier, Sent};
-use igorio_app::state::FairyState;
+use igorio_app::state::IgorioState;
 use igorio_app::uia::{
     ElementInfo, Outcome, Probe, Shell, Snapshot, Target, UiaNode, ValueSignature,
 };
@@ -243,7 +243,7 @@ const AT: (i32, i32) = (500, 400);
 
 struct Rig {
     r: Router<Snap>,
-    s: FairyState,
+    s: IgorioState,
     e: Fake,
     now: f64,
     /// Answers for probe lookups: the first of a delivery (the focus check) and the later
@@ -302,7 +302,7 @@ fn image() -> Arc<Image> {
 
 impl Rig {
     fn new(cards: usize) -> Rig {
-        let mut s = FairyState::new(7);
+        let mut s = IgorioState::new(7);
         for _ in 0..cards {
             s.hold(
                 image(),
@@ -750,7 +750,7 @@ fn a_whiteboard_text_box_opened_by_the_double_click_is_closed_with_escape() {
             dismiss_editor: true
         }
     );
-    // In a page-drawn document the text box is where the paste goes (Swift: `.field`).
+    // In a page-drawn document the text box is where the paste goes (a field).
     before.document = true;
     assert_eq!(
         confirm_after_up(&after, AT, Some(100), before),
@@ -940,7 +940,7 @@ fn explorer_background_starts_a_folder_save_and_an_item_is_ignored() {
     let mut rig = Rig::new(1);
     rig.double_click();
     rig.answer(0.17, shell_spot(Shell::Explorer, true));
-    assert!(rig.e.logged("SaveToFinder"));
+    assert!(rig.e.logged("SaveToExplorer"));
     assert_eq!(rig.e.folders.len(), 1);
     assert!(rig.s.is_holding());
     // An item (not the background) is the user opening a file: ignored.
@@ -1456,7 +1456,7 @@ fn the_hover_hint_looks_after_a_rest_at_most_four_times_a_second() {
 }
 
 #[test]
-fn hover_hints_follow_the_swift_rules() {
+fn hover_hints_follow_the_drop_rules() {
     assert_eq!(hover_hint(&field("x.exe")), Some(HINT_HOVER_PASTE));
     assert_eq!(hover_hint(&terminal()), Some(HINT_HOVER_PASTE));
     assert_eq!(hover_hint(&Seen::OwnProcess), None);
@@ -1901,7 +1901,7 @@ fn a_first_click_takes_no_snapshot_outside_terminals() {
     assert!(rig.e.snapshots.is_empty());
 }
 
-/// The canvas rule is kept as in Swift, and the hover says so first.
+/// A web canvas takes the paste, and the hover says so first.
 #[test]
 fn a_web_canvas_shows_the_paste_hint_on_hover() {
     let mut spot = nothing("chrome.exe");
@@ -3349,7 +3349,7 @@ fn a_double_click_on_the_folder_background_saves_the_card_and_reveals_it() {
     assert!(rig.e.stages.is_empty() && rig.e.pressed.is_empty() && rig.e.sent == 0);
     for line in [
         "drop-spot=yes",
-        "→ SaveToFinder",
+        "→ SaveToExplorer",
         "asking Explorer for the folder of Window(16) (request 2, 0.50s)",
         r"folder (request 2, 130 ms): C:\Users\me\Pictures",
         "(1/1): writing Screenshot ",
@@ -3377,8 +3377,8 @@ fn a_double_click_on_the_empty_desktop_saves_into_the_desktop_folder() {
     assert_eq!(rig.e.reveals, vec![(0x10, file)]);
 }
 
-/// Swift `saveToFinder`: `let pile = state.deliverable` (top first), each saved in turn,
-/// then one `deliver(ids: saved…, hint: "saved N to <folder>")`.
+/// The deliverable pile (top first) is saved one file at a time, then delivered together
+/// with "saved N to <folder>".
 #[test]
 fn a_pile_is_saved_top_first_one_file_at_a_time_and_leaves_together() {
     let mut rig = Rig::new(3);
@@ -3413,7 +3413,7 @@ fn a_recording_is_copied_as_its_movie_file() {
     rig.written(0.4, Ok(png(PICTURES, "clip one.mp4")));
     assert_eq!(rig.s.hint(), Some("saved to Pictures"));
 
-    // Already in that folder (`FinderTarget.copy`): nothing is copied.
+    // Already in that folder: nothing is copied.
     let mut rig = Rig::with_movie();
     rig.save_double_click(Shell::Explorer);
     rig.folder_answer(0.3, FolderOutcome::Folder(PathBuf::from(r"c:\videos\")));

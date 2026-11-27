@@ -92,6 +92,82 @@ fn unlisted_capability_is_enabled() {
 }
 
 #[test]
+fn old_capability_ids_are_read_as_new_ids_and_saved_as_new_ids() {
+    let scratch = Scratch::new("old-capability-ids");
+    let path = scratch.path("settings.json");
+    fs::write(
+        &path,
+        r#"{"capabilities": {"fairy.screenshots": false, "fairy.notes": false,
+            "igorio.notes": true, "fairy.screen-recording": true, "other": false}}"#,
+    )
+    .unwrap();
+
+    let settings = Settings::load(&path).unwrap();
+    let expected = BTreeMap::from([
+        ("igorio.screenshots".to_owned(), false),
+        // The new id wins over the old one.
+        ("igorio.notes".to_owned(), true),
+        ("igorio.screen-recording".to_owned(), true),
+        ("other".to_owned(), false),
+    ]);
+    assert_eq!(settings.capabilities, expected);
+    assert!(!scratch.path("settings.json.bad").exists(), "the file was parsed");
+
+    settings.save(&path).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("fairy."), "only new ids are saved: {text}");
+    assert_eq!(Settings::load(&path).unwrap().capabilities, expected);
+}
+
+#[test]
+fn an_old_default_notes_folder_is_kept_when_the_new_one_is_missing() {
+    let scratch = Scratch::new("old-notes-folder");
+    let documents = scratch.path("Documents");
+    let old = documents.join("Fairy Notes");
+    fs::create_dir_all(&old).unwrap();
+    fs::write(old.join("a note.md"), "# a note").unwrap();
+    let defaults = DefaultFolders {
+        notes: documents.join("Igorio Notes"),
+        captures: scratch.path("captures"),
+    };
+
+    let mut settings = Settings::default();
+    assert!(settings.keep_old_notes_folder(&defaults));
+    assert_eq!(settings.notes_folder, Some(old.clone()));
+    assert_eq!(settings.notes_dir(&defaults), (old.clone(), false));
+    assert!(!defaults.notes.exists(), "the new default folder is not created");
+    assert_eq!(fs::read_to_string(old.join("a note.md")).unwrap(), "# a note");
+    // Once stored it is a chosen folder like any other.
+    assert!(!settings.keep_old_notes_folder(&defaults));
+
+    // A chosen folder is never replaced.
+    let chosen = scratch.path("chosen");
+    let mut settings = Settings { notes_folder: Some(chosen.clone()), ..Settings::default() };
+    assert!(!settings.keep_old_notes_folder(&defaults));
+    assert_eq!(settings.notes_folder, Some(chosen));
+
+    // The new default exists: it is used.
+    fs::create_dir_all(&defaults.notes).unwrap();
+    let mut settings = Settings::default();
+    assert!(!settings.keep_old_notes_folder(&defaults));
+    assert_eq!(settings.notes_folder, None);
+    assert!(old.join("a note.md").is_file());
+}
+
+#[test]
+fn no_old_notes_folder_keeps_the_new_default() {
+    let scratch = Scratch::new("no-old-notes-folder");
+    let defaults = DefaultFolders {
+        notes: scratch.path("Documents").join("Igorio Notes"),
+        captures: scratch.path("captures"),
+    };
+    let mut settings = Settings::default();
+    assert!(!settings.keep_old_notes_folder(&defaults));
+    assert_eq!(settings.notes_folder, None);
+    assert!(!scratch.path("Documents").join("Fairy Notes").exists());
+}
+
+#[test]
 fn save_then_load_round_trips() {
     let scratch = Scratch::new("round-trip");
     let path = scratch.path("nested/settings.json");

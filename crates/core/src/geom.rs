@@ -1,7 +1,7 @@
-//! Shared value types. They stand in for CGPoint, CGSize, CGVector, CGRect and UUID
-//! in the Swift source. Seconds (`TimeInterval`) and `CGFloat` are plain `f64`.
+//! Shared value types: points, sizes, vectors, rectangles and card ids. Seconds and
+//! lengths are plain `f64`.
 
-/// Identifies one card on the pile. Stands in for `UUID`; the app hands them out.
+/// Identifies one card on the pile; the app hands them out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CardId(pub u64);
 
@@ -89,17 +89,17 @@ impl Rect {
         self.width <= 0.0 || self.height <= 0.0
     }
 
-    /// Like `CGRect.contains`: the min edges are inside, the max edges are not.
+    /// The min edges are inside, the max edges are not.
     pub fn contains(&self, p: Point) -> bool {
         p.x >= self.min_x() && p.x < self.max_x() && p.y >= self.min_y() && p.y < self.max_y()
     }
 
-    /// Like `CGRect.insetBy`: positive values shrink, negative values grow.
+    /// Positive values shrink, negative values grow.
     pub fn inset_by(&self, dx: f64, dy: f64) -> Rect {
         Rect::new(self.x + dx, self.y + dy, self.width - 2.0 * dx, self.height - 2.0 * dy)
     }
 
-    /// `None` where `CGRect.intersection` returns the null rect.
+    /// `None` when the rectangles do not overlap.
     pub fn intersection(&self, other: &Rect) -> Option<Rect> {
         let x = self.min_x().max(other.min_x());
         let y = self.min_y().max(other.min_y());

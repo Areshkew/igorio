@@ -1,8 +1,8 @@
 //! Software renderer for the pen and the highlighter: turns the pure stroke geometry of
-//! `igorio_core::ink` into premultiplied pixels, the way `InkOverlay.swift` draws it with
-//! Core Animation layers. Everything is in physical pixels; points arrive in logical pixels.
+//! `igorio_core::ink` into premultiplied pixels. Everything is in physical pixels; points
+//! arrive in logical pixels.
 //!
-//! One layer per stroke is what makes the Swift drawing look the way it does: a highlighter
+//! One layer per stroke is what makes the drawing look the way it does: a highlighter
 //! fill is a single non-zero-winding path, so a stroke crossing itself does not darken, while
 //! two highlighter *strokes* are two layers and therefore do darken where they cross (alpha
 //! `0.38` over `0.38`, about `0.62`). The same holds here: every stroke is filled once.
@@ -31,16 +31,16 @@ use tiny_skia::{
     Stroke as SkiaStroke, Transform,
 };
 
-/// `InkStyle.penColor`: calibrated hue 212/360, saturation 0.72, brightness 0.88, alpha 1.
+/// Pen colour: hue 212/360, saturation 0.72, brightness 0.88, alpha 1.
 const PEN_COLOR: [u8; 3] = [63, 138, 224];
-/// `InkStyle.highlighterColor`: hue 52/360, saturation 0.75, brightness 1, alpha 0.38.
+/// Highlighter colour: hue 52/360, saturation 0.75, brightness 1, alpha 0.38.
 const HIGHLIGHTER_COLOR: [u8; 3] = [255, 230, 64];
 const HIGHLIGHTER_ALPHA: f64 = 0.38;
-/// `layer(for:)` pen shadow: black at 0.18, radius 1.5, offset (0, 0.5) points.
+/// Pen shadow: black at 0.18, radius 1.5, offset (0, 0.5) logical pixels.
 const SHADOW_ALPHA: f64 = 0.18;
 const SHADOW_RADIUS: f64 = 1.5;
 const SHADOW_OFFSET_Y: f64 = 0.5;
-/// `InkStyle.penWidth` / `highlighterWidth`, in points.
+/// Pen and highlighter widths, in logical pixels.
 const PEN_WIDTH: f64 = 5.0;
 const HIGHLIGHTER_WIDTH: f64 = 22.0;
 /// Extra pixels painted around a partial frame's part and not copied back.
@@ -541,7 +541,7 @@ impl InkRenderer {
         }
         self.committed.fill(Color::TRANSPARENT);
         let mut has_content = false;
-        // Highlights sit under lines, as the two container layers do in InkOverlay.swift.
+        // Highlights sit under lines: all highlighter strokes first, then the pen.
         for tool in [InkTool::Highlighter, InkTool::Pen] {
             for stroke in strokes.iter().filter(|stroke| stroke.tool() == tool) {
                 if let Some(shape) = build_shape(stroke, true, scale) {
@@ -729,7 +729,7 @@ fn paint(
         anti_alias: true,
         ..Paint::default()
     };
-    // `CAShapeLayer.fillRule` is `.nonZero`, which tiny-skia calls `Winding`.
+    // Non-zero fill rule, which tiny-skia calls `Winding`.
     pixmap.fill_path(
         &shape.path,
         &paint,
@@ -762,7 +762,7 @@ fn paint_flat_shadow(pixmap: &mut Pixmap, shape: &Shape, scale: f64, opacity: f6
     );
 }
 
-/// `layer.shadowColor` black, `shadowOpacity` 0.18, `shadowRadius` 1.5, `shadowOffset` (0, 0.5).
+/// The pen's shadow: black at 0.18, radius 1.5, offset (0, 0.5).
 fn paint_shadow(
     pixmap: &mut Pixmap,
     shape: &Shape,
@@ -1187,11 +1187,11 @@ fn damage_margin(scale: f64) -> f64 {
     2.0 + 3.0 * radius + SHADOW_OFFSET_Y * scale
 }
 
-/// A small image of the tool to use as the mouse cursor, with its hot spot, drawn as
-/// `InkStyle.cursor(for:)` does. Premultiplied RGBA; the hot spot is the image centre.
+/// A small image of the tool to use as the mouse cursor, with its hot spot. Premultiplied
+/// RGBA; the hot spot is the image centre.
 ///
-/// `scale` is the display's physical pixels per point. `CursorScale.enlargement` has no
-/// Windows equivalent and is taken as 1, so the nib keeps the ink's width.
+/// `scale` is the display's physical pixels per logical pixel. The nib keeps the ink's
+/// width.
 pub fn tool_cursor(tool: InkTool, scale: f64) -> (Pixmap, (u32, u32)) {
     let s = if scale.is_finite() && scale > 0.0 {
         scale.min(64.0)

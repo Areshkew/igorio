@@ -1,16 +1,16 @@
-//! What the user does during a recording, turned into commands. From `RecordingInput.swift`.
+//! What the user does during a recording, turned into commands.
 //! No recording logic lives here: [`Machine`] turns keys, taken wheel events and the tool
 //! shortcuts into [`Action`]s, and the recording UI (`ink_overlay::RecordingUi`) carries them
 //! out and sends the viewport ones on to the app.
 //!
-//! # The zoom gesture on Windows
+//! # The zoom gesture
 //!
-//! macOS: Option + scroll zooms, holding Option moves the zoomed view with the cursor, letting
-//! go leaves the view, a double tap of Option returns to the whole screen.
+//! Modifier + scroll zooms, holding the modifier moves the zoomed view with the cursor, letting
+//! go leaves the view, a double tap of the modifier returns to the whole screen.
 //!
-//! Windows: **Alt** by default ([`ZoomModifier::Alt`], one config value; `CtrlAlt` is the
-//! alternative). Alt is what the user already holds for the note gesture (which is blocked
-//! while a recording runs), and it is the key in the same place as Option.
+//! The modifier is **Alt** by default ([`ZoomModifier::Alt`], one config value; `CtrlAlt` is
+//! the alternative). Alt is what the user already holds for the note gesture (which is blocked
+//! while a recording runs).
 //!
 //! The problem with Alt is the lone Alt: an Alt press and release with no other key in
 //! between activates the foreground window's menu bar (or Office key tips, or the menu of VS
@@ -53,10 +53,9 @@
 //!
 //! # The drawing keys (A.2)
 //!
-//! `InkOverlay.swift` never lets its panel become key (`canBecomeKey` false): the recorded app
-//! keeps the keyboard focus and keeps looking active in the video, and the global event tap
-//! takes the drawing keys. The same here: the ink window never activates and never takes the
-//! focus (`WS_EX_NOACTIVATE`), and a low-level keyboard hook on its own thread (rule 1)
+//! The recorded app keeps the keyboard focus and keeps looking active in the video: the ink
+//! window never activates and never takes the focus (`WS_EX_NOACTIVATE`), and a low-level
+//! keyboard hook on its own thread (rule 1)
 //! swallows exactly the drawing keys while a tool is in hand. Taking the focus instead would
 //! need no hook, but the recorded app would show as inactive (grey title bar, no caret) in the
 //! video while drawing.
@@ -102,17 +101,16 @@ pub use crate::notes::summoner::Modifier as ZoomModifier;
 use crate::notes::summoner::{MASK_KEY, is_altgr_ctrl};
 
 // ---------------------------------------------------------------------------------------
-// Constants (the Swift values)
+// Constants
 // ---------------------------------------------------------------------------------------
 
-/// Two presses of the modifier this close together are a double tap (`doubleTapWindow`).
+/// Two presses of the modifier this close together are a double tap.
 pub const DOUBLE_TAP_WINDOW: f64 = 0.35;
 /// Following starts this long after the modifier goes down, so the two taps of a double tap
-/// do not tug the view toward the cursor first (`followDelay`). A wheel event starts it at
+/// do not tug the view toward the cursor first. A wheel event starts it at
 /// once.
 pub const FOLLOW_DELAY: f64 = 0.15;
-/// Zoom per wheel notch, in `RecordingViewport::zoom_by` units (`zoomAmount`: one line
-/// notch is 0.12).
+/// Zoom per wheel notch, in `RecordingViewport::zoom_by` units.
 pub const ZOOM_PER_NOTCH: f64 = 0.12;
 /// `WHEEL_DELTA`: one notch.
 pub const WHEEL_DELTA: f64 = 120.0;
@@ -151,7 +149,7 @@ pub enum Toggle {
     Ignore,
 }
 
-/// The ToggleRecording shortcut (`RecordingCapability.toggle()`). The wiring calls this when
+/// The ToggleRecording shortcut. The wiring calls this when
 /// `shortcuts::Hotkeys` reports the press.
 pub fn toggle(state: RecordingState) -> Toggle {
     match state {
@@ -257,8 +255,7 @@ fn key_down(vk: VIRTUAL_KEY) -> bool {
     (unsafe { GetAsyncKeyState(i32::from(vk.0)) }) < 0
 }
 
-/// Which drawing key a press is, given the modifiers down (`RecordingInput.handle`): Ctrl+Z
-/// (Cmd+Z on macOS) undoes, Backspace or Delete clears, Esc puts the pen down. Any other
+/// Which drawing key a press is, given the modifiers down: Ctrl+Z undoes, Backspace or Delete clears, Esc puts the pen down. Any other
 /// modifier makes it someone else's shortcut. Pen and highlighter are global shortcuts and
 /// do not come through here.
 pub fn drawing_key(vk: u32, mods: &Mods) -> Option<InkKey> {
@@ -273,7 +270,7 @@ pub fn drawing_key(vk: u32, mods: &Mods) -> Option<InkKey> {
 }
 
 /// One key change as the recording's keyboard hook saw it. Auto-repeats are reported only
-/// when the hook took them (a held Ctrl+Z undoes again, as on macOS).
+/// when the hook took them (a held Ctrl+Z undoes again).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KeyInput {
     pub vk: u32,
@@ -419,7 +416,7 @@ pub enum Action {
     Mask { changes: u64 },
 }
 
-/// The input rules of `RecordingInput.swift`. Pure: time comes in, actions go out. The ink
+/// The input rules of a recording. Pure: time comes in, actions go out. The ink
 /// itself is passed to [`step`](Self::step) (one `Ink`, owned by the ink window).
 #[derive(Debug, Clone)]
 pub struct Machine {
@@ -492,7 +489,7 @@ impl Machine {
                 self.follow_due = None;
                 self.last_tap = None;
                 self.stop_following(&mut out);
-                // `InkOverlay.close`: a pen in hand is put down, and its ink fades.
+                // A pen in hand is put down, and its ink fades.
                 if ink.is_drawing() {
                     ink.put_down();
                     out.push(Action::Tool(None));
@@ -502,7 +499,7 @@ impl Machine {
             Input::Key(key) => self.key(key, now, ink, &mut out),
             Input::Wheel(delta) => {
                 if self.recording && delta != 0 {
-                    // A scroll makes it a hold at once (`reportFollowing`).
+                    // A scroll makes it a hold at once.
                     if self.held {
                         self.start_following(&mut out);
                     }
@@ -610,7 +607,7 @@ impl Machine {
     }
 }
 
-/// `InkOverlay.press`: applies a key to the ink and says what changed.
+/// Applies a key to the ink and says what changed.
 fn press(ink: &mut Ink, key: InkKey, out: &mut Vec<Action>) {
     let before = ink.tool();
     if !ink.press(key) {
@@ -1087,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn modifier_and_wheel_zooms_by_the_swift_step_clamped_by_the_viewport() {
+    fn modifier_and_wheel_zooms_by_the_notch_step_clamped_by_the_viewport() {
         let mut s = Script::new(ZoomModifier::Alt);
         s.key(0.0, LALT, true);
         assert!(s.wheel(0.05, 120));

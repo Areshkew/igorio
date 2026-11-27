@@ -1,6 +1,6 @@
 //! The clipboard for one paste: save the user's clipboard, put a screenshot (or a path, or a
 //! file) there, learn whether another app read it, and put the user's clipboard back.
-//! From `PasteTarget.swift` (`PromisedPasteboardItem`, `PasteboardSnapshot`). The timing and
+//! The timing and
 //! the decisions are in `igorio_core::paste_policy`; this module reports the facts those rules
 //! ask for and performs the writes they decide.
 //!
@@ -29,7 +29,7 @@
 //!
 //! The staged formats are written with delayed rendering (`SetClipboardData(format, NULL)`).
 //! When another process asks for one, Windows sends `WM_RENDERFORMAT` to the owner window;
-//! that is a read (the Windows form of the lazy data provider in `PasteTarget.swift`). Windows
+//! that is a read. Windows
 //! keeps rendered data, so each format is counted at most once per staging. Formats that
 //! Windows synthesizes (`CF_DIB` and `CF_BITMAP` from `CF_DIBV5`; `CF_TEXT` from
 //! `CF_UNICODETEXT`) still render their source format first, so they count too. Markers are

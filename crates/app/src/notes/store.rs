@@ -1,12 +1,10 @@
 //! Sticky notes as plain Markdown files in a folder the caller chooses.
 //!
-//! Ported from `fairy-cursor/sources/capabilities/notes/NoteStore.swift`. Each file
-//! starts with the same short front matter block the macOS app writes (id, when, and where the
-//! note was written), so a notes folder can be shared between the two apps. The file is named
-//! after the note's first line and renamed as that changes; a blank note has no file until
-//! something is typed into it.
+//! Each file starts with a short front matter block (id, when, and where the note was
+//! written), then the Markdown as typed. The file is named after the note's first line and
+//! renamed as that changes; a blank note has no file until something is typed into it.
 //!
-//! Two Windows-only changes sit on top of the Swift rules:
+//! Two Windows rules sit on top of the naming rules:
 //!
 //! - A file stem is made safe for Windows (`windows_safe_stem`): characters Windows forbids
 //!   become `-`, trailing dots and spaces go, device names such as `CON` get a leading `_`,
@@ -38,8 +36,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::core::PCWSTR;
 
-/// How long a change waits before it is written, from `update`'s `DispatchQueue` delay in the
-/// Swift store. The caller supplies the clock; this is only a length of time.
+/// How long a change waits before it is written. The caller supplies the clock; this is only a
+/// length of time.
 pub const DEBOUNCE_SECONDS: f64 = 0.4;
 
 /// Longest full path, in UTF-16 code units, that this store aims to produce. Windows'
@@ -54,7 +52,7 @@ pub const MAX_STEM_UNITS: usize = 120;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// A note's identity: a UUID, as `[u8; 16]`. Text form is the canonical 8-4-4-4-12 with
-/// uppercase hex digits, which is what Swift's `UUID.uuidString` writes into the file.
+/// uppercase hex digits, as written into the file.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NoteId([u8; 16]);
 
@@ -181,7 +179,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 }
 
 /// Where a note was started: the Desktop, an app window, or a web page. Field and value names
-/// match `NoteOrigin` in Swift.
+/// are the ones in the file's front matter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum NoteKind {
     #[default]
@@ -277,7 +275,7 @@ impl NoteOrigin {
     }
 }
 
-/// One sticky note, in memory. Field names follow `Note` in Swift.
+/// One sticky note, in memory.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Note {
     pub id: NoteId,
@@ -290,7 +288,7 @@ pub struct Note {
     /// On screen or put away (put-away notes stay listed in the menu).
     pub is_open: bool,
     /// Open but hidden: the window is off screen until it is shown again (from the notes
-    /// panel or the menu). Not in the Swift app; kept in the windows file only.
+    /// panel or the menu). Kept in the windows file only, never in the note's file.
     pub is_hidden: bool,
 }
 
@@ -327,11 +325,11 @@ impl Note {
     /// This does not know the notes folder, so it uses [`MAX_STEM_UNITS`]; the store shortens
     /// the stem further when the folder path leaves less room under [`MAX_PATH_UNITS`].
     pub fn file_stem(&self) -> String {
-        windows_safe_stem(&self.swift_file_stem(), MAX_STEM_UNITS)
+        windows_safe_stem(&self.plain_file_stem(), MAX_STEM_UNITS)
     }
 
-    /// The Swift `fileStem` rules, before the Windows-only rules.
-    fn swift_file_stem(&self) -> String {
+    /// The stem from the note's first line, before the Windows rules.
+    fn plain_file_stem(&self) -> String {
         if self.is_blank() {
             return "Untitled".to_owned();
         }
@@ -356,7 +354,7 @@ impl Note {
     }
 }
 
-/// Applies the Windows file-name rules to a stem (the Swift rules already ran).
+/// Applies the Windows file-name rules to a stem (from [`Note::plain_file_stem`]).
 ///
 /// Invalid characters (`< > : " / \ | ? *` and control characters) become `-`; trailing dots
 /// and spaces are dropped; a reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
@@ -498,8 +496,7 @@ fn is_reserved_device_name(stem: &str) -> bool {
         && bytes[3] != b'0'
 }
 
-/// The window part of a note, kept in the separate windows file. Matches Swift's nested
-/// `NoteStore.WindowState`.
+/// The window part of a note, kept in the separate windows file.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowState {
     pub frame: Rect,
@@ -508,7 +505,7 @@ pub struct WindowState {
     pub is_hidden: bool,
 }
 
-/// The on-disk form of a note, from `NoteFile` in Swift: a front matter block, then the
+/// The on-disk form of a note: a front matter block, then the
 /// Markdown as typed.
 ///
 /// ```text
@@ -570,7 +567,7 @@ impl NoteFile {
     }
 
     /// Splits a file into its metadata and body. A file without the block is all body and
-    /// gets no metadata, which is the Swift rule. One leading UTF-8 byte order mark is
+    /// gets no metadata. One leading UTF-8 byte order mark is
     /// skipped, as `settings.rs` does: an editor on Windows may add one, and it is not part
     /// of the note's text.
     pub fn parse(text: &str) -> (NoteMeta, String) {
@@ -635,8 +632,7 @@ pub trait Trash {
     fn trash(&self, path: &Path) -> io::Result<()>;
 }
 
-/// The Recycle Bin, through `SHFileOperationW` with `FOF_ALLOWUNDO` (the Windows counterpart
-/// of `FileManager.trashItem`).
+/// The Recycle Bin, through `SHFileOperationW` with `FOF_ALLOWUNDO`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RecycleBin;
 
@@ -820,7 +816,7 @@ impl NoteStore {
         errors
     }
 
-    /// Adds a note and writes it at once, like Swift's `insert`.
+    /// Adds a note and writes it at once.
     pub fn insert(&mut self, note: Note) -> io::Result<()> {
         let id = note.id;
         self.notes.insert(id, note);
@@ -996,7 +992,7 @@ impl NoteStore {
         let room = MAX_PATH_UNITS
             .saturating_sub(folder_units + 1 + 3) // separator and ".md"
             .clamp(1, MAX_STEM_UNITS);
-        windows_safe_stem(&note.swift_file_stem(), room)
+        windows_safe_stem(&note.plain_file_stem(), room)
     }
 
     /// Every `.md` file in the folder (not subfolders), parsed. Files without our front
@@ -1262,8 +1258,8 @@ fn is_hidden(entry: &fs::DirEntry) -> bool {
         .unwrap_or(false)
 }
 
-/// Spaces, tabs and the `\r` of a CRLF line, like Swift's `CharacterSet.whitespaces` plus the
-/// carriage return Windows editors leave at the end of a line.
+/// Spaces, tabs and the `\r` of a CRLF line (the carriage return Windows editors leave at the
+/// end of a line).
 fn trim_spaces(text: &str) -> &str {
     text.trim_matches(|c: char| c == ' ' || c == '\t' || c == '\r')
 }
@@ -1273,7 +1269,7 @@ fn trim_line(text: &str) -> &str {
     text.trim_matches(|c: char| c == ' ' || c == '\t' || c == '\r')
 }
 
-/// The leading Markdown marker the Swift title regex removes, if any.
+/// The leading Markdown marker the title leaves out, if any.
 fn strip_markdown_prefix(line: &str) -> &str {
     let hashes = line.chars().take_while(|c| *c == '#').count();
     if (1..=6).contains(&hashes)
@@ -1322,7 +1318,7 @@ fn strip_task_marker(text: &str) -> Option<&str> {
     None
 }
 
-/// Removes every `*`, `_`, `` ` `` and `~`, like the Swift title regex.
+/// Removes every `*`, `_`, `` ` `` and `~`, for the title.
 fn strip_markers(text: &str) -> String {
     text.chars()
         .filter(|c| !matches!(c, '*' | '_' | '`' | '~'))
@@ -1404,7 +1400,7 @@ fn unix_parts(time: SystemTime) -> (i64, u32) {
     }
 }
 
-/// ISO 8601 as Swift's default `ISO8601DateFormatter` writes it: `2026-11-11T14:32:05Z`.
+/// ISO 8601 in UTC, whole seconds: `2026-11-11T14:32:05Z`.
 fn format_utc(time: SystemTime) -> String {
     let (seconds, _) = unix_parts(time);
     let days = seconds.div_euclid(86_400);

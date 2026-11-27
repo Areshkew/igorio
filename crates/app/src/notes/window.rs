@@ -1,14 +1,13 @@
 //! Note windows: every open note, on one notes thread with its own message loop.
 //!
-//! Ported from `NotesController.swift` and `NoteView.swift`. The app's UI thread talks to the
+//! The app's UI thread talks to the
 //! notes thread through [`Notes`]: commands go in through a channel (never waiting), events come
 //! back through another channel with a wake handle, and [`DropZones`] answers "which note is
 //! under this point" from a snapshot the UI thread reads without asking the notes thread.
 //!
 //! The notes thread owns the [`NoteStore`] and drives its debounce with a timer that runs only
 //! while a write is pending. Each note is a borderless, resizable, always-on-top tool window
-//! (the Swift panel is a borderless non-activating floating panel that never shows in the Dock
-//! or the app switcher: here no taskbar button and no Alt+Tab entry), with DWM rounded corners
+//! (no taskbar button and no Alt+Tab entry), with DWM rounded corners
 //! and shadow, a header (origin chip, delete, put away), the editor, and a footer (when it was
 //! edited, a resize grip).
 
@@ -61,7 +60,7 @@ use super::store::{Note, NoteId, NoteKind, NoteOrigin, NoteStore, Trash, seed_by
 use crate::overlay::{cursor_pos, monitor_at};
 
 // ---------------------------------------------------------------------------
-// Layout constants (logical pixels), from `NoteLayout` in NoteView.swift
+// Layout constants (logical pixels)
 // ---------------------------------------------------------------------------
 
 /// A new note's card.
@@ -74,7 +73,7 @@ const FOOTER: f64 = 26.0;
 const EDGE: f64 = 6.0;
 const BUTTON: f64 = 20.0;
 const GRIP: f64 = 18.0;
-/// What the overlay says over a note while the fairy carries screenshots (Swift `DropZone`).
+/// What the overlay says over a note while the pile carries screenshots.
 pub const DROP_HINT: &str = "double-click to add to note";
 
 /// Control ids inside a note window.
@@ -119,7 +118,7 @@ pub struct NotesConfig {
     /// The Recycle Bin, or a fake in tests.
     pub trash: Box<dyn Trash + Send>,
     pub theme: Theme,
-    /// Reopen the notes that were on screen when the app last quit (Swift `restore`).
+    /// Reopen the notes that were on screen when the app last quit.
     pub restore: bool,
     #[doc(hidden)]
     pub test: Option<TestOptions>,
@@ -137,7 +136,7 @@ pub struct TestOptions {
     pub no_activate: bool,
 }
 
-/// A note in the recent-notes menu (Swift `appendMenuItems`).
+/// A note in the recent-notes menu.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecentNote {
     pub id: NoteId,
@@ -156,7 +155,7 @@ pub struct RecentNote {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     /// These carried cards went into a note: the pile lets go of them. The text is the
-    /// Swift hint ("added to note", "added 2 to note").
+    /// hint ("added to note", "added 2 to note").
     CardsTaken { ids: Vec<CardId>, hint: String },
     /// The recent notes changed, most recently edited first.
     Recent(Vec<RecentNote>),
@@ -358,12 +357,12 @@ impl Notes {
         result.lock().ok()?.take()
     }
 
-    /// Takes a note off screen; a blank note is discarded (Swift `putAway`).
+    /// Takes a note off screen; a blank note is discarded.
     pub fn put_away(&self, id: NoteId) {
         self.send(Command::PutAway(id));
     }
 
-    /// Takes every note off screen but remembers which were up (Swift `hideAll`).
+    /// Takes every note off screen but remembers which were up.
     pub fn put_away_all(&self) {
         self.send(Command::PutAwayAll);
     }
@@ -389,7 +388,7 @@ impl Notes {
         self.send(Command::SetTheme(theme));
     }
 
-    /// Picks up files changed in Explorer (call when the menu opens, as Swift does); answers
+    /// Picks up files changed in Explorer (call when the menu opens); answers
     /// with [`Event::Recent`].
     pub fn refresh(&self) {
         self.send(Command::Refresh);
@@ -567,7 +566,7 @@ impl TestNote<'_> {
 // ---------------------------------------------------------------------------
 
 /// The window rectangle (physical pixels) of a new note summoned at `at` on a monitor with this
-/// work area and scale. From Swift `create(at:origin:)`: the card's top-left starts where the
+/// work area and scale: the card's top-left starts where the
 /// summon pill's was, so it grows out of it; then it is kept on the screen.
 pub fn new_note_frame(at: Point, work: Rect, scale: f64) -> Rect {
     let (w, h) = (NOTE_SIZE.0 * scale, NOTE_SIZE.1 * scale);
@@ -608,7 +607,7 @@ pub fn clamp_frame(frame: Rect, works: &[Rect], min: (f64, f64)) -> Rect {
     frame
 }
 
-/// The footer's text, from Swift `editedLabel`: "Created" until the first edit a second after
+/// The footer's text: "Created" until the first edit a second after
 /// creation, then "Edited"; "just now" within a minute, then how long ago.
 pub fn edited_label(created: SystemTime, updated: SystemTime, now: SystemTime) -> String {
     let verb = if updated.duration_since(created).map_or(true, |d| d < Duration::from_secs(1)) {
@@ -636,8 +635,8 @@ fn plural(count: u64, unit: &str) -> String {
     if count == 1 { format!("1 {unit} ago") } else { format!("{count} {unit}s ago") }
 }
 
-/// The damped spring of Swift's `.spring(response: 0.34, dampingFraction: 0.78)`: 0 at the
-/// start, settling at 1 with a small overshoot.
+/// A damped spring (response 0.34 s, damping fraction 0.78): 0 at the start, settling at 1
+/// with a small overshoot.
 pub fn spring(seconds: f64) -> f64 {
     let omega = 2.0 * std::f64::consts::PI / 0.34;
     let zeta: f64 = 0.78;
@@ -658,15 +657,14 @@ pub fn lerp_rect(from: Rect, to: Rect, amount: f64) -> Rect {
     )
 }
 
-/// The file name for a screenshot or recording dropped into a note (Swift
-/// `attachCarriedScreenshots`): "shot-" or "recording-" and the first eight characters of a new
-/// UUID in lowercase.
+/// The file name for a screenshot or recording dropped into a note: "shot-" or "recording-" and
+/// the first eight characters of a new UUID in lowercase.
 pub fn attachment_name(kind: &str, id: NoteId, extension: &str) -> String {
     let uuid = id.to_string().to_lowercase();
     format!("{kind}-{}.{extension}", &uuid[..8])
 }
 
-/// The Markdown for one attachment, as Swift writes it.
+/// The Markdown for one attachment.
 pub fn attachment_link(name: &str, movie: bool) -> String {
     if movie {
         format!("[recording](attachments/{name})")
@@ -675,7 +673,7 @@ pub fn attachment_link(name: &str, movie: bool) -> String {
     }
 }
 
-/// The overlay hint after a drop (Swift `onScreenshotsTaken`).
+/// The overlay hint after a drop.
 pub fn taken_hint(count: usize) -> String {
     if count == 1 { "added to note".to_owned() } else { format!("added {count} to note") }
 }
@@ -1106,7 +1104,7 @@ impl Hub {
         NoteId::new_random(seed_bytes(SystemTime::now(), counter.wrapping_add(0x5eed)))
     }
 
-    /// Swift `restore`: the notes that were up when the app quit come back, oldest first.
+    /// The notes that were up when the app quit come back, oldest first.
     fn restore(&self) {
         let notes: Vec<Note> = self
             .store
@@ -1121,7 +1119,7 @@ impl Hub {
         }
     }
 
-    /// Swift `create(at:origin:)`.
+    /// Creates a note at `at` and shows it growing out of the summon pill.
     fn create(&self, at: Point, origin: NoteOrigin) {
         let monitor = monitor_at(at);
         let scale = self.test.dpi.map_or(monitor.scale, |dpi| f64::from(dpi) / 96.0);
@@ -1144,7 +1142,7 @@ impl Hub {
         self.publish_recent();
     }
 
-    /// Swift `show(_:growsIn:focus:)`.
+    /// Shows `note`'s window, creating it when needed.
     fn show(&self, note: Note, grows_in: bool, focus: bool) {
         if let Some(window) = self.window(note.id) {
             window.bring_forward(focus);
@@ -1284,7 +1282,7 @@ impl Hub {
         }
     }
 
-    /// Swift `putAway`: off screen, still in the menu; a blank note is discarded.
+    /// Off screen, still in the menu; a blank note is discarded.
     fn put_away(&self, id: NoteId) {
         self.close_window(id, true);
         let blank = self.store.borrow().note(id).is_none_or(Note::is_blank);
@@ -1296,7 +1294,7 @@ impl Hub {
         self.publish_recent();
     }
 
-    /// Swift `hideAll`: every window goes, each remembered as open.
+    /// Every window goes, each remembered as open.
     fn hide_all(&self) {
         let ids: Vec<NoteId> = self.windows.borrow().keys().copied().collect();
         for id in ids {
@@ -1352,9 +1350,9 @@ impl Hub {
         self.publish_recent();
     }
 
-    /// Swift `refreshFromDisk`, plus reloading open notes whose files changed: an open note with
-    /// no change waiting to be written takes the file's text; one with a change waiting keeps
-    /// the editor's text (the store leaves pending notes alone, as Swift's `refresh(keeping:)`).
+    /// Reads the notes folder again, and reloads open notes whose files changed: an open note
+    /// with no change waiting to be written takes the file's text; one with a change waiting
+    /// keeps the editor's text (the store leaves pending notes alone).
     fn refresh_from_disk(&self) {
         let windows: Vec<Rc<NoteWindow>> = self.windows.borrow().values().cloned().collect();
         let keeping: Vec<NoteId> = {
@@ -1374,7 +1372,7 @@ impl Hub {
         self.publish_recent();
     }
 
-    /// Swift `attachCarriedScreenshots`: each card becomes a file in `<notes>/attachments`
+    /// Each card becomes a file in `<notes>/attachments`
     /// and a Markdown link; the links go in at the double-click.
     fn give_cards(&self, at: Point, cards: Vec<HeldCard>) {
         let Some(id) = self.zones.note_at(at) else { return };
@@ -1974,8 +1972,7 @@ impl NoteWindow {
         }
     }
 
-    /// Shows the window. A new note grows out of the summon pill (Swift spring, response 0.34,
-    /// damping 0.78): the window's rectangle grows from the pill's and its opacity fades in,
+    /// Shows the window. A new note grows out of the summon pill ([`spring`]): the window's rectangle grows from the pill's and its opacity fades in,
     /// with the content hidden until it is nearly full size. Reduced motion: at once.
     fn appear(&self, grows_in: bool, focus: bool) {
         let hub = self.hub();
@@ -2253,8 +2250,8 @@ impl NoteWindow {
             return;
         }
         if current != *self.synced.borrow() {
-            // The editor has text the store has not got yet: it wins and is saved (the Swift
-            // rule: an open note keeps its own text).
+            // The editor has text the store has not got yet: it wins and is saved (an open
+            // note keeps its own text).
             drop(guard);
             self.sync_text();
             return;
@@ -2303,8 +2300,7 @@ impl NoteWindow {
         }
     }
 
-    /// The header buttons show while the pointer is over the note or one of them has focus
-    /// (Swift shows them on hover).
+    /// The header buttons show while the pointer is over the note or one of them has focus.
     fn update_buttons_shown(&self) {
         // SAFETY: focus query on this thread.
         let focused = unsafe { GetFocus() };
@@ -2433,7 +2429,7 @@ impl NoteWindow {
             canvas.fill(client, 0.0, palette.paper, 1.0);
             {
                 // The header and footer draw while the card grows too; only the editor waits.
-                // Header hairline, inset like Swift's.
+                // Header hairline, inset from the sides.
                 let line = RECT {
                     left: self.s(12.0),
                     top: self.s(HEADER),
@@ -2739,7 +2735,7 @@ fn open_in_shell(target: String) {
     });
 }
 
-/// Swift `openOrigin`: back to where the note was written.
+/// Back to where the note was written.
 fn open_origin(origin: &NoteOrigin) {
     match origin.kind {
         NoteKind::Desktop => open_in_shell("shell:Desktop".to_owned()),
@@ -2952,8 +2948,8 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             if active {
                 hub.active.set(Some(window.id));
                 hub.update_zones();
-                // Swift refreshes from disk when the menu opens; a note also checks its file when
-                // it is activated (not on a timer).
+                // The notes are read again when the menu opens; a note also checks its file
+                // when it is activated (not on a timer).
                 hub.refresh_from_disk();
                 let saved = window.saved_focus.get();
                 // SAFETY: focus within our own window.
@@ -3005,7 +3001,7 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     HIDE_ID => {
                         let _ = hub.commands.send(Command::Hide(window.id));
                     }
-                    // Swift deletes without asking (the file goes to the Trash, so it can come back).
+                    // Deletes without asking (the file goes to the Recycle Bin, so it can come back).
                     DELETE_ID => {
                         let _ = hub.commands.send(Command::Delete(window.id));
                     }
@@ -3164,7 +3160,7 @@ mod tests {
     }
 
     #[test]
-    fn attachments_follow_the_swift_names() {
+    fn attachments_are_named_by_kind_and_a_short_id() {
         let id = NoteId::parse("6F9A1B2C-3D4E-4F5A-6B7C-8D9EAFB0C1D2").unwrap();
         assert_eq!(attachment_name("shot", id, "png"), "shot-6f9a1b2c.png");
         assert_eq!(attachment_name("recording", id, "mp4"), "recording-6f9a1b2c.mp4");

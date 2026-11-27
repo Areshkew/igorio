@@ -1,4 +1,4 @@
-//! Visual tokens from `Theme.swift`. Colours are straight RGBA, 0 to 255.
+//! Visual tokens: colours, sizes and timings shared by the app's windows. Colours are straight RGBA, 0 to 255.
 
 pub type Rgba = [u8; 4];
 

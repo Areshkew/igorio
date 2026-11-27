@@ -1,4 +1,4 @@
-//! Translated from `fairy-cursor/tests/core/ShakeGateTests.swift`.
+//! The gate that feeds cursor movement to the shake gesture.
 
 use std::f64::consts::PI;
 
@@ -13,7 +13,7 @@ struct Sample {
 
 type Path = Vec<Sample>;
 
-/// `Motion.shake` from `ShakeDetectorTests.swift`, with its documented defaults.
+/// A shake path, with the same defaults as in `shake_detector.rs`.
 fn shake(amplitude: f64, hz: f64, duration: f64) -> Path {
     shake_starting_at(amplitude, hz, duration, 0.0)
 }
@@ -61,7 +61,7 @@ fn test_nothing_held_never_discards() {
 
 #[test]
 fn test_picking_a_window_during_cmd_shift_4_never_discards() {
-    // ⌘⇧4, Space, then sweeping back and forth across windows to choose one.
+    // Win+Shift+S, Space, then sweeping back and forth across windows to choose one.
     let mut gate = ShakeGate::new();
     gate.screenshot_ui_shown();
     assert_eq!(

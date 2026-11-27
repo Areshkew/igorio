@@ -1,8 +1,7 @@
-//! The fairy's own settings: which capabilities are on, where notes and captures go, and
+//! The app's own settings: which capabilities are on, where notes and captures go, and
 //! a couple of switches. Stored as `%APPDATA%\Igorio\settings.json`.
 //!
-//! Ported in spirit from `AppSettings.swift` and `CapabilityRegistry.swift`: a capability
-//! that is not listed in the file is ON, so new capabilities arrive enabled.
+//! A capability that is not listed in the file is ON, so new capabilities arrive enabled.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -24,7 +23,13 @@ use crate::notes::summoner::ToolMenu;
 use crate::shortcuts::Shortcuts;
 
 /// Sub-folder of Documents where notes are kept by default.
-const NOTES_FOLDER_NAME: &str = "Fairy Notes";
+const NOTES_FOLDER_NAME: &str = "Igorio Notes";
+/// Migration: the default notes folder before the app was renamed. Only
+/// [`Settings::keep_old_notes_folder`] reads it.
+const OLD_NOTES_FOLDER_NAME: &str = "Fairy Notes";
+/// Migration: capability ids started with this before the app was renamed. Only
+/// `capabilities_with_old_ids` reads it.
+const OLD_CAPABILITY_PREFIX: &str = "fairy.";
 /// Counter used to give temp files distinct names within one process.
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -32,6 +37,7 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 #[serde(default)]
 pub struct Settings {
     /// Capability id -> switched on. A capability that is not listed is ON (new ones arrive enabled).
+    #[serde(deserialize_with = "capabilities_with_old_ids")]
     pub capabilities: BTreeMap<String, bool>,
     /// None means "use the default folder".
     pub notes_folder: Option<PathBuf>,
@@ -65,6 +71,29 @@ where
 {
     let value = serde_json::Value::deserialize(deserializer)?;
     Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// Reads the capability switches. Migration: ids were `fairy.*` before the app was renamed
+/// and are `igorio.*` now. An old id is read once as its new id; when the file has both, the
+/// new id wins. Saving writes only what is in the map, so only new ids are saved.
+fn capabilities_with_old_ids<'de, D>(deserializer: D) -> Result<BTreeMap<String, bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut capabilities = BTreeMap::new();
+    let mut old = Vec::new();
+    for (id, on) in BTreeMap::<String, bool>::deserialize(deserializer)? {
+        match id.strip_prefix(OLD_CAPABILITY_PREFIX) {
+            Some(rest) => old.push((format!("igorio.{rest}"), on)),
+            None => {
+                capabilities.insert(id, on);
+            }
+        }
+    }
+    for (id, on) in old {
+        capabilities.entry(id).or_insert(on);
+    }
+    Ok(capabilities)
 }
 
 impl Settings {
@@ -140,6 +169,26 @@ impl Settings {
         settings.guide_seen = true;
         settings.save(path)?;
         Ok(settings)
+    }
+
+    /// Migration from before the app was renamed: when no notes folder is chosen, the old
+    /// default (`Fairy Notes` next to the new default) exists and the new default does not,
+    /// the old folder becomes the chosen one, so existing notes stay in use. Nothing on disk
+    /// changes. Call it before anything creates the default folder. Returns true when the
+    /// setting changed; the caller saves.
+    pub fn keep_old_notes_folder(&mut self, defaults: &DefaultFolders) -> bool {
+        if self.notes_folder.is_some() || defaults.notes.exists() {
+            return false;
+        }
+        let Some(old) = defaults.notes.parent().map(|parent| parent.join(OLD_NOTES_FOLDER_NAME))
+        else {
+            return false;
+        };
+        if !old.is_dir() {
+            return false;
+        }
+        self.notes_folder = Some(old);
+        true
     }
 
     /// The folder to use for notes: a writable absolute path, otherwise the default.
@@ -231,7 +280,7 @@ pub struct DefaultFolders {
 }
 
 impl DefaultFolders {
-    /// Documents\Fairy Notes and the Screenshots known folder, through SHGetKnownFolderPath
+    /// Documents\Igorio Notes and the Screenshots known folder, through SHGetKnownFolderPath
     /// (FOLDERID_Documents, FOLDERID_Screenshots; never hard-code user paths, they may be
     /// redirected to OneDrive). Falls back to %USERPROFILE% sub-folders if a call fails.
     pub fn from_system() -> DefaultFolders {

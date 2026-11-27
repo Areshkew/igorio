@@ -16,14 +16,14 @@ or a focusable Edit control with no Value pattern. Read-only and password
 controls are excluded. A same-process focused editable control can qualify
 when its rectangle contains the click. Everything else is `CANVAS_OR_UNKNOWN`.
 
-| macOS roles in the reference | Windows UIA facts used here |
+| Role names in the core rules | Windows UIA facts used here |
 | --- | --- |
 | AXTextField, AXTextArea, AXSearchField | Edit; search fields commonly expose Edit |
 | AXComboBox | ComboBox with writable Value, or an Edit child |
 | AXSecureTextField | IsPassword |
 | AXEditableAncestor, settable text value on a generic role | Writable ancestor, TextEdit, or Text with IsReadOnly=false |
 | AXWindow, AXApplication, AXSheet, AXWebArea | Window and Document serve as traversal boundaries. UIA has no one-to-one mapping for application and sheet. |
-| Finder AXScrollArea, AXGroup, AXList, AXOutline, AXTable, AXBrowser, AXSplitGroup, AXLayoutArea, AXGrid | Pane, Group, List, Table, DataGrid, or Custom in a confirmed shell view |
+| File view AXScrollArea, AXGroup, AXList, AXOutline, AXTable, AXBrowser, AXSplitGroup, AXLayoutArea, AXGrid | Pane, Group, List, Table, DataGrid, or Custom in a confirmed shell view |
 | AXRow, AXCell, toolbar and menu roles | ListItem, DataItem, TreeItem, HeaderItem, ToolBar, Menu and related controls block a background verdict |
 
 ## What ran

@@ -1,6 +1,5 @@
 //! File Explorer and the desktop: which folder a window shows, answered off the UI thread
 //! within a deadline, and selecting a saved file in that window afterwards.
-//! From `FinderTarget.folder(for:)` and the reveal step after `FinderTarget.save`.
 //!
 //! [`crate::uia`] already says whether a double-click hit an Explorer window or the
 //! desktop, and `igorio_core::drop_policy` whether it hit empty background. This module
@@ -80,8 +79,8 @@
 //!
 //! # Reveal
 //!
-//! [`Explorer::reveal`] selects a saved file in the window's active view, like the macOS app
-//! selects it in Finder. The view learns about a new file from a change notification a
+//! [`Explorer::reveal`] selects a saved file in the window's active view, so the user sees
+//! where it went. The view learns about a new file from a change notification a
 //! moment after the write, so the controller schedules a few attempts
 //! ([`REVEAL_DELAYS`]) instead of the worker sleeping; a folder request always goes first.
 //! Each attempt checks that the view still shows the file's folder, parses the file name

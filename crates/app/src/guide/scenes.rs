@@ -1,9 +1,9 @@
-//! The small looping pictures of the guide, ported from `GuideScenes.swift`: an empty stage,
+//! The small looping pictures of the guide: an empty stage,
 //! one cursor arrow, and only what the gesture needs. Every scene is a pure function of time,
 //! so a loop always plays the same way and any moment can be drawn on its own (in a test, or
 //! as the still frame when motion is off).
 //!
-//! Coordinates are stage units (the Swift points): the stage is [`STAGE`] units, scaled to
+//! Coordinates are stage units: the stage is [`STAGE`] units, scaled to
 //! pixels by [`Stage::scale`]. Shapes go straight into a tiny-skia pixmap; the few words a
 //! scene shows (the recording timer, the typed note) come back as [`SceneText`] for the
 //! window to draw with GDI, like every other label.

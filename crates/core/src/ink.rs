@@ -12,10 +12,10 @@ pub enum InkTool {
 }
 
 impl InkTool {
-    /// `CaseIterable`: every tool, in declaration order.
+    /// Every tool, in declaration order.
     pub const ALL: [InkTool; 2] = [InkTool::Pen, InkTool::Highlighter];
 
-    /// The String raw value, unchanged from Swift.
+    /// The tool's name as text.
     pub fn as_str(self) -> &'static str {
         match self {
             InkTool::Pen => "pen",
@@ -23,7 +23,7 @@ impl InkTool {
         }
     }
 
-    /// `init(rawValue:)`.
+    /// The tool for a name from [`as_str`](Self::as_str).
     pub fn from_raw_value(value: &str) -> Option<InkTool> {
         match value {
             "pen" => Some(InkTool::Pen),
@@ -36,15 +36,15 @@ impl InkTool {
 /// The keys the ink answers to while recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InkKey {
-    /// ⌘⇧7: take the pen, or put it down if it's already in hand.
+    /// Pen shortcut (Ctrl+Shift+7 by default): take the pen, or put it down if it's already in hand.
     Pen,
-    /// ⌘⇧8: take the highlighter, or put it down if it's already in hand.
+    /// Highlighter shortcut (Ctrl+Shift+8 by default): take the highlighter, or put it down if it's already in hand.
     Highlighter,
     /// esc: back to the normal cursor.
     Done,
-    /// ⌘Z: take back the last stroke.
+    /// Ctrl+Z: take back the last stroke.
     Undo,
-    /// ⌫: wipe the screen, keep drawing.
+    /// Backspace: wipe the screen, keep drawing.
     Clear,
 }
 
