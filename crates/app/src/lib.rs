@@ -10,6 +10,7 @@ pub mod draw;
 pub mod drop_router;
 pub mod explorer;
 pub mod follower;
+pub mod guide;
 pub mod hook;
 pub mod ink_draw;
 pub mod input;

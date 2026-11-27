@@ -500,3 +500,25 @@ fn counting_the_recording_hint_on_a_locked_file_loses_nothing() {
     assert_eq!(loaded.recording_hints_shown, 1);
     assert!(!scratch.path("settings.json.bad").exists());
 }
+
+#[test]
+fn the_guide_seen_flag_reads_false_from_old_files_and_round_trips() {
+    let scratch = Scratch::new("guide");
+    let path = scratch.path("settings.json");
+    fs::write(&path, r#"{"launch_at_login": true, "recording_hints_shown": 2}"#).unwrap();
+    let settings = Settings::load(&path).unwrap();
+    assert!(!settings.guide_seen, "a file from before the guide reads as not seen");
+    assert!(!Settings::default().guide_seen);
+
+    let saved = Settings::note_guide_seen(&path).unwrap();
+    assert!(saved.guide_seen);
+    let loaded = Settings::load(&path).unwrap();
+    assert!(loaded.guide_seen);
+    assert!(loaded.launch_at_login, "the other settings are kept");
+    assert_eq!(loaded.recording_hints_shown, 2);
+    assert!(fs::read_to_string(&path).unwrap().contains("\"guide_seen\": true"));
+
+    // No file yet: it starts from the defaults.
+    let fresh = scratch.path("fresh.json");
+    assert!(Settings::note_guide_seen(&fresh).unwrap().guide_seen);
+}

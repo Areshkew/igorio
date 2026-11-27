@@ -367,6 +367,12 @@ shortcuts,
 launch at login), first-run guide. The folder settings exist from M3 as JSON values; this adds
 the pickers.
 
+The guide (`guide.rs`, `guide/scenes.rs`) is a window in the settings window's style on its
+own thread, not topmost, so the gestures work while it is open. It opens on start until
+`guide_seen` is set in settings.json, and from the tray's "Guide…". After a welcome page,
+each switched-on gesture gets a page with a looping picture, the user's own key chips and a
+"Try it now" line that turns into "Done" when the UI loop reports the gesture.
+
 Check: switching a capability off stops its hooks; settings survive a restart; after
 changing the captures folder, the next kept screenshot lands in the new folder; changing
 the card size resizes the pile on screen at once.
