@@ -1,11 +1,21 @@
 //! Non-interactive self-check of `igorio_app::notes::summoner`. Sends no input, moves
-//! nothing, launches nothing. Shows the pill at the cursor for about three seconds.
-//! Prints PASS or FAIL per check; exits 0 only if all pass.
+//! nothing, launches nothing. Shows the tool menu (two rows) at the cursor for about three
+//! seconds, without the gesture and without arming the click gate. Prints PASS or FAIL per
+//! check; exits 0 only if all pass.
 //!
-//! What it cannot check: the hook-level swallow of a click. A message posted to our own
-//! window does not pass through the low-level mouse hook, so check (b) only shows that our
-//! own window receives every posted click while the gate is off; the swallow itself is
-//! covered by the unit tests of `hook::ClickGate` and by `SUMMON_TEST.md`.
+//! Checks of the menu window: its styles (layered, click-through, topmost, no-activate, tool
+//! window), that the first row is under the cursor and the card inside the work area, that
+//! it is excluded from screen capture, that the whole window is click-through seen from
+//! another process (the click gate in the mouse hook takes the click on a row, never the
+//! window), that it never becomes the foreground window, and that it costs no CPU while
+//! hidden or shown and still. Whether the foreground window changed while the menu showed is
+//! printed as INFO (the person at the desktop may switch windows meanwhile).
+//!
+//! What it cannot check: the hook-level swallow of a click, and the gesture itself (both
+//! need real input). A message posted to our own window does not pass through the low-level
+//! mouse hook, so check (b) only shows that our own window receives every posted click while
+//! the gate is off; the swallow is covered by the unit tests of `hook::ClickGate`, the
+//! gesture by the unit tests of `notes::summoner` and by `SUMMON_TEST.md`.
 //!
 //! `summon_selftest --probe X Y HWND` is the helper mode: run as a separate process, it
 //! reports whether `WindowFromPoint` at (X, Y) finds the window HWND.
@@ -16,8 +26,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use igorio_app::hook::CLICK_GATE;
-use igorio_app::notes::summoner::{SummonConfig, Summoner};
-use igorio_app::overlay::ensure_dpi_awareness;
+use igorio_app::notes::summoner::{Bounds, SummonConfig, Summoner, ToolId};
+use igorio_app::overlay::{cursor_pos, ensure_dpi_awareness, monitor_at};
 use igorio_app::uia::Uia;
 use windows::Win32::Foundation::{FILETIME, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -103,27 +113,35 @@ fn run() -> Result<bool> {
     // SAFETY: created on this thread above.
     unsafe { DestroyWindow(window)? };
 
-    // c. Idle CPU with the pill hidden.
+    // c. Idle CPU with the menu hidden.
     pump_for(Duration::from_millis(300));
     let hidden = cpu_share(Duration::from_secs(2));
     pass &= report(
         hidden < IDLE_CPU,
         format_args!(
-            "c. idle CPU, pill hidden: {:.3}% of one core",
+            "c. idle CPU, menu hidden: {:.3}% of one core",
             hidden * 100.0
         ),
     );
 
-    // d. The pill window: shown at the cursor (the test mode does not arm the gate).
-    summoner.test_pill(true);
-    let hwnd = HWND(summoner.pill_window() as *mut _);
+    // d. The menu window: shown at the cursor with two rows (the test mode does not arm the
+    // gate).
+    // SAFETY: no arguments.
+    let foreground_before = unsafe { GetForegroundWindow() };
+    summoner.test_menu(Some(vec![ToolId::NewNote, ToolId::RecordScreen]));
+    let hwnd = HWND(summoner.menu_window() as *mut _);
     let mut foreground_hits = 0;
+    let mut foreground_changed = 0;
     let shown = Instant::now();
     while shown.elapsed() < Duration::from_millis(600) {
         pump_for(Duration::from_millis(20));
         // SAFETY: no arguments.
-        if unsafe { GetForegroundWindow() } == hwnd {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground == hwnd {
             foreground_hits += 1;
+        }
+        if foreground != foreground_before {
+            foreground_changed += 1;
         }
     }
     // SAFETY: reads flags of a window of this process.
@@ -138,7 +156,40 @@ fn run() -> Result<bool> {
     pass &= report(
         visible && style & wanted == wanted && !CLICK_GATE.is_armed(),
         format_args!(
-            "d. pill shown: layered, click-through, topmost, no-activate, tool window (style {style:#x}); gate still off"
+            "d. menu shown: layered, click-through, topmost, no-activate, tool window (style {style:#x}); gate still off"
+        ),
+    );
+    let cursor = cursor_pos();
+    let cursor = (cursor.x.round() as i32, cursor.y.round() as i32);
+    let area = monitor_at(cursor_pos()).work_area;
+    let work = Bounds {
+        left: area.x.round() as i32,
+        top: area.y.round() as i32,
+        right: (area.x + area.width).round() as i32,
+        bottom: (area.y + area.height).round() as i32,
+    };
+    let placed = summoner.menu_layout();
+    let mut window_rect = RECT::default();
+    // SAFETY: writes into a local.
+    unsafe { GetWindowRect(hwnd, &mut window_rect)? };
+    pass &= report(
+        placed.is_some_and(|l| {
+            l.rows == 2
+                && l.row_at(cursor) == Some(0)
+                && l.card.inside(&work)
+                && (
+                    window_rect.left,
+                    window_rect.top,
+                    window_rect.right,
+                    window_rect.bottom,
+                ) == (l.window.left, l.window.top, l.window.right, l.window.bottom)
+        }),
+        format_args!(
+            "d. two rows, the first under the cursor at {},{}, card {:?} inside the work area {:?}, window where placed",
+            cursor.0,
+            cursor.1,
+            placed.map(|l| l.card),
+            work
         ),
     );
     let mut affinity = 0;
@@ -146,11 +197,12 @@ fn run() -> Result<bool> {
     let affinity_ok = unsafe { GetWindowDisplayAffinity(hwnd, &mut affinity) }.is_ok();
     pass &= report(
         affinity_ok && affinity == WDA_EXCLUDEFROMCAPTURE.0,
-        format_args!("d. pill excluded from capture (affinity {affinity:#x})"),
+        format_args!("d. menu excluded from capture (affinity {affinity:#x})"),
     );
 
-    // e. Click-through seen from another process; the control run without
-    // WS_EX_TRANSPARENT shows the probe finds the pill when it should.
+    // e. Click-through seen from another process (the gate takes a click on a row, not the
+    // window); the control run without WS_EX_TRANSPARENT shows the probe finds the menu when
+    // it should.
     let mut rect = RECT::default();
     // SAFETY: writes into a local.
     unsafe { GetWindowRect(hwnd, &mut rect)? };
@@ -168,33 +220,43 @@ fn run() -> Result<bool> {
     pass &= report(
         !normal && control,
         format_args!(
-            "e. click-through from another process (WindowFromPoint at {},{} finds the pill: {normal}; control without WS_EX_TRANSPARENT: {control})",
+            "e. click-through from another process (WindowFromPoint at {},{} finds the menu: {normal}; control without WS_EX_TRANSPARENT: {control})",
             center.x, center.y
         ),
     );
 
-    // f. Idle CPU with the pill shown and still.
+    // f. Idle CPU with the menu shown and still.
     let still = cpu_share(Duration::from_secs(2));
     // SAFETY: no arguments.
-    if unsafe { GetForegroundWindow() } == hwnd {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground == hwnd {
         foreground_hits += 1;
+    }
+    if foreground != foreground_before {
+        foreground_changed += 1;
     }
     pass &= report(
         still < IDLE_CPU,
         format_args!(
-            "f. idle CPU, pill shown and still: {:.3}% of one core",
+            "f. idle CPU, menu shown and still: {:.3}% of one core",
             still * 100.0
         ),
     );
     pass &= report(
         foreground_hits == 0,
-        format_args!("f. the pill never became the foreground window ({foreground_hits} samples)"),
+        format_args!("f. the menu never became the foreground window ({foreground_hits} samples)"),
     );
-    summoner.test_pill(false);
+    println!(
+        "INFO f. the foreground window changed in {foreground_changed} samples while the menu showed (0 expected unless someone switched windows)"
+    );
+    summoner.test_menu(None);
     pump_for(Duration::from_millis(300));
     // SAFETY: reads a flag of a window of this process.
     let gone = !unsafe { IsWindowVisible(hwnd) }.as_bool();
-    pass &= report(gone, "f. the pill hides again");
+    pass &= report(
+        gone && summoner.menu_layout().is_none(),
+        "f. the menu hides again",
+    );
 
     // g. The keyboard hook's worst callback so far (the whole run, over two seconds).
     let (calls, worst) = summoner.key_hook_stats();
@@ -382,9 +444,9 @@ fn probe(x: &str, y: &str, hwnd: &str) -> Result<()> {
         x: x.parse()?,
         y: y.parse()?,
     };
-    let pill = hwnd.parse::<isize>()?;
+    let menu = hwnd.parse::<isize>()?;
     // SAFETY: plain value arguments.
     let hit = unsafe { GetAncestor(WindowFromPoint(point), GA_ROOT) };
-    println!("hit={}", hit.0 as isize == pill);
+    println!("hit={}", hit.0 as isize == menu);
     Ok(())
 }

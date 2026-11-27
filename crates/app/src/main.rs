@@ -18,7 +18,7 @@ use igorio_app::follower::Follower;
 use igorio_app::hook::{self, MouseEvent, MouseHook};
 use igorio_app::layout::CardSize;
 use igorio_app::notes::store::{NoteId, RecycleBin};
-use igorio_app::notes::summoner::{Block, SummonConfig, Summoner, SummonerEvent};
+use igorio_app::notes::summoner::{Block, SummonConfig, Summoner, SummonerEvent, ToolContext, ToolId};
 use igorio_app::notes::window::{Event as NotesEvent, Notes, NotesConfig, RecentNote, Theme};
 use igorio_app::overlay::{self, Overlay};
 use igorio_app::saver;
@@ -610,6 +610,9 @@ impl NotesFeature {
             return;
         }
         if let Some(running) = &mut self.active {
+            if let Some(summoner) = &mut running.summoner {
+                summoner.set_shortcuts(&settings.shortcuts);
+            }
             if running.chosen != settings.notes_folder {
                 // Rare and asked for: the folder check runs here.
                 let (folder, _) = settings.notes_dir(&DefaultFolders::from_system());
@@ -726,18 +729,33 @@ impl NotesFeature {
             summoner.drain(&mut summons);
             summoner.set_blocked(Block::Paste, drops.as_deref().is_some_and(Drops::busy));
             summoner.set_blocked(Block::Capture, state.hidden_for_capture());
+            // Recording is not built yet: the menu offers New note only.
+            summoner.set_tool_context(ToolContext {
+                notes: true,
+                recording_available: Action::ToggleRecording.available(),
+                cards_held: state.is_holding(),
+                ..ToolContext::default()
+            });
         }
         for event in summons.drain(..) {
             match event {
-                SummonerEvent::Summon(summon) => {
-                    let (x, y) = summon.point;
-                    // `new_note_frame` puts the card's top-left half a pill up and left of
-                    // the point, as `NotesController.create` does.
-                    running.notes.open_new(Point::new(f64::from(x), f64::from(y)), summon.origin.clone());
-                    self.log.line(
-                        now,
-                        &format!("notes: summon at ({x}, {y}) from {}", summon.origin.label()),
-                    );
+                SummonerEvent::ToolChosen(chosen) => {
+                    let (x, y) = chosen.point;
+                    match chosen.tool {
+                        // `new_note_frame` puts the card's top-left half a pill up and left of
+                        // the point, as `NotesController.create` does.
+                        ToolId::NewNote => {
+                            running.notes.open_new(Point::new(f64::from(x), f64::from(y)), chosen.origin.clone());
+                            self.log.line(
+                                now,
+                                &format!("notes: summon at ({x}, {y}) from {}", chosen.origin.label()),
+                            );
+                        }
+                        ToolId::RecordScreen if Action::ToggleRecording.available() => {
+                            self.log.line(now, &format!("record screen chosen at ({x}, {y}): not built yet"));
+                        }
+                        ToolId::RecordScreen => {}
+                    }
                 }
                 // The line starts with its own time on the same clock ("  1.234 summon: …").
                 SummonerEvent::Log(line) => {
