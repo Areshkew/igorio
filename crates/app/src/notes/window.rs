@@ -2491,13 +2491,18 @@ impl NoteWindow {
                     if visible <= 0.0 {
                         continue;
                     }
-                    let fill = if pressed {
-                        mix(palette.hover, palette.muted, 0.18)
-                    } else {
-                        palette.hover
-                    };
+                    // Delete is red, so it is never taken for a window button.
+                    let delete = index == 2;
+                    let red = delete_red(palette.dark);
+                    let base = if delete { mix(palette.paper, red, 0.14) } else { palette.hover };
+                    let fill = if pressed { mix(base, palette.muted, 0.18) } else { base };
                     canvas.fill(*rect, self.s(BUTTON / 2.0) as f32, fill, hover * visible);
-                    let ink = mix(palette.paper, mix(palette.muted, palette.text, hover), visible);
+                    let rest = if delete {
+                        mix(palette.muted, red, 0.75 + 0.25 * hover)
+                    } else {
+                        mix(palette.muted, palette.text, hover)
+                    };
+                    let ink = mix(palette.paper, rest, visible);
                     match index {
                         1 => hide_icon(&mut canvas, *rect, ink, self.dpi.get()),
                         2 => trash_icon(&mut canvas, *rect, ink, self.dpi.get()),
@@ -2673,6 +2678,12 @@ pub(super) fn focus_ring(
         bottom: shape.bottom + gap + ring / 2,
     };
     canvas.stroke(outer, (radius + gap + ring / 2) as f32, palette.text);
+}
+
+/// The delete button's red, for light and dark notes.
+fn delete_red(dark: bool) -> COLORREF {
+    // COLORREF is 0x00BBGGRR: #D93636 in light, #FF6B6B in dark.
+    if dark { COLORREF(0x006B6BFF) } else { COLORREF(0x003636D9) }
 }
 
 pub(super) fn trash_icon(canvas: &mut editor::Canvas<'_>, rect: RECT, ink: COLORREF, dpi: u32) {
