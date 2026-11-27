@@ -252,7 +252,8 @@ pub const HINT_PASTE_FAILED: &str = "couldn't paste · still holding it";
 pub const HINT_CANVAS_FAILED: &str = "nothing here took it · still holding it";
 pub const HINT_REST_FAILED: &str = "couldn't paste the rest";
 pub const HINT_NO_IMAGES: &str = "this field doesn't take images";
-pub const HINT_NO_VIDEOS: &str = "this field doesn't take videos";
+/// A file (a recording) was read by the target and nothing appeared in the field.
+pub const HINT_NO_FILES: &str = "this field doesn't take files · still holding it";
 pub const HINT_HOVER_PASTE: &str = "double-click to paste";
 pub const HINT_HOVER_SAVE: &str = "double-click to save here";
 pub const HINT_ELEVATED: &str = "can't reach this window";
@@ -1130,6 +1131,51 @@ fn judge(elapsed: f64, reads: Reads, canvas: bool, probe: Option<ProbeView>) -> 
     }
 }
 
+/// The outcome rule for a file payload (a recording staged as `CF_HDROP`). A read is never
+/// proof that a file was taken: Chromium and Electron read the clipboard on every Ctrl+V,
+/// and many composers then drop a file they cannot use. Only the probe can prove it.
+///
+/// - The probe saw the field change (its text, its images or its attachment-like elements,
+///   a file chip): accepted.
+/// - Nothing read it by `OutcomeRules`' no-read timeout: failed ("couldn't paste").
+/// - Read, and the probe answered and saw no change by [`PROBE_TIMEOUT`]: by the target (or
+///   probably the target) it refused the file ("doesn't take files"); by others only,
+///   uncertain.
+/// - Read, and no probe answered (or it cannot tell) by then: uncertain ("check the paste").
+/// - A delivery the user stopped never ends refused or failed after its keys: uncertain.
+pub fn file_verdict(
+    elapsed: f64,
+    reads: Reads,
+    probe: Option<ProbeView>,
+    cancelled: bool,
+) -> Verdict {
+    let found = if probe.is_some_and(|p| p.changed) {
+        Verdict::Accepted
+    } else {
+        let evidence = reads.target + reads.probable;
+        let judged = probe.is_some_and(|p| p.answered && p.can_tell);
+        if evidence + reads.other == 0 {
+            if elapsed >= OutcomeRules::default().no_read_timeout {
+                Verdict::Failed
+            } else {
+                Verdict::Pending
+            }
+        } else if elapsed < PROBE_TIMEOUT {
+            Verdict::Pending
+        } else if !judged {
+            Verdict::Uncertain
+        } else if evidence > 0 {
+            Verdict::Rejected
+        } else {
+            Verdict::Uncertain
+        }
+    };
+    match found {
+        Verdict::Rejected | Verdict::Failed if cancelled => Verdict::Uncertain,
+        other => other,
+    }
+}
+
 pub fn seen_from_outcome(outcome: Outcome, point: (i32, i32)) -> Seen {
     match outcome {
         Outcome::Found(snapshot) => Seen::Spot(Box::new(spot_from_snapshot(&snapshot, point))),
@@ -1378,7 +1424,8 @@ struct ProbeState {
 struct Job {
     id: CardId,
     first: bool,
-    movie: bool,
+    /// Staged as a file (a recording outside terminals): judged by [`file_verdict`].
+    file: bool,
     started: f64,
     payload: Pay,
     is_path: bool,
@@ -1892,7 +1939,10 @@ impl<S: Clone> Router<S> {
             self.phase = Phase::Idle;
             self.phase_wake = None;
         }
-        env.log(now, &format!("the note took {} card(s) → {hint}", ids.len()));
+        env.log(
+            now,
+            &format!("the note took {} card(s) → {hint}", ids.len()),
+        );
         state.deliver(ids, hint, now);
         self.state_changed = true;
         self.run(now, state, env);
@@ -2892,9 +2942,9 @@ impl<S: Clone> Router<S> {
                     d.probe.verify =
                         d.surface == Surface::Field && spot.focused.is_some_and(|f| f.single_line);
                     d.probe.before = spot.probe;
-                    d.probe.can_tell = spot
-                        .probe
-                        .is_some_and(|p| p.value.is_some() || p.images.is_some());
+                    d.probe.can_tell = spot.probe.is_some_and(|p| {
+                        p.value.is_some() || p.images.is_some() || p.attachments.is_some()
+                    });
                     env.log(
                         now,
                         &format!(
@@ -2986,7 +3036,7 @@ impl<S: Clone> Router<S> {
             job: Job {
                 id: first,
                 first: true,
-                movie: false,
+                file: false,
                 started: clicked_at,
                 payload: Pay::Failed,
                 is_path: false,
@@ -3120,7 +3170,7 @@ impl<S: Clone> Router<S> {
         d.job = Job {
             id,
             first,
-            movie: card.movie.is_some(),
+            file: matches!(payload, Pay::Ready(Payload::File(_))),
             started,
             payload,
             is_path,
@@ -3491,7 +3541,8 @@ impl<S: Clone> Router<S> {
                 // The probe verifies single-line fields, and any field whose reads came only
                 // from others (they may hide the target's).
                 let masked = reads.target + reads.probable == 0 && reads.other > 0;
-                let probing = d.probe.before.is_some() && (d.probe.verify || masked);
+                // A file is only ever proved by the probe: it always runs for one.
+                let probing = d.probe.before.is_some() && (d.probe.verify || masked || d.job.file);
                 if probing
                     && d.probe.after_req.is_none()
                     && d.probe.last_check.is_none_or(|t| now >= t + PROBE_INTERVAL)
@@ -3521,7 +3572,12 @@ impl<S: Clone> Router<S> {
                         "-"
                     }
                 );
-                match verdict(now - sent_at, reads, canvas, view, cancelled) {
+                let found = if d.job.file {
+                    file_verdict(now - sent_at, reads, view, cancelled)
+                } else {
+                    verdict(now - sent_at, reads, canvas, view, cancelled)
+                };
+                match found {
                     Verdict::Pending => Flow::Wait(Some(now + OUTCOME_POLL)),
                     Verdict::Accepted => {
                         let count = d.ids.len();
@@ -3551,8 +3607,8 @@ impl<S: Clone> Router<S> {
                         }
                     }
                     Verdict::Rejected => {
-                        let hint = if d.job.movie {
-                            HINT_NO_VIDEOS
+                        let hint = if d.job.file {
+                            HINT_NO_FILES
                         } else {
                             HINT_NO_IMAGES
                         };
@@ -3566,7 +3622,10 @@ impl<S: Clone> Router<S> {
                         )
                     }
                     Verdict::Uncertain => {
-                        if let Some(restore) = self.restore.as_mut() {
+                        // A late read proves an image landed, never a file.
+                        if !d.job.file
+                            && let Some(restore) = self.restore.as_mut()
+                        {
                             restore.late = Some((d.job.id, evidence));
                         }
                         self.fail(
@@ -3582,7 +3641,9 @@ impl<S: Clone> Router<S> {
                         )
                     }
                     Verdict::Failed => {
-                        if let Some(restore) = self.restore.as_mut() {
+                        if !d.job.file
+                            && let Some(restore) = self.restore.as_mut()
+                        {
                             restore.late = Some((d.job.id, evidence));
                         }
                         let hint = if !d.job.first {
@@ -4806,9 +4867,11 @@ impl Env for LiveEnv {
     }
 
     fn note_at(&self, (x, y): (i32, i32)) -> bool {
-        self.notes
-            .as_ref()
-            .is_some_and(|zones| zones.note_at(Point::new(f64::from(x), f64::from(y))).is_some())
+        self.notes.as_ref().is_some_and(|zones| {
+            zones
+                .note_at(Point::new(f64::from(x), f64::from(y)))
+                .is_some()
+        })
     }
 
     fn give_to_note(&mut self, point: (i32, i32), cards: Vec<HeldCard>) {
@@ -4917,7 +4980,13 @@ impl Drops {
     }
 
     /// The notes thread's `CardsTaken`. Returns true when the state changed (redraw).
-    pub fn note_took(&mut self, ids: &[CardId], hint: &str, state: &mut FairyState, now: f64) -> bool {
+    pub fn note_took(
+        &mut self,
+        ids: &[CardId],
+        hint: &str,
+        state: &mut FairyState,
+        now: f64,
+    ) -> bool {
         let Some(env) = self.env.as_mut() else {
             return false;
         };

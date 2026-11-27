@@ -253,10 +253,12 @@ struct Rig {
     /// When set, every probe (the focus check of each card and the probes after its keys)
     /// sees a multi-line composer holding this many images.
     images: Option<u32>,
+    /// File chips in that composer.
+    chips: u32,
 }
 
-/// The focused composer with `images` images, as a probe sees it.
-fn composer_with(images: u32) -> Seen {
+/// The focused composer with `images` images and `chips` file chips, as a probe sees it.
+fn composer_with(images: u32, chips: u32) -> Seen {
     let mut spot = nothing("T3 Code (Beta).exe");
     spot.point = Some(AT);
     spot.focused = Some(Focus {
@@ -269,6 +271,8 @@ fn composer_with(images: u32) -> Seen {
     spot.probe = Some(Probe {
         value: Some(ValueSignature::of("hello")),
         images: Some(images),
+        // The composer's own send button, plus every image and file chip.
+        attachments: Some(1 + images + chips),
     });
     Seen::Spot(Box::new(spot))
 }
@@ -287,6 +291,7 @@ fn focused_field(single_line: bool, value: &str) -> Seen {
     spot.probe = Some(Probe {
         value: Some(ValueSignature::of(value)),
         images: Some(0),
+        attachments: Some(0),
     });
     Seen::Spot(Box::new(spot))
 }
@@ -330,6 +335,7 @@ impl Rig {
             focus: Some(focused_field(false, "")),
             after: Some(focused_field(false, "")),
             images: None,
+            chips: 0,
         }
     }
 
@@ -383,7 +389,7 @@ impl Rig {
             let first = self.e.probes_answered == 0;
             self.e.probes_answered += 1;
             let seen = if let Some(images) = self.images {
-                Some(composer_with(images))
+                Some(composer_with(images, self.chips))
             } else if first {
                 self.focus.clone()
             } else {
@@ -4009,7 +4015,8 @@ fn a_note_that_never_answers_leaves_the_cards_on_the_pile_and_says_so() {
     assert_eq!(rig.s.reject_tick(), tick + 1);
     assert!(rig.e.logged("the note did not answer"));
     // A late answer still lets go of the cards it took: they are in the note.
-    rig.r.note_took(&ids, "added to note", 12.0, &mut rig.s, &mut rig.e);
+    rig.r
+        .note_took(&ids, "added to note", 12.0, &mut rig.s, &mut rig.e);
     assert!(rig.ids().is_empty());
 }
 
@@ -4065,7 +4072,8 @@ fn typing_in_the_note_while_it_takes_the_cards_does_not_stop_it() {
     rig.e.keys += 3;
     rig.to(1.0);
     assert!(rig.r.busy());
-    rig.r.note_took(&ids, "added to note", 1.0, &mut rig.s, &mut rig.e);
+    rig.r
+        .note_took(&ids, "added to note", 1.0, &mut rig.s, &mut rig.e);
     assert!(rig.ids().is_empty());
 }
 
@@ -4097,4 +4105,161 @@ fn a_delivery_in_progress_ignores_a_double_click_over_a_note() {
     rig.double_click_at(0.6);
     assert!(rig.e.gifts.is_empty(), "{:#?}", rig.e.log);
     assert!(rig.e.logged("busy=yes"));
+}
+
+// MARK: Recordings: a file is only taken when the field shows it
+
+/// Holds a recording on top of the pile (it was captured last).
+fn hold_recording(rig: &mut Rig) {
+    rig.s.hold(
+        image(),
+        1.0,
+        SystemTime::UNIX_EPOCH,
+        true,
+        Some(PathBuf::from(r"C:\Videos\clip one.mp4")),
+        Some(3.0),
+        -5.0,
+    );
+}
+
+/// The owner's log: the composer reads the file (windowless, probably the target) and shows
+/// nothing. The card stays, with the file hint.
+#[test]
+fn a_recording_the_composer_reads_but_does_not_show_keeps_its_card() {
+    let mut rig = Rig::with_movie();
+    let id = rig.ids()[0];
+    rig.images = Some(0);
+    let sent = paste_pile_into_composer(&mut rig);
+    assert!(matches!(rig.e.stages[0].1, Payload::File(_)));
+    rig.read_by(sent + 0.03, 1, None);
+    rig.to(sent + 0.5);
+    assert!(
+        rig.s.card(id).is_some(),
+        "a read is no proof: {:#?}",
+        rig.e.log
+    );
+    rig.to(sent + 3.2);
+    assert!(rig.s.card(id).is_some());
+    assert_eq!(rig.s.hint(), Some(HINT_NO_FILES));
+    // The probe ran although the composer is multi-line.
+    assert!(rig.e.lookups.iter().filter(|l| l.4).count() >= 5);
+}
+
+/// A file chip appears in the composer: the recording was taken.
+#[test]
+fn a_recording_that_shows_a_file_chip_is_delivered() {
+    let mut rig = Rig::with_movie();
+    let id = rig.ids()[0];
+    rig.images = Some(0);
+    let sent = paste_pile_into_composer(&mut rig);
+    rig.chips = 1;
+    rig.read_by(sent + 0.03, 1, None);
+    rig.to(sent + 0.6);
+    assert!(rig.s.card(id).is_none(), "{:#?}", rig.e.log);
+    assert!(rig.e.logged("probe: the field changed"));
+}
+
+/// Read, but no probe answers: nothing can prove it either way.
+#[test]
+fn a_recording_whose_probe_cannot_answer_says_check_the_paste() {
+    let mut rig = Rig::with_movie();
+    let id = rig.ids()[0];
+    rig.after = None;
+    rig.double_click();
+    rig.answer(0.17, composer());
+    rig.remembered_arrives(0.18);
+    rig.up(0.25);
+    rig.to(0.40);
+    rig.staged_reply(0.41);
+    rig.read_by(0.44, 1, None);
+    rig.to(3.6);
+    assert!(rig.s.card(id).is_some());
+    assert_eq!(rig.s.hint(), Some(HINT_UNCERTAIN), "{:#?}", rig.e.log);
+}
+
+/// Nothing reads the file: the keys went nowhere.
+#[test]
+fn a_recording_nothing_reads_says_couldnt_paste() {
+    let mut rig = Rig::with_movie();
+    let id = rig.ids()[0];
+    rig.images = Some(0);
+    let sent = paste_pile_into_composer(&mut rig);
+    rig.to(sent + 1.7);
+    assert!(rig.s.card(id).is_some());
+    assert_eq!(rig.s.hint(), Some(HINT_PASTE_FAILED));
+}
+
+/// An image into the same composer still follows the image rule: a read by the target is
+/// enough there.
+#[test]
+fn an_image_into_the_composer_still_follows_the_image_rule() {
+    let mut rig = Rig::new(1);
+    let id = rig.ids()[0];
+    rig.images = Some(0);
+    let sent = paste_pile_into_composer(&mut rig);
+    rig.read_by(sent + 0.03, 1, None);
+    rig.to(sent + 0.3);
+    assert!(rig.s.card(id).is_none(), "{:#?}", rig.e.log);
+}
+
+/// A mixed pile: each card is judged by its own payload, and a card that is not proved
+/// stops the pile.
+#[test]
+fn a_mixed_pile_judges_each_card_by_its_payload() {
+    // Recording on top, refused: it stays, the screenshot under it is not tried.
+    let mut rig = Rig::new(1);
+    hold_recording(&mut rig);
+    let ids = rig.ids();
+    rig.images = Some(0);
+    let sent = paste_pile_into_composer(&mut rig);
+    rig.read_by(sent + 0.03, 1, None);
+    rig.to(sent + 4.0);
+    assert!(rig.s.card(ids[0]).is_some() && rig.s.card(ids[1]).is_some());
+    assert_eq!(rig.s.hint(), Some(HINT_NO_FILES));
+    assert_eq!(rig.e.stages.len(), 1);
+
+    // Recording on top, taken (a chip): then the screenshot follows the image rule.
+    let mut rig = Rig::new(1);
+    hold_recording(&mut rig);
+    let ids = rig.ids();
+    rig.images = Some(0);
+    let sent = paste_pile_into_composer(&mut rig);
+    rig.chips = 1;
+    rig.read_by(sent + 0.03, 1, None);
+    rig.to(sent + 0.6);
+    assert!(rig.s.card(ids[0]).is_none(), "{:#?}", rig.e.log);
+    rig.to(sent + 0.6 + 0.45 + 0.4);
+    assert_eq!(rig.e.stages.len(), 2, "{:#?}", rig.e.log);
+    let second = rig.now;
+    rig.staged_reply(second);
+    rig.read_by(second + 0.03, 1, None);
+    rig.to(second + 0.3);
+    assert!(rig.s.card(ids[1]).is_none(), "{:#?}", rig.e.log);
+
+    // Screenshot on top, then a recording the composer ignores: the screenshot leaves, the
+    // recording stays with the file hint.
+    let mut rig = Rig::with_movie();
+    rig.s.hold(
+        image(),
+        1.0,
+        SystemTime::UNIX_EPOCH,
+        false,
+        None,
+        None,
+        -5.0,
+    );
+    let ids = rig.ids();
+    rig.images = Some(0);
+    let sent = paste_pile_into_composer(&mut rig);
+    rig.images = Some(1);
+    rig.read_by(sent + 0.03, 1, None);
+    rig.to(sent + 0.3);
+    assert!(rig.s.card(ids[0]).is_none(), "{:#?}", rig.e.log);
+    rig.to(sent + 0.3 + 0.45 + 0.4);
+    let second = rig.now;
+    rig.staged_reply(second);
+    rig.read_by(second + 0.03, 1, None);
+    rig.to(second + 3.5);
+    assert!(rig.s.card(ids[1]).is_some(), "{:#?}", rig.e.log);
+    assert_eq!(rig.s.hint(), Some(HINT_NO_FILES));
 }

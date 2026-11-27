@@ -319,6 +319,36 @@ pub struct Probe {
     pub value: Option<ValueSignature>,
     /// Image elements under the container; None when the search did not run.
     pub images: Option<u32>,
+    /// Attachment-like elements under the container ([`ATTACHMENT_CONTROL_TYPES`]),
+    /// images included; None when the search did not run.
+    pub attachments: Option<u32>,
+}
+
+/// What a pasted file or picture looks like in a composer through UI Automation, counted
+/// by the probe: a thumbnail or an inline picture (`Image`); a file chip, which is a list
+/// item in the attachment list, a link to the file, or carries a remove button (`ListItem`,
+/// `Hyperlink`, `Button`). Generic groups are not counted: Chromium exposes many, and a
+/// `<video>` is one of them without a type of its own, so a video shows up through its
+/// chip or poster instead.
+pub const ATTACHMENT_CONTROL_TYPES: &[UIA_CONTROLTYPE_ID] = &[
+    UIA_ImageControlTypeId,
+    UIA_ListItemControlTypeId,
+    UIA_HyperlinkControlTypeId,
+    UIA_ButtonControlTypeId,
+];
+
+/// (images, attachments) among elements of these control types.
+pub fn count_attachments(control_types: impl IntoIterator<Item = i32>) -> (u32, u32) {
+    let mut counts = (0, 0);
+    for control in control_types {
+        if control == UIA_ImageControlTypeId.0 {
+            counts.0 += 1;
+        }
+        if ATTACHMENT_CONTROL_TYPES.iter().any(|t| t.0 == control) {
+            counts.1 += 1;
+        }
+    }
+    counts
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,7 +384,9 @@ impl Probe {
         let value = matches!((self.value, before.value), (Some(a), Some(b)) if a != b)
             || self.value.is_some() != before.value.is_some();
         let images = matches!((self.images, before.images), (Some(a), Some(b)) if a != b);
-        value || images
+        let attachments =
+            matches!((self.attachments, before.attachments), (Some(a), Some(b)) if a != b);
+        value || images || attachments
     }
 }
 
@@ -1718,7 +1750,10 @@ struct UiaSession {
     walker: IUIAutomationTreeWalker,
     cache: IUIAutomationCacheRequest,
     nearby: IUIAutomationCondition,
-    images: IUIAutomationCondition,
+    /// Any of [`ATTACHMENT_CONTROL_TYPES`].
+    attachments: IUIAutomationCondition,
+    /// Only the control type: what the probe's search brings back with each element.
+    types_only: IUIAutomationCacheRequest,
     own_pid: u32,
     calls: Arc<AtomicU64>,
     _apartment: Apartment,
@@ -1743,12 +1778,21 @@ impl UiaSession {
             unsafe { cache.AddProperty(property)? };
         }
         let nearby = nearby_condition(&automation)?;
-        // SAFETY: in-process call; the variant holds no pointer and outlives the call.
-        let images = unsafe {
-            automation.CreatePropertyCondition(
-                UIA_ControlTypePropertyId,
-                &i32_variant(UIA_ImageControlTypeId.0),
-            )?
+        // SAFETY: in-process calls; the variants hold no pointers and outlive the calls.
+        let (attachments, types_only) = unsafe {
+            let mut any = Vec::new();
+            for control in ATTACHMENT_CONTROL_TYPES {
+                any.push(Some(automation.CreatePropertyCondition(
+                    UIA_ControlTypePropertyId,
+                    &i32_variant(control.0),
+                )?));
+            }
+            let types_only = automation.CreateCacheRequest()?;
+            types_only.AddProperty(UIA_ControlTypePropertyId)?;
+            (
+                automation.CreateOrConditionFromNativeArray(&any)?,
+                types_only,
+            )
         };
         Ok(UiaSession {
             automation,
@@ -1756,7 +1800,8 @@ impl UiaSession {
             walker,
             cache,
             nearby,
-            images,
+            attachments,
+            types_only,
             own_pid,
             calls,
             _apartment: apartment,
@@ -2008,13 +2053,27 @@ impl UiaSession {
             container = parent.clone();
             current = parent;
         }
-        // SAFETY: as above; the condition lives in `self`.
-        match budget.call(|| unsafe { container.FindAll(TreeScope_Descendants, &self.images) }) {
+        // One call: every attachment-like element, each with its control type cached, so
+        // images and the rest are told apart locally.
+        // SAFETY: as above; the condition and the cache request live in `self`.
+        match budget.call(|| unsafe {
+            container.FindAllBuildCache(TreeScope_Descendants, &self.attachments, &self.types_only)
+        }) {
             Err(Stop::Expired) => return None,
             Err(Stop::Cap) | Ok(Err(_)) => {}
             Ok(Ok(array)) => {
-                // SAFETY: an in-process read of the array UI Automation returned.
-                probe.images = unsafe { array.Length() }.ok().map(|n| n.max(0) as u32);
+                // SAFETY: in-process reads of the array UI Automation returned and of the
+                // cache each element came with.
+                let types = unsafe {
+                    let count = array.Length().unwrap_or(0).max(0);
+                    (0..count)
+                        .filter_map(|i| array.GetElement(i).ok())
+                        .map(|e| e.CachedControlType().map_or(0, |c| c.0))
+                        .collect::<Vec<_>>()
+                };
+                let (images, attachments) = count_attachments(types);
+                probe.images = Some(images);
+                probe.attachments = Some(attachments);
             }
         }
         Some(probe)
@@ -2343,11 +2402,36 @@ mod tests {
     }
 
     #[test]
+    fn a_new_file_chip_is_a_change() {
+        let before = Probe {
+            value: Some(ValueSignature::of("hi")),
+            images: Some(0),
+            attachments: Some(2),
+        };
+        // A chip (a list item with a remove button) appeared; no image, same text.
+        let after = Probe {
+            attachments: Some(4),
+            ..before
+        };
+        assert!(after.changed_from(&before));
+        assert!(!before.changed_from(&before));
+        let types = [
+            UIA_ImageControlTypeId.0,
+            UIA_ListItemControlTypeId.0,
+            UIA_ButtonControlTypeId.0,
+            UIA_HyperlinkControlTypeId.0,
+            UIA_GroupControlTypeId.0,
+        ];
+        assert_eq!(count_attachments(types), (1, 4));
+    }
+
+    #[test]
     fn probes_compare_value_and_images() {
         let sig = |t: &str| Some(ValueSignature::of(t));
         let before = Probe {
             value: sig("abc"),
             images: Some(1),
+            attachments: Some(3),
         };
         assert!(!before.changed_from(&before));
         assert!(
