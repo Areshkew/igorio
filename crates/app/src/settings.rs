@@ -358,10 +358,18 @@ mod tests {
             &[
                 MenuEntry { tool: ToolId::RecordScreen, shown: false },
                 MenuEntry { tool: ToolId::NewNote, shown: true },
+                MenuEntry { tool: ToolId::PinCard, shown: true },
             ]
         );
         let json = serde_json::to_value(&partial).unwrap();
-        assert_eq!(json["tool_menu"], serde_json::json!([{"id": "record", "shown": false}, {"id": "note", "shown": true}]));
+        assert_eq!(
+            json["tool_menu"],
+            serde_json::json!([
+                {"id": "record", "shown": false},
+                {"id": "note", "shown": true},
+                {"id": "pin", "shown": true}
+            ])
+        );
         assert_eq!(serde_json::from_value::<Settings>(json).unwrap(), partial);
     }
 }

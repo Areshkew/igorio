@@ -24,6 +24,7 @@ use igorio_app::notes::store::{NoteId, RecycleBin};
 use igorio_app::notes::summoner::{Block, SummonConfig, Summoner, SummonerEvent, ToolContext, ToolId};
 use igorio_app::notes::window::{Event as NotesEvent, Notes, NotesConfig, RecentNote, Theme};
 use igorio_app::overlay::{self, Overlay};
+use igorio_app::pins::{self, Event as PinEvent, Pins};
 use igorio_app::recording::feature::{self as rec, RecordingFeature, RecordingState};
 use igorio_app::saver;
 use igorio_app::settings::{self, DefaultFolders, Settings};
@@ -71,6 +72,8 @@ const MENU_GUIDE: u32 = 10;
 const MENU_NOTE_BASE: u32 = 100;
 /// How long stopping the notes may take: saving the text and closing the windows.
 const NOTES_STOP: Duration = Duration::from_secs(2);
+/// How long closing the pins may take.
+const PINS_STOP: Duration = Duration::from_secs(1);
 /// How long the normal quit waits for a recording in progress to be finished. Bounded by the recorder's own shutdown wait.
 const RECORDING_STOP: Duration = Duration::from_secs(3);
 /// At session end Windows may end the process a few seconds after WM_ENDSESSION, so the quit
@@ -152,6 +155,48 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Pin to screen (the tool menu, at `at`, or the shortcut, at the cursor): the top card
+    /// leaves the pile and stays on the screen centred on `at`.
+    fn pin_top(&mut self, pins: Option<&Pins>, at: Point, now: f64) {
+        if !self.state.is_holding() {
+            return;
+        }
+        let Some(pins) = pins else {
+            self.state.reject("pinning is off", now);
+            self.dirty = true;
+            return;
+        };
+        if !pins::can_pin(pins.count()) {
+            self.state.reject(pins::FULL_HINT, now);
+        } else if let Some(card) = self.state.take_top("pinned", now) {
+            pins.pin(card, at);
+        }
+        self.dirty = true;
+    }
+
+    /// What the pins asked for. A double-click on a pin carries its card again, unless cards
+    /// are in hand: a pin takes no cards, so it wobbles "no" as other refused drops do. Returns
+    /// the errors to tell the user.
+    fn pin_events(&mut self, pins: Option<&Pins>, now: f64) -> Vec<String> {
+        let Some(pins) = pins else { return Vec::new() };
+        let mut errors = Vec::new();
+        for event in pins.events() {
+            match event {
+                PinEvent::Carry { double_click: true, .. } if self.state.is_holding() => {
+                    self.state.reject(pins::REFUSE_HINT, now);
+                }
+                PinEvent::Carry { pin, card, .. } => {
+                    pins.take(pin);
+                    self.state.hold(card.image, card.scale, card.captured_at, card.kept, card.movie, card.duration, now);
+                    self.shake.captured();
+                }
+                PinEvent::Error(message) => errors.push(message),
+            }
+            self.dirty = true;
+        }
+        errors
     }
 
     fn capture_ui(&mut self, shown: bool, time: f64) {
@@ -597,6 +642,8 @@ struct NotesFeature {
     summoner_events: Vec<SummonerEvent>,
     /// The tool menu's Record screen was chosen: the loop hands it to the recording.
     record: bool,
+    /// The tool menu's Pin to screen was chosen here: the loop pins the top card.
+    pin_at: Option<Point>,
     /// The tool menu opened: the loop tells the guide.
     menu_opened: bool,
 }
@@ -626,6 +673,7 @@ impl NotesFeature {
             shown: Vec::new(),
             summoner_events: Vec::new(),
             record: false,
+            pin_at: None,
             menu_opened: false,
         }
     }
@@ -827,6 +875,10 @@ impl NotesFeature {
                         ToolId::RecordScreen => {
                             self.record = true;
                             self.log.line(now, &format!("record screen chosen at ({x}, {y})"));
+                        }
+                        ToolId::PinCard => {
+                            self.pin_at = Some(Point::new(f64::from(x), f64::from(y)));
+                            self.log.line(now, &format!("pin to screen chosen at ({x}, {y})"));
                         }
                     }
                 }
@@ -1079,6 +1131,7 @@ struct Parts {
     hotkeys: Option<Hotkeys>,
     detector: Detector,
     drops: Option<Drops>,
+    pins: Option<Pins>,
 }
 
 /// What session end leaves running. Windows ends it with the process; if the process lives
@@ -1148,7 +1201,7 @@ impl Quit {
     /// clipboard restore 1 s, the clipboard thread 2 s, UI Automation 1.5 s, the key watch 1 s,
     /// the Explorer lookup 1 s and the PNG saver 1 s. About 18.3 s with nothing in flight.
     fn stop_all(&self, parts: Parts) {
-        let Parts { settings, settings_window, mut guide, mut hotkeys, detector, drops } = parts;
+        let Parts { settings, settings_window, mut guide, mut hotkeys, detector, drops, pins } = parts;
         // The settings window goes first: a shortcut being recorded in it resumes the hotkeys.
         let service = hotkeys.as_ref().map(|hotkeys| hotkeys as &dyn ShortcutService);
         settings_window.shutdown(service, &settings.snapshot.shortcuts);
@@ -1172,6 +1225,12 @@ impl Quit {
             self.problem("the shortcut thread did not stop within its shutdown budget");
         }
         self.line("quit: shortcuts stopped");
+        if let Some(pins) = pins
+            && !pins.shutdown(PINS_STOP)
+        {
+            self.problem("the pins thread did not stop within its budget");
+        }
+        self.line("quit: pins closed");
         // The note gesture, then the notes (pending text written), then the workers they use.
         match self.notes.try_borrow_mut() {
             Ok(mut notes) => notes.stop_now(),
@@ -1489,7 +1548,17 @@ fn main() -> windows::core::Result<()> {
             None
         }
     };
+    // Pinned cards; without them the rest of the app works as before.
+    let pins = match Pins::start(settings.snapshot.captures_folder.clone(), None) {
+        Ok(pins) => Some(pins),
+        Err(error) => {
+            eprintln!("pinning is off: {error}");
+            None
+        }
+    };
     let mut presses = Vec::new();
+    // Where to pin the top card this pass (the tool menu's point, or the cursor).
+    let mut pin_requests: Vec<Point> = Vec::new();
     let mut snip_events = Vec::new();
     let mut wakes = vec![mouse_hook.wake_handle(), settings_window.wake_handle()];
     if let Some(hotkeys) = &hotkeys {
@@ -1497,6 +1566,9 @@ fn main() -> windows::core::Result<()> {
     }
     if let Some(drops) = &drops {
         wakes.extend(drops.wake_handles());
+    }
+    if let Some(pins) = &pins {
+        wakes.push(pins.wake_handle());
     }
     let permanent_wakes = wakes.len();
     // From here every way out of `main` runs the one quit path (see `Quit` for the order).
@@ -1508,6 +1580,7 @@ fn main() -> windows::core::Result<()> {
             hotkeys,
             detector: Detector::default(),
             drops,
+            pins,
         }),
         notes: Rc::clone(&notes),
         recording: Rc::clone(&recording),
@@ -1549,7 +1622,7 @@ fn main() -> windows::core::Result<()> {
         let Some(mut parts) = quit.parts.get() else {
             break;
         };
-        let Parts { settings, settings_window, guide, hotkeys, detector, drops } = &mut *parts;
+        let Parts { settings, settings_window, guide, hotkeys, detector, drops, pins } = &mut *parts;
         let now = hook::now();
         if let Some(hotkeys) = &hotkeys {
             hotkeys.drain(&mut presses);
@@ -1561,6 +1634,7 @@ fn main() -> windows::core::Result<()> {
                 Action::ToggleRecording => recording.borrow_mut().request_toggle(),
                 Action::Pen => recording.borrow_mut().tool_shortcut(InkTool::Pen, now),
                 Action::Highlighter => recording.borrow_mut().tool_shortcut(InkTool::Highlighter, now),
+                Action::PinTop => pin_requests.push(overlay::cursor_pos()),
                 action => app.borrow_mut().shortcut(action, now),
             }
         }
@@ -1583,6 +1657,9 @@ fn main() -> windows::core::Result<()> {
             *settings = saved.into();
             if let Some(drops) = drops.as_mut() {
                 drops.set_settings(&settings.snapshot);
+            }
+            if let Some(pins) = pins.as_ref() {
+                pins.set_captures_folder(settings.snapshot.captures_folder.clone());
             }
             let mut app = app.borrow_mut();
             app.apply_card_size(settings.card_size, now);
@@ -1664,6 +1741,17 @@ fn main() -> windows::core::Result<()> {
             if notes.borrow_mut().pass(&mut app.state, drops.as_mut(), facts, now) {
                 app.dirty = true;
                 router_due = drops.as_ref().and_then(Drops::next_deadline);
+            }
+            pin_requests.extend(notes.borrow_mut().pin_at.take());
+            for at in pin_requests.drain(..) {
+                app.pin_top(pins.as_ref(), at, now);
+            }
+            for error in app.pin_events(pins.as_ref(), now) {
+                if app.state.is_holding() {
+                    app.state.flash_hint(&overlay_hint(&error), 2.5, now);
+                } else if let Err(problem) = tray.notice("Igorio", &error) {
+                    eprintln!("{error} ({problem})");
+                }
             }
             // What the guide's "Try it now" lines wait for.
             if std::mem::take(&mut notes.borrow_mut().menu_opened) {

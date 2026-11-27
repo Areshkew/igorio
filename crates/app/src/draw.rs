@@ -897,6 +897,36 @@ fn seconds_label(total: u64) -> String {
     format!("{}:{:02}", total / 60, total % 60)
 }
 
+/// The image filling a `width` x `height` pixmap (premultiplied RGBA), for a pinned card:
+/// box-filtered where it shrinks, as the pile's cards are, and bilinear where it grows.
+pub fn fit_image(image: &Image, width: u32, height: u32) -> Option<Pixmap> {
+    let (width, height) = (width.max(1), height.max(1));
+    let base = reduce_image(image, width.min(image.width), height.min(image.height));
+    if base.width() == width && base.height() == height {
+        return Some(base);
+    }
+    let mut out = Pixmap::new(width, height)?;
+    let transform = Transform::from_scale(
+        width as f32 / base.width() as f32,
+        height as f32 / base.height() as f32,
+    );
+    let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..PixmapPaint::default() };
+    out.draw_pixmap(0, 0, base.as_ref(), &paint, transform, None);
+    Some(out)
+}
+
+/// The recording badge (a play triangle and the length) in the bottom-left corner of a card
+/// that fills `pixmap`, at `scale` (physical px per DIP), as the pile draws it on its cards.
+pub fn draw_movie_badge(pixmap: &mut Pixmap, duration: Option<f64>, scale: f64) {
+    static FONT: std::sync::OnceLock<Font> = std::sync::OnceLock::new();
+    let font = FONT.get_or_init(|| {
+        Font::from_bytes(theme::FONT_SEMIBOLD, FontSettings::default())
+            .expect("embedded Barlow font")
+    });
+    let card = (pixmap.width() as f32, pixmap.height() as f32);
+    draw_badge(font, pixmap, badge_key(Some(duration)), scale as f32, (0.0, 0.0), card);
+}
+
 fn badge_key(movie: Option<Option<f64>>) -> Option<Option<u64>> {
     movie.map(|duration| duration.map(|seconds| seconds.max(0.0).round() as u64))
 }

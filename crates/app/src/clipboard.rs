@@ -492,6 +492,23 @@ pub fn sequence() -> u32 {
     unsafe { GetClipboardSequenceNumber() }
 }
 
+/// Puts an image on the clipboard as the user's own copy (a pin's Copy): "PNG" and `CF_DIBV5`,
+/// written at once and without the rule 5 markers, so it is in `Win+V` history like any copy.
+/// `window` must belong to the calling thread; it becomes the clipboard owner, which tells the
+/// screenshot detector the copy is ours. Blocks for the open retry (rule 4) and while the
+/// previous owner answers `WM_DESTROYCLIPBOARD`: call it on a worker, never on the UI thread
+/// or a hook thread.
+pub fn copy_image(window: HWND, image: &Image) -> Result<(), ClipError> {
+    let png = encode_png(image).map_err(|error| ClipError::Payload(error.to_string()))?;
+    let dib = dibv5(image);
+    let _open = Open::new(window)?;
+    // SAFETY: the clipboard is open by this thread; it sends `WM_DESTROYCLIPBOARD` to the
+    // previous owner, which is why this runs on a worker.
+    unsafe { EmptyClipboard() }.map_err(|error| win32("EmptyClipboard", &error))?;
+    Global::new(&png)?.set(ids().png)?;
+    Global::new(&dib)?.set(DIBV5)
+}
+
 /// A readable name for a format id: the registered name, or the `CF_` name.
 pub fn format_name(id: u32) -> String {
     if id >= 0xC000

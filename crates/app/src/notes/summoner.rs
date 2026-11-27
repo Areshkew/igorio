@@ -1,6 +1,6 @@
 //! The tool menu at the cursor: hold Alt on its own anywhere except over a text field (a
 //! button, a link, page text, the desktop, a window background) and a small menu of tools
-//! opens under the cursor (New note, Record screen; [`TOOLS`], in the order the user chose in
+//! opens under the cursor (New note, Record screen, Pin to screen; [`TOOLS`], in the order the user chose in
 //! the settings, hidden ones left out: [`ToolMenu`]). Its first row sits under the cursor, so
 //! "hold Alt, click" runs the first tool (a new note by default) in one click; moving to another row and
 //! clicking runs that tool. The click is swallowed, so the app underneath never sees an
@@ -386,6 +386,7 @@ impl Block {
 pub enum ToolId {
     NewNote,
     RecordScreen,
+    PinCard,
 }
 
 impl ToolId {
@@ -409,6 +410,8 @@ pub enum Icon {
     NoteSheet,
     /// A record dot.
     RecordDot,
+    /// A push pin.
+    Pin,
 }
 
 /// What kind of spot the menu opens over (from the lookup that allowed it).
@@ -490,6 +493,14 @@ pub const TOOLS: &[Tool] = &[
         icon: Icon::RecordDot,
         action: shortcuts::Action::ToggleRecording,
         offered: |c| c.recording_available && c.recording_enabled && !c.recording,
+    },
+    Tool {
+        id: ToolId::PinCard,
+        id_text: "pin",
+        label: "Pin to screen",
+        icon: Icon::Pin,
+        action: shortcuts::Action::PinTop,
+        offered: |c| c.cards_held,
     },
 ];
 
@@ -1993,6 +2004,45 @@ fn icon_pixmap(icon: Icon, scale: f64, palette: &Palette) -> Option<Pixmap> {
                     Transform::identity(),
                     None,
                 );
+            }
+        }
+        Icon::Pin => {
+            // A push pin seen from the side: a cap, a narrow body, a wide base, the needle.
+            let points = [
+                (6.0, 2.5),
+                (12.0, 2.5),
+                (10.75, 4.0),
+                (10.75, 7.75),
+                (13.25, 10.5),
+                (4.75, 10.5),
+                (7.25, 7.75),
+                (7.25, 4.0),
+            ];
+            let mut body = PathBuilder::new();
+            let (x, y) = at(points[0].0, points[0].1);
+            body.move_to(x, y);
+            for (px_, py) in &points[1..] {
+                let (x, y) = at(*px_, *py);
+                body.line_to(x, y);
+            }
+            body.close();
+            if let Some(path) = body.finish() {
+                pixmap.fill_path(
+                    &path,
+                    &bgr_paint(palette.paper),
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+                pixmap.stroke_path(&path, &ink, &stroke(1.3), Transform::identity(), None);
+            }
+            let mut needle = PathBuilder::new();
+            let (x0, y0) = at(9.0, 10.5);
+            let (x1, y1) = at(9.0, 16.0);
+            needle.move_to(x0, y0);
+            needle.line_to(x1, y1);
+            if let Some(path) = needle.finish() {
+                pixmap.stroke_path(&path, &ink, &stroke(1.4), Transform::identity(), None);
             }
         }
     }
@@ -4458,6 +4508,13 @@ mod tests {
         assert_eq!(offered(&app), vec![ToolId::NewNote, ToolId::RecordScreen]);
         let running = ToolContext { recording: true, ..app };
         assert_eq!(offered(&running), vec![ToolId::NewNote]);
+        // Pin to screen comes last by default, and only while the user carries a card.
+        assert_eq!(tool(ToolId::PinCard).action, Shortcut::PinTop);
+        assert_eq!(ToolId::parse("pin"), Some(ToolId::PinCard));
+        let carrying = ToolContext { cards_held: true, ..app };
+        assert_eq!(offered(&carrying), vec![ToolId::NewNote, ToolId::RecordScreen, ToolId::PinCard]);
+        let carrying_alone = ToolContext { cards_held: true, notes: false, ..ToolContext::default() };
+        assert_eq!(offered(&carrying_alone), vec![ToolId::PinCard]);
     }
 
     fn entry(tool: ToolId, shown: bool) -> MenuEntry {
@@ -4474,8 +4531,11 @@ mod tests {
         // A shown tool that cannot run is still not offered.
         assert_eq!(offered(&ToolContext { menu: reversed, ..notes_only() }), vec![ToolId::NewNote]);
         hidden.set_shown(ToolId::NewNote, false);
-        assert!(!hidden.any_shown());
+        // Pin to screen is still shown, but there is no card to pin.
         assert!(offered(&ToolContext { menu: hidden, ..both() }).is_empty());
+        hidden.set_shown(ToolId::PinCard, false);
+        assert!(!hidden.any_shown());
+        assert!(offered(&ToolContext { menu: hidden, cards_held: true, ..both() }).is_empty());
     }
 
     #[test]
@@ -4502,29 +4562,39 @@ mod tests {
     fn the_tool_menu_list_reads_leniently() {
         let read = |text: &str| ToolMenu::from_json(&serde_json::from_str(text).unwrap());
         let default = ToolMenu::default();
-        assert_eq!(default.entries(), &[entry(ToolId::NewNote, true), entry(ToolId::RecordScreen, true)]);
+        assert_eq!(
+            default.entries(),
+            &[entry(ToolId::NewNote, true), entry(ToolId::RecordScreen, true), entry(ToolId::PinCard, true)]
+        );
         for text in ["null", "{}", "\"note\"", "3", "[]"] {
             assert_eq!(read(text), default, "{text}");
         }
         // Order kept, shown read; a row that is not a known id is dropped.
         assert_eq!(
             read(r#"[{"id": "record", "shown": false}, {"id": "grammar"}, 5, {"shown": false}, {"id": "note"}]"#).entries(),
-            &[entry(ToolId::RecordScreen, false), entry(ToolId::NewNote, true)]
+            &[entry(ToolId::RecordScreen, false), entry(ToolId::NewNote, true), entry(ToolId::PinCard, true)]
         );
         // A later row for the same tool is dropped; a bad `shown` is true.
         assert_eq!(
             read(r#"[{"id": "record", "shown": "no"}, {"id": "record", "shown": false}, {"id": "note", "shown": false}]"#).entries(),
-            &[entry(ToolId::RecordScreen, true), entry(ToolId::NewNote, false)]
+            &[entry(ToolId::RecordScreen, true), entry(ToolId::NewNote, false), entry(ToolId::PinCard, true)]
         );
-        // Partial: the missing tool is appended, shown.
+        // Partial (a file from before Pin to screen): the missing tools are appended, shown.
         assert_eq!(
-            read(r#"[{"id": "record", "shown": false}]"#).entries(),
-            &[entry(ToolId::RecordScreen, false), entry(ToolId::NewNote, true)]
+            read(r#"[{"id": "record", "shown": false}, {"id": "note", "shown": true}]"#).entries(),
+            &[entry(ToolId::RecordScreen, false), entry(ToolId::NewNote, true), entry(ToolId::PinCard, true)]
         );
         // Written as a list of rows, and read back the same.
         let menu = read(r#"[{"id": "record", "shown": false}]"#);
         let json = serde_json::to_value(menu).unwrap();
-        assert_eq!(json, serde_json::json!([{"id": "record", "shown": false}, {"id": "note", "shown": true}]));
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"id": "record", "shown": false},
+                {"id": "note", "shown": true},
+                {"id": "pin", "shown": true}
+            ])
+        );
         assert_eq!(ToolMenu::from_json(&json), menu);
     }
 
@@ -4532,11 +4602,12 @@ mod tests {
     fn moving_a_row_closes_up_the_rows_between() {
         let menu = ToolMenu::default();
         let ids = |m: ToolMenu| m.entries().iter().map(|e| e.tool).collect::<Vec<_>>();
-        assert_eq!(ids(menu.moved(0, 1)), [ToolId::RecordScreen, ToolId::NewNote]);
-        assert_eq!(ids(menu.moved(1, 0)), [ToolId::RecordScreen, ToolId::NewNote]);
+        assert_eq!(ids(menu.moved(0, 1)), [ToolId::RecordScreen, ToolId::NewNote, ToolId::PinCard]);
+        assert_eq!(ids(menu.moved(1, 0)), [ToolId::RecordScreen, ToolId::NewNote, ToolId::PinCard]);
+        assert_eq!(ids(menu.moved(2, 0)), [ToolId::PinCard, ToolId::NewNote, ToolId::RecordScreen]);
         assert_eq!(menu.moved(0, 0), menu);
         // Past the end goes to the end; a row that is not there changes nothing.
-        assert_eq!(ids(menu.moved(0, 9)), [ToolId::RecordScreen, ToolId::NewNote]);
+        assert_eq!(ids(menu.moved(0, 9)), [ToolId::RecordScreen, ToolId::PinCard, ToolId::NewNote]);
         assert_eq!(menu.moved(5, 0), menu);
         let mut hidden = menu;
         hidden.set_shown(ToolId::RecordScreen, false);
