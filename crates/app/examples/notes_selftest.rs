@@ -553,7 +553,9 @@ fn run() -> Result<bool> {
     let every_undo_changes_text = undo_steps.windows(2).all(|pair| pair[0] != pair[1]);
     checks.check(
         &format!("undo never undoes a formatting pass ({undo_steps:?})"),
-        every_undo_changes_text && undo_steps.last().is_some_and(String::is_empty),
+        undo_steps.len() > 1
+            && every_undo_changes_text
+            && undo_steps.last().is_some_and(String::is_empty),
     );
     let conversions = on(&notes, first, |editor| {
         let mut out = Vec::new();
@@ -1224,6 +1226,8 @@ fn run() -> Result<bool> {
         short.0 == 0 && short.1.is_none(),
     );
 
+    paint_sequences(&mut checks, &notes, &root)?;
+
     // --- Resizing through the real message path, down to nothing and back --------------------
     let attachment = fs::read_dir(root.join("Notes").join("attachments"))?
         .flatten()
@@ -1316,6 +1320,10 @@ fn run() -> Result<bool> {
     } else {
         checks.check("a note for the resize test opens", false);
     }
+
+    // The caret checks give an editor real keyboard focus: they run after the checks that need
+    // an unfocused note (idle CPU, typing through messages).
+    caret_checks(&mut checks, &notes, first, &pictures)?;
 
     // --- UI Automation reaches the editor with its text -------------------------------------
     let editor_hwnd = {
@@ -1638,4 +1646,501 @@ fn placeholder_checks(
     checks.check(&format!("{suffix}: an empty code line has no placeholder"), code.is_none());
     on(notes, id, |editor| editor.set_focused(false));
     Ok(())
+}
+
+/// Paint sequences a person causes without thinking about it (another window over the note,
+/// another app active, hide and show, display, DPI and theme changes, updates arriving during a
+/// paint), each followed by typing. After each: no repaint is owed and the note on screen
+/// matches a fresh render of it.
+fn paint_sequences(checks: &mut Checks, notes: &Notes, root: &Path) -> Result<()> {
+    let monitor = monitor_at(Point::new(0.0, 0.0));
+    let work = monitor.work_area;
+    let Some(a) =
+        new_note(notes, Point::new(work.x + work.width * 0.35, work.y + work.height * 0.35))
+    else {
+        checks.check("paint sequences: a note opens", false);
+        return Ok(());
+    };
+    let Some(b) =
+        new_note(notes, Point::new(work.x + work.width * 0.6, work.y + work.height * 0.35))
+    else {
+        checks.check("paint sequences: a second note opens", false);
+        return Ok(());
+    };
+    // Typed, so the store holds the same text (an activation re-reads files from disk).
+    on(notes, a, |editor| type_text(editor, "# Paint check\n[] a to-do\nSome **bold** words"));
+    thread::sleep(Duration::from_millis(600));
+    let (ha, hb) = (hwnd_of(notes, a), hwnd_of(notes, b));
+    let rect_a = window_rect(ha);
+    let rect_b = window_rect(hb);
+    let send = |hwnd: HWND, message: u32, wp: usize, lp: isize| {
+        // SAFETY: messages to our own note windows (the notes thread handles them).
+        unsafe { SendMessageW(hwnd, message, Some(WPARAM(wp)), Some(LPARAM(lp))) };
+    };
+    let immersive: Vec<u16> = "ImmersiveColorSet\0".encode_utf16().collect();
+    let steps: [&str; 12] = [
+        "cover",
+        "deactivate",
+        "hide",
+        "display",
+        "dpi",
+        "theme",
+        "setting",
+        "burst",
+        "nothing",
+        "hover",
+        "focus-hover",
+        "blur",
+    ];
+    // SAFETY: children of our own note window.
+    let (editor_a, close_a) = unsafe {
+        (
+            GetDlgItem(Some(ha), igorio_app::notes::window::EDITOR_ID).unwrap_or_default(),
+            GetDlgItem(Some(ha), igorio_app::notes::window::CLOSE_ID).unwrap_or_default(),
+        )
+    };
+    let hover = |focused: bool| {
+        if focused {
+            on(notes, a, |editor| editor.focus());
+        }
+        // The pointer crosses the header, the editor and a button, then leaves; the buttons
+        // fade in and out on the animation clock meanwhile.
+        for (target, x, y) in
+            [(ha, 150, 10), (editor_a, 40, 30), (editor_a, 120, 60), (close_a, 5, 5), (ha, 60, 8)]
+        {
+            let point = ((y as u16 as isize) << 16) | (x as u16 as isize);
+            send(target, WM_MOUSEMOVE, 0, point);
+            thread::sleep(Duration::from_millis(40));
+        }
+        thread::sleep(Duration::from_millis(200));
+        for target in [close_a, editor_a, ha] {
+            send(target, windows::Win32::UI::Controls::WM_MOUSELEAVE, 0, 0);
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut failures = Vec::new();
+    let mut typed = 0;
+    let mut runs = 0;
+    for round in 0..6 {
+        let mut order = steps;
+        for i in (1..order.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            order.swap(i, (seed % (i as u64 + 1)) as usize);
+        }
+        for step in order {
+            match step {
+                "cover" => {
+                    // SAFETY: our own windows.
+                    unsafe {
+                        let _ = SetWindowPos(
+                            hb,
+                            Some(HWND_TOP),
+                            rect_a.left + 20,
+                            rect_a.top + 20,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                        let _ = SetWindowPos(
+                            hb,
+                            None,
+                            rect_b.left,
+                            rect_b.top,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+                        );
+                    }
+                }
+                "deactivate" => {
+                    send(ha, WM_ACTIVATE, 0, hb.0 as isize);
+                    send(hb, WM_ACTIVATE, 1, ha.0 as isize);
+                    send(hb, WM_ACTIVATE, 0, ha.0 as isize);
+                    send(ha, WM_ACTIVATE, 1, hb.0 as isize);
+                }
+                "hide" => {
+                    // SAFETY: our own window.
+                    unsafe {
+                        let _ = ShowWindow(ha, SW_HIDE);
+                        let _ = ShowWindow(ha, SW_SHOWNOACTIVATE);
+                    }
+                }
+                "display" => send(ha, WM_DISPLAYCHANGE, 32, (1920 | (1080 << 16)) as isize),
+                "dpi" => {
+                    for dpi in [144usize, 96] {
+                        let mut suggested = window_rect(ha);
+                        send(
+                            ha,
+                            WM_DPICHANGED,
+                            dpi | (dpi << 16),
+                            &mut suggested as *mut RECT as isize,
+                        );
+                    }
+                }
+                "theme" => send(ha, WM_THEMECHANGED, 0, 0),
+                "hover" => hover(false),
+                "focus-hover" => hover(true),
+                "blur" => {
+                    on(notes, a, |editor| editor.focus());
+                    on(notes, b, |editor| editor.focus());
+                    hover(false);
+                }
+                "setting" => send(ha, WM_SETTINGCHANGE, 0, immersive.as_ptr() as isize),
+                "burst" => {
+                    on(notes, a, |editor| {
+                        let hwnd = editor.hwnd().0 as isize;
+                        editor.test_during_paint(Box::new(move || {
+                            for ch in "zzz".encode_utf16() {
+                                // SAFETY: characters to our own editor while it paints.
+                                unsafe {
+                                    SendMessageW(
+                                        HWND(hwnd as *mut _),
+                                        WM_CHAR,
+                                        Some(WPARAM(usize::from(ch))),
+                                        Some(LPARAM(1)),
+                                    )
+                                };
+                            }
+                        }));
+                    });
+                    // SAFETY: our own window, painted now.
+                    let _ = unsafe {
+                        RedrawWindow(
+                            Some(ha),
+                            None,
+                            None,
+                            RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN,
+                        )
+                    };
+                    typed += 3;
+                }
+                _ => {}
+            }
+            on(notes, a, |editor| type_text(editor, "x"));
+            typed += 1;
+            runs += 1;
+            thread::sleep(Duration::from_millis(120));
+            // Animations (the header buttons fading after a hover) finish first.
+            wait(Duration::from_secs(2), || notes.test_idle());
+            let debts = notes
+                .test_with(a, |note| (note.paint_debt(), note.editor().paint_debt()))
+                .unwrap_or((None, None));
+            let owed =
+                |debt: Option<Duration>| debt.is_some_and(|d| d > Duration::from_millis(100));
+            let shown = capture(ha);
+            // SAFETY: our own window, painted from scratch now.
+            let _ = unsafe {
+                RedrawWindow(
+                    Some(ha),
+                    None,
+                    None,
+                    RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN | RDW_FRAME,
+                )
+            };
+            let fresh = capture(ha);
+            let differing = match (&shown, &fresh) {
+                (Some((w1, h1, p1)), Some((w2, h2, p2))) if w1 == w2 && h1 == h2 => {
+                    p1.chunks(4).zip(p2.chunks(4)).filter(|(a, b)| a[..3] != b[..3]).count()
+                }
+                _ => usize::MAX,
+            };
+            let ink = shown.as_ref().map_or(0, |(w, h, pixels)| {
+                let mut dark = 0;
+                for y in 45..(*h - 30) {
+                    for x in 14..(*w - 14) {
+                        let at = ((y * *w + x) * 4) as usize;
+                        if pixels[at] < 100 && pixels[at + 1] < 100 {
+                            dark += 1;
+                        }
+                    }
+                }
+                dark
+            });
+            // A focused caret blinks and antialiasing can shift a little: a few hundred pixels may
+            // differ. A stale or blank editor differs by thousands (about 2,900 measured).
+            let same = differing <= 1000 && ink > 200;
+            if owed(debts.0) || owed(debts.1) || !same {
+                failures.push(format!(
+                    "round {round} after {step}: owed {debts:?}, {differing} pixels differ from a fresh render, {ink} dark pixels of text"
+                ));
+                let folder = root.join("..").join("notes-stale");
+                let _ = fs::create_dir_all(&folder);
+                if let (Some((w, h, pixels)), Some((_, _, fresh))) = (&shown, &fresh) {
+                    let _ =
+                        save_png(&folder.join(format!("{round}-{step}-shown.png")), *w, *h, pixels);
+                    let _ =
+                        save_png(&folder.join(format!("{round}-{step}-fresh.png")), *w, *h, fresh);
+                }
+            }
+        }
+    }
+    let text = on(notes, a, |editor| editor.text());
+    let x_and_z = text.chars().filter(|ch| *ch == 'x' || *ch == 'z').count();
+    checks.check(
+        &format!(
+            "{runs} paint sequences in shuffled orders: the note paints again and matches a fresh render ({failures:?})"
+        ),
+        failures.is_empty(),
+    );
+    checks.check(
+        &format!("typing after each sequence and during paints lands ({x_and_z} of {typed})"),
+        x_and_z == typed,
+    );
+    // An activation re-reads the file; text the store has not got yet must stay in the editor
+    // (and be saved), never be replaced by the older file.
+    on(notes, a, |editor| editor.set_text("Unsaved words the store has not seen"));
+    send(ha, WM_ACTIVATE, 1, 0);
+    let kept = on(notes, a, |editor| editor.text());
+    thread::sleep(Duration::from_millis(700));
+    let stored = notes.test_with(a, |note| note.store_text()).flatten();
+    checks.check(
+        &format!("an activation never replaces unsaved editor text with the file's ({kept:?}, stored {stored:?})"),
+        kept == "Unsaved words the store has not seen" && stored.as_deref() == Some(kept.as_str()),
+    );
+    // The watchdog: a note that is asked to paint and does not gets one debug line.
+    let log = root.join("watchdog.log");
+    // SAFETY: the variable is read by this process's notes thread only when it writes a line.
+    unsafe { std::env::set_var("IGORIO_DEBUG_LOG", &log) };
+    editor::test_set_debug(Some(true));
+    on(notes, a, |editor| editor.test_block_paint(true));
+    thread::sleep(Duration::from_millis(1600));
+    on(notes, a, |editor| editor.test_block_paint(false));
+    editor::test_set_debug(None);
+    let logged = fs::read_to_string(&log).unwrap_or_default();
+    checks.check(
+        &format!(
+            "the watchdog logs a note that stopped painting ({:?})",
+            logged.lines().next().map(|line| line.chars().take(140).collect::<String>())
+        ),
+        logged.contains("notes-paint:") && logged.contains("blocked=true"),
+    );
+    thread::sleep(Duration::from_millis(100));
+    let debt = on(notes, a, |editor| editor.paint_debt());
+    checks.check("after paints are allowed again the note paints", debt.is_none());
+    notes.delete(a);
+    notes.delete(b);
+    wait(Duration::from_secs(2), || notes.test_idle());
+    Ok(())
+}
+
+/// For an empty block of each type, made each way a person makes one, and after a click on its
+/// line: the system caret stands where the placeholder starts (within a pixel), spans the same
+/// line box (the block's size and baseline), and a typed character lands after the marker.
+fn caret_checks(checks: &mut Checks, notes: &Notes, id: NoteId, pictures: &Path) -> Result<()> {
+    // (block, marker as stored, typed shortcut, slash query, key command)
+    let blocks: [(&str, &str, &str, &str, Option<EditorCommand>); 7] = [
+        ("Heading 1", "# ", "# ", "/h1", Some(EditorCommand::Block(BlockCommand::Heading(1)))),
+        ("Heading 2", "## ", "## ", "/h2", Some(EditorCommand::Block(BlockCommand::Heading(2)))),
+        ("Heading 3", "### ", "### ", "/h3", Some(EditorCommand::Block(BlockCommand::Heading(3)))),
+        ("Quote", "> ", "> ", "/quote", Some(EditorCommand::Block(BlockCommand::Quote))),
+        ("To-do", "- [ ] ", "[] ", "/todo", Some(EditorCommand::Block(BlockCommand::Todo))),
+        ("Bullet", "- ", "- ", "/bulleted", Some(EditorCommand::Block(BlockCommand::Bullet))),
+        ("Numbered", "1. ", "1. ", "/numbered", Some(EditorCommand::Block(BlockCommand::Numbered))),
+    ];
+    let mut failures = Vec::new();
+    let mut cases = 0;
+    for (name, marker, shortcut, slash, command) in blocks {
+        let ways: [&str; 6] = ["typed", "slash menu", "key", "enter", "backspace", "click"];
+        for way in ways {
+            let owned_marker = marker.to_owned();
+            let shortcut = shortcut.to_owned();
+            let slash = slash.to_owned();
+            let result = on(notes, id, move |editor| {
+                let marker = owned_marker;
+                editor.set_focused(true);
+                editor.focus();
+                // Every case starts with a line above, so the block is not the first line.
+                let made = match way {
+                    "typed" => {
+                        editor.set_text("Above\n");
+                        editor.select(6..6);
+                        type_text(editor, &shortcut);
+                        true
+                    }
+                    "slash menu" => {
+                        editor.set_text("Above\n");
+                        editor.select(6..6);
+                        type_text(editor, &slash);
+                        editor.send_key(VK_RETURN.0, "\r");
+                        true
+                    }
+                    "key" => {
+                        editor.set_text("Above\n");
+                        editor.select(6..6);
+                        if let Some(command) = command {
+                            editor.command(command);
+                        }
+                        true
+                    }
+                    "enter" => {
+                        // Enter after a filled item makes an empty one (not for headings: the
+                        // line after a heading is text).
+                        if marker.starts_with('#') {
+                            false
+                        } else {
+                            editor.set_text(&format!("Above\n{marker}item"));
+                            let end = editor.text().len();
+                            editor.select(end..end);
+                            editor.send_key(VK_RETURN.0, "\r");
+                            true
+                        }
+                    }
+                    "backspace" => {
+                        editor.set_text(&format!("Above\n{marker}x"));
+                        let end = editor.text().len();
+                        editor.select(end..end);
+                        editor.send_key(0x08, "\u{8}");
+                        true
+                    }
+                    _ => false,
+                };
+                if !made {
+                    return None;
+                }
+                let text_before = editor.text();
+                let (caret, _) = editor.caret_rect();
+                let geometry = editor.placeholder_geometry();
+                type_text(editor, "W");
+                Some((text_before, caret, geometry, editor.text()))
+            });
+            let result = match result {
+                Some(result) => Some(result),
+                None if way == "click" => click_case(notes, id, marker),
+                None => None,
+            };
+            let Some((before, caret, geometry, after)) = result else { continue };
+            cases += 1;
+            // Enter leaves the filled item above; every other way makes the block on line 2.
+            let next = if marker == "1. " { "2. " } else { marker };
+            let expected_before = if way == "enter" {
+                format!("Above\n{marker}item\n{next}")
+            } else {
+                format!("Above\n{marker}")
+            };
+            let expected_after = format!("{expected_before}W");
+            let placed = match (caret, geometry) {
+                (Some(caret), Some(g)) => {
+                    (caret.right - g.placeholder.left).abs() <= 1
+                        && (caret.top - g.placeholder.top).abs() <= 3
+                        && (caret.bottom - g.placeholder.bottom).abs() <= 3
+                        && g.baseline > caret.top
+                        && g.baseline < caret.bottom
+                }
+                _ => false,
+            };
+            if before != expected_before || after != expected_after || !placed {
+                failures.push(format!(
+                    "{name} by {way}: text {before:?} then {after:?}, caret {caret:?}, placeholder {:?}",
+                    geometry.map(|g| (g.placeholder, g.baseline))
+                ));
+            }
+        }
+    }
+    checks.check(
+        &format!("on an empty block of every type, made {cases} ways, the caret is where the placeholder starts, the block's size, and typing goes after the marker ({failures:?})"),
+        failures.is_empty(),
+    );
+    // Left from the words enters the marker on purpose; Home goes back after it.
+    on(notes, id, |editor| {
+        editor.focus();
+        editor.set_focused(true);
+        editor.set_text("Above\n# ");
+        editor.select(8..8);
+    });
+    thread::sleep(Duration::from_millis(250)); // the marker's reveal fade
+    let keys = on(notes, id, |editor| {
+        editor.send_key(0x25, ""); // Left
+        let in_marker = editor.selection();
+        editor.send_key(0x24, ""); // Home
+        (in_marker, editor.selection())
+    });
+    checks.check(
+        &format!("Left from an empty heading's start edits its marker, Home goes back after it ({keys:?})"),
+        keys.0 == (7..7) && keys.1 == (8..8),
+    );
+    // The picture, with the caret drawn where the system has it (after the reveal fade).
+    on(notes, id, |editor| {
+        editor.focus();
+        editor.set_text("Above\n# ");
+        editor.select(8..8);
+    });
+    thread::sleep(Duration::from_millis(300));
+    let caret = on(notes, id, |editor| {
+        let (caret, _) = editor.caret_rect();
+        let mut origin = [POINT::default()];
+        // SAFETY: maps from our editor to its note window, both ours.
+        unsafe {
+            MapWindowPoints(Some(editor.hwnd()), GetParent(editor.hwnd()).ok(), &mut origin);
+        }
+        caret.map(|caret| (caret, origin[0]))
+    });
+    let hwnd = hwnd_of(notes, id);
+    let saved = match (capture(hwnd), caret) {
+        (Some((w, h, mut pixels)), Some((caret, origin))) => {
+            let (left, right) =
+                (caret.left + origin.x, (caret.right + origin.x).max(caret.left + origin.x + 1));
+            for y in (caret.top + origin.y).max(0)..(caret.bottom + origin.y).min(h) {
+                for x in left.max(0)..right.min(w) {
+                    let at = ((y * w + x) * 4) as usize;
+                    pixels[at..at + 3].copy_from_slice(&[0x46, 0x33, 0x2a]);
+                }
+            }
+            save_png(&pictures.join("notes-caret-heading.png"), w, h, &pixels)?
+        }
+        _ => false,
+    };
+    checks
+        .check("picture notes-caret-heading.png (the caret drawn where the system has it)", saved);
+    on(notes, id, |editor| {
+        editor.set_focused(false);
+        // No keyboard focus left behind: a focused editor blinks its caret (CPU when idle).
+        // SAFETY: focus on the notes thread, cleared.
+        let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(None) };
+    });
+    Ok(())
+}
+
+type CaretCase = (String, Option<RECT>, Option<editor::PlaceholderGeometry>, String);
+
+/// The click case: the empty block on line 2, the caret on line 1, a pause (so the click is not
+/// a double-click), then a click on the empty line: on a heading's or quote's marker, to the
+/// right of a list's drawn box or bullet.
+fn click_case(notes: &Notes, id: NoteId, marker: &str) -> Option<CaretCase> {
+    let owned = marker.to_owned();
+    on(notes, id, move |editor| {
+        editor.set_focused(true);
+        editor.focus();
+        editor.set_text(&format!("Above\n{owned}"));
+        editor.select(0..0);
+    });
+    thread::sleep(Duration::from_millis(600));
+    let list = !(marker.starts_with('#') || marker.starts_with('>'));
+    on(notes, id, move |editor| {
+        let (_, line_top) = editor.line_point(1);
+        let x = if list { 60 } else { 3 };
+        let point = (((line_top + 6) as u16 as usize) << 16) | x;
+        // SAFETY: a click on our own editor control (client coordinates).
+        unsafe {
+            SendMessageW(
+                editor.hwnd(),
+                WM_LBUTTONDOWN,
+                Some(WPARAM(1)),
+                Some(LPARAM(point as isize)),
+            );
+            SendMessageW(
+                editor.hwnd(),
+                WM_LBUTTONUP,
+                Some(WPARAM(0)),
+                Some(LPARAM(point as isize)),
+            );
+        }
+        let before = editor.text();
+        let (caret, _) = editor.caret_rect();
+        let geometry = editor.placeholder_geometry();
+        type_text(editor, "W");
+        Some((before, caret, geometry, editor.text()))
+    })
 }

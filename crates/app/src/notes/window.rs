@@ -89,6 +89,8 @@ const EDITOR_EVENTS: u32 = WM_APP + 2;
 const TEST_RUN: u32 = WM_APP + 3;
 const SAVE_TIMER: usize = 1;
 const MOTION_TIMER: usize = 2;
+const WATCHDOG_TIMER: usize = 3;
+const RETRY_TIMER: usize = 4;
 const APPEAR_SECONDS: f64 = 0.45;
 const FADE_OUT_MS: f64 = 120.0;
 const BUTTONS_MS: f64 = 120.0;
@@ -504,6 +506,11 @@ impl TestNote<'_> {
     /// Runs the store's refresh as a window activation does.
     pub fn refresh(&self) {
         self.hub.refresh_from_disk();
+    }
+
+    /// A repaint the window still owes, and how long ago it was asked for.
+    pub fn paint_debt(&self) -> Option<Duration> {
+        self.window.asked.get().map(|at| at.elapsed())
     }
 
     /// The frame the store holds for this note (what will be saved).
@@ -1394,6 +1401,12 @@ struct NoteWindow {
     surface: RefCell<Option<Surface>>,
     epoch: Instant,
     saved_focus: Cell<HWND>,
+    /// The text this window last gave the store (or loaded). A reload from disk replaces the
+    /// editor's text only while the editor still holds exactly this, so nothing unsaved is lost.
+    synced: RefCell<String>,
+    /// When a repaint was asked for and has not happened yet (the watchdog reads it).
+    asked: Cell<Option<Instant>>,
+    painted: Cell<Option<Instant>>,
 }
 
 impl NoteWindow {
@@ -1498,6 +1511,9 @@ impl NoteWindow {
             surface: RefCell::new(None),
             epoch: Instant::now(),
             saved_focus: Cell::new(HWND::default()),
+            synced: RefCell::new(String::new()),
+            asked: Cell::new(None),
+            painted: Cell::new(None),
         });
         // SAFETY: the Rc in the hub's map keeps the window state alive until WM_NCDESTROY
         // clears this pointer (destroy() runs before the map drops it).
@@ -1533,6 +1549,7 @@ impl NoteWindow {
         editor.set_text(&note.text);
         let end = editor.text().len();
         editor.select(end..end);
+        *window.synced.borrow_mut() = editor.text();
         *window.editor.borrow_mut() = Some(editor);
         window.add_tools();
         window.style_frame();
@@ -1605,6 +1622,13 @@ impl NoteWindow {
     }
 
     fn invalidate(&self) {
+        if self.asked.get().is_none() {
+            self.asked.set(Some(Instant::now()));
+            if editor::debug_enabled() {
+                // SAFETY: a one-shot timer on our own window.
+                unsafe { SetTimer(Some(self.hwnd), WATCHDOG_TIMER, 1200, None) };
+            }
+        }
         // SAFETY: our window and its header buttons, which paint their part of the card.
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
@@ -1858,15 +1882,77 @@ impl NoteWindow {
     fn start_timer(&self) {
         let run = self.frozen.get().is_none() && self.active();
         if run != self.timer.get() {
-            // SAFETY: our window's own timer.
-            unsafe {
+            // SAFETY: our window's own timer. The flag follows what Windows did, so a refused
+            // timer is asked for again on the next change.
+            let running = unsafe {
                 if run {
-                    SetTimer(Some(self.hwnd), MOTION_TIMER, 10, None);
+                    SetTimer(Some(self.hwnd), MOTION_TIMER, 10, None) != 0
                 } else {
                     let _ = KillTimer(Some(self.hwnd), MOTION_TIMER);
+                    false
                 }
-            }
-            self.timer.set(run);
+            };
+            self.timer.set(running);
+        }
+    }
+
+    /// Everything drawn again: the card, its buttons, the editor (after the window came back
+    /// from being hidden, covered, deactivated, or a display or theme change). A layered style
+    /// left over from an animation that never finished is removed first.
+    fn redraw_all(&self) {
+        if matches!(self.window_motion.get(), Motion::Still) && self.layered.get() {
+            self.set_layered(None);
+        }
+        self.invalidate();
+        // SAFETY: our own window and its children.
+        let _ = unsafe {
+            RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_ERASE,
+            )
+        };
+    }
+
+    /// One line of the window's paint state, for the watchdog.
+    fn paint_state(&self) -> String {
+        // SAFETY: plain queries about our own window.
+        let (visible, alpha) = unsafe {
+            let mut alpha = 0u8;
+            let mut flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS(0);
+            let _ = GetLayeredWindowAttributes(self.hwnd, None, Some(&mut alpha), Some(&mut flags));
+            (IsWindowVisible(self.hwnd).as_bool(), alpha)
+        };
+        format!(
+            "window visible={visible} motion={:?} layered={} alpha={alpha} timer={} closing={} asked={:?} painted={:?} surface={}",
+            self.window_motion.get(),
+            self.layered.get(),
+            self.timer.get(),
+            self.closing.get(),
+            self.asked.get().map(|at| at.elapsed()),
+            self.painted.get().map(|at| at.elapsed()),
+            self.surface
+                .try_borrow()
+                .map_or("busy".to_owned(), |surface| surface.is_some().to_string()),
+        )
+    }
+
+    fn watchdog(&self) {
+        let Some(asked) = self.asked.get() else { return };
+        // SAFETY: a plain query about our own window.
+        let visible = unsafe { IsWindowVisible(self.hwnd) }.as_bool();
+        if visible && asked.elapsed() > Duration::from_secs(1) {
+            editor::debug_line(&format!(
+                "notes-paint: note {} not painted for {:?}: {}",
+                self.id,
+                asked.elapsed(),
+                self.paint_state()
+            ));
+            self.redraw_all();
+        } else if visible {
+            // SAFETY: a one-shot timer on our own window.
+            unsafe { SetTimer(Some(self.hwnd), WATCHDOG_TIMER, 1200, None) };
         }
     }
 
@@ -1936,11 +2022,14 @@ impl NoteWindow {
             return;
         }
         let now = SystemTime::now();
+        let given = text.clone();
         let stored = self.hub().update(self.id, |note| {
             note.text = text;
             note.updated_at = now;
         });
-        if !stored {
+        if stored {
+            *self.synced.borrow_mut() = given;
+        } else {
             // The store is busy (a write that pumps messages): try again after this message.
             self.editor_events.borrow_mut().push(EditorEvent::Changed);
             // SAFETY: a scalar message to our own window.
@@ -1950,11 +2039,19 @@ impl NoteWindow {
 
     /// The file changed on disk: take its text unless the editor has something unsaved.
     fn reload(&self, stored: &str) {
-        let editor = self.editor.borrow();
-        let Some(editor) = editor.as_ref() else { return };
+        let guard = self.editor.borrow();
+        let Some(editor) = guard.as_ref() else { return };
         let current = editor.text();
         let normalized = stored.replace("\r\n", "\n").replace('\r', "\n");
         if current == normalized {
+            *self.synced.borrow_mut() = current;
+            return;
+        }
+        if current != *self.synced.borrow() {
+            // The editor has text the store has not got yet: it wins and is saved (the Swift
+            // rule: an open note keeps its own text).
+            drop(guard);
+            self.sync_text();
             return;
         }
         let caret = editor.selection().end;
@@ -1962,6 +2059,7 @@ impl NoteWindow {
         let line = current[..caret.min(current.len())].matches('\n').count();
         let column = current[..caret.min(current.len())].rsplit('\n').next().map_or(0, str::len);
         editor.set_text(&normalized);
+        *self.synced.borrow_mut() = normalized.clone();
         let start = normalized
             .split('\n')
             .take(line)
@@ -2099,20 +2197,29 @@ impl NoteWindow {
     }
 
     fn paint(&self, target: HDC) {
-        self.paint_at(target, POINT::default());
+        self.paint_at(target, POINT::default(), None);
     }
 
     /// Renders the whole card and copies it to `target`, whose top-left is `origin` in the
     /// card (a header button paints its own part of the card this way).
-    fn paint_at(&self, target: HDC, origin: POINT) {
+    fn paint_at(&self, target: HDC, origin: POINT, size: Option<(i32, i32)>) {
         let client = self.client();
         let (width, height) = (client.right.max(1) as u32, client.bottom.max(1) as u32);
-        let Ok(mut storage) = self.surface.try_borrow_mut() else { return };
+        let Ok(mut storage) = self.surface.try_borrow_mut() else {
+            // SAFETY: a one-shot timer on our own window: paint again shortly.
+            unsafe { SetTimer(Some(self.hwnd), RETRY_TIMER, 250, None) };
+            return;
+        };
         if storage.as_ref().is_none_or(|surface| surface.width != width || surface.height != height)
         {
             *storage = Surface::new(width, height).ok();
         }
-        let Some(surface) = storage.as_mut() else { return };
+        let Some(surface) = storage.as_mut() else {
+            // No bitmap (GDI refused one): try again shortly instead of leaving stale pixels.
+            // SAFETY: a one-shot timer on our own window.
+            unsafe { SetTimer(Some(self.hwnd), RETRY_TIMER, 250, None) };
+            return;
+        };
         let palette = self.palette.get();
         let fonts = self.fonts.get();
         let now = self.now();
@@ -2228,14 +2335,18 @@ impl NoteWindow {
             }
             canvas.finish_labels();
         }
+        if origin == POINT::default() {
+            self.asked.set(None);
+            self.painted.set(Some(Instant::now()));
+        }
         // SAFETY: both DCs are live; the whole client area is copied.
         unsafe {
             let _ = BitBlt(
                 target,
                 0,
                 0,
-                client.right - origin.x,
-                client.bottom - origin.y,
+                size.map_or(client.right - origin.x, |(width, _)| width),
+                size.map_or(client.bottom - origin.y, |(_, height)| height),
                 Some(surface.dc),
                 origin.x,
                 origin.y,
@@ -2452,12 +2563,20 @@ unsafe extern "system" fn button_proc(
             let mut paint = PAINTSTRUCT::default();
             // SAFETY: the button paints its part of the parent's card (the parent clips its
             // children, so it cannot draw there itself); the origin maps the button into it.
+            // BUTTON has CS_PARENTDC: its paint DC is not clipped to the button, so the copy is
+            // limited to the button's own rectangle (the whole card copied from here covered
+            // the editor and its text vanished whenever a button repainted, on hover).
             unsafe {
                 let dc = BeginPaint(hwnd, &mut paint);
                 let mut origin = [POINT::default()];
                 MapWindowPoints(Some(hwnd), Some(window.hwnd), &mut origin);
+                let mut own = RECT::default();
+                let _ = GetClientRect(hwnd, &mut own);
                 if !dc.is_invalid() {
-                    window.paint_at(dc, origin[0]);
+                    let saved = SaveDC(dc);
+                    IntersectClipRect(dc, 0, 0, own.right, own.bottom);
+                    window.paint_at(dc, origin[0], Some((own.right, own.bottom)));
+                    let _ = RestoreDC(dc, saved);
                 }
                 let _ = EndPaint(hwnd, &paint);
             }
@@ -2594,7 +2713,7 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             return result;
         }
         WM_DPICHANGED => {
-            if window.hub().test.dpi.is_none() {
+            {
                 window.set_dpi((wp.0 & 0xffff) as u32);
                 if lp.0 != 0 {
                     // SAFETY: lParam points to the suggested rectangle for this message.
@@ -2618,6 +2737,7 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_ACTIVATE => {
             let active = (wp.0 & 0xffff) as u32 != WA_INACTIVE;
             let hub = window.hub();
+            window.redraw_all();
             if active {
                 hub.active.set(Some(window.id));
                 hub.update_zones();
@@ -2711,11 +2831,31 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             window.step();
             return LRESULT(0);
         }
+        WM_TIMER if wp.0 == WATCHDOG_TIMER || wp.0 == RETRY_TIMER => {
+            // SAFETY: one-shot timers of our own window.
+            let _ = unsafe { KillTimer(Some(hwnd), wp.0) };
+            if wp.0 == RETRY_TIMER {
+                window.redraw_all();
+            } else {
+                window.watchdog();
+            }
+            return LRESULT(0);
+        }
         WM_SETTINGCHANGE | WM_THEMECHANGED => {
             let hub = window.hub();
             hub.set_motion(editor::animation_effects());
             hub.apply_theme();
+            window.redraw_all();
         }
+        WM_DISPLAYCHANGE | WM_DWMCOMPOSITIONCHANGED => {
+            // A new display layout or a restarted compositor: the bitmaps are made again on
+            // the next paint, and everything is drawn.
+            if let Ok(mut surface) = window.surface.try_borrow_mut() {
+                *surface = None;
+            }
+            window.redraw_all();
+        }
+        WM_SHOWWINDOW if wp.0 != 0 => window.redraw_all(),
         WM_CTLCOLORBTN => {
             // SAFETY: an empty brush; the parent paints the buttons.
             return LRESULT(unsafe { GetStockObject(NULL_BRUSH) }.0 as isize);
