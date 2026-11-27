@@ -14,6 +14,7 @@ pub mod ink_draw;
 pub mod input;
 pub mod notes;
 pub mod overlay;
+pub mod recording;
 pub mod saver;
 pub mod settings;
 pub mod settings_window;
