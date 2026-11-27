@@ -890,6 +890,9 @@ pub enum Control {
     Screenshots,
     KeepTitle,
     Keep,
+    CarryTitle,
+    Carry,
+    CarryDetail,
     NotesTitle,
     NotesKeys,
     NotesDetail,
@@ -1006,8 +1009,11 @@ const STATUS_HEIGHT: i32 = 34;
 const PAGE_SWITCH: [i32; 4] = [24, 12, 321, 32];
 /// Everything below the page switch, which moves when the page changes.
 const CONTENT: [i32; 4] = [0, 48, WIDTH, HEIGHT - 48];
-const KEEP_PATCH: [i32; 4] = [24, 150, 496, 36];
-const CARD_PATCH: [i32; 4] = [24, 437, 496, 72];
+const KEEP_PATCH: [i32; 4] = [24, 150, 496, 60];
+const CARD_PATCH: [i32; 4] = [24, 454, 496, 72];
+
+/// Beside "Also carry copied images".
+const CARRY_DETAIL: &str = "Not saved by Keep every screenshot.";
 
 const ITEMS: &[Item] = &[
     item(GeneralTab, Kind::Radio, "General", [24, 12, 107, 32]),
@@ -1029,50 +1035,54 @@ const ITEMS: &[Item] = &[
         "Taking a screenshot uses the Windows shortcuts. Change them in Windows settings.",
         [24, 128, 496, 17],
     ),
-    item(KeepTitle, Kind::Title, "Keep every screenshot", [36, 156, 412, 24]),
-    item(Keep, Kind::Switch, "Keep every screenshot", [458, 154, 50, 28]),
-    item(NotesTitle, Kind::Title, "Notes", [24, 195, 45, 22]),
-    item(NotesKeys, Kind::Keys, "Hold|Alt|and click", [75, 196, 367, 20]),
-    item(Notes, Kind::Switch, "Notes", [470, 192, 50, 28]),
+    item(KeepTitle, Kind::Title, "Keep every screenshot", [36, 153, 412, 24]),
+    item(Keep, Kind::Switch, "Keep every screenshot", [458, 151, 50, 28]),
+    item(CarryTitle, Kind::Title, "Also carry copied images", [36, 181, 186, 24]),
+    item(Carry, Kind::Switch, "Also carry copied images", [458, 179, 50, 28]),
+    // On the title's line: the page has no room for a line of its own.
+    item(CarryDetail, Kind::Detail, CARRY_DETAIL, [230, 181, 226, 24]),
+    item(NotesTitle, Kind::Title, "Notes", [24, 219, 45, 22]),
+    item(NotesKeys, Kind::Keys, "Hold|Alt|and click", [75, 220, 367, 20]),
+    item(Notes, Kind::Switch, "Notes", [470, 216, 50, 28]),
     item(
         NotesDetail,
         Kind::Detail,
         "A sticky note opens where you click, saved as Markdown.",
-        [24, 219, 400, 18],
+        [24, 243, 400, 18],
     ),
-    item(RecordingTitle, Kind::Title, "Screen recording", [24, 248, 119, 22]),
+    item(RecordingTitle, Kind::Title, "Screen recording", [24, 270, 119, 22]),
     // The chips are the user's chords (`recording_chords`), drawn from the settings.
-    item(RecordingKeys, Kind::Keys, "", [149, 249, 315, 20]),
-    item(Recording, Kind::Switch, "Screen recording", [470, 245, 50, 28]),
+    item(RecordingKeys, Kind::Keys, "", [149, 271, 315, 20]),
+    item(Recording, Kind::Switch, "Screen recording", [470, 267, 50, 28]),
     item(
         RecordingDetail,
         Kind::Detail,
         "Records the screen under the cursor as MP4. Alt + wheel zooms.",
-        [24, 272, 440, 18],
+        [24, 294, 440, 18],
     ),
-    item(General, Kind::Heading, "General", [24, 302, 496, 22]),
-    item(NotesFolder, Kind::Title, "Notes folder", [24, 329, 496, 20]),
-    item(ChooseNotes, Kind::Push("&Choose…"), "&Choose notes folder…", [24, 352, 77, 24]),
-    item(OpenNotes, Kind::Push("Open"), "Open notes folder", [107, 352, 55, 24]),
-    item(ResetNotes, Kind::Push("Reset"), "Reset notes folder", [168, 352, 58, 24]),
-    item(NotesPath, Kind::Path, "", [236, 352, 284, 24]),
-    item(NotesFallback, Kind::Detail, "", [24, 377, 496, 17]),
-    item(CapturesFolder, Kind::Title, "Captures folder", [24, 382, 496, 20]),
-    item(ChooseCaptures, Kind::Push("Ch&oose…"), "Ch&oose captures folder…", [24, 405, 77, 24]),
-    item(OpenCaptures, Kind::Push("Open"), "Open captures folder", [107, 405, 55, 24]),
-    item(ResetCaptures, Kind::Push("Reset"), "Reset captures folder", [168, 405, 58, 24]),
-    item(CapturesPath, Kind::Path, "", [236, 405, 284, 24]),
-    item(CapturesFallback, Kind::Detail, "", [24, 430, 496, 17]),
-    item(CardTitle, Kind::Title, "Card size", [36, 446, 220, 20]),
-    item(Small, Kind::Radio, "Small", [36, 471, 66, 26]),
-    item(Medium, Kind::Radio, "Medium", [108, 471, 75, 26]),
-    item(Large, Kind::Radio, "Large", [189, 471, 65, 26]),
-    item(Preview, Kind::Preview, "Card size preview", [412, 443, 96, 60]),
-    item(CardDimensions, Kind::Detail, "", [264, 474, 108, 20]),
-    item(LaunchTitle, Kind::Title, "Launch at login", [24, 521, 436, 24]),
-    item(Launch, Kind::Switch, "Launch at login", [470, 519, 50, 28]),
-    item(Status, Kind::Status, "", [24, 559, 414, STATUS_HEIGHT]),
-    item(Retry, Kind::Push("&Retry"), "&Retry saving settings", [450, 561, 70, 29]),
+    item(General, Kind::Heading, "General", [24, 321, 496, 22]),
+    item(NotesFolder, Kind::Title, "Notes folder", [24, 348, 496, 20]),
+    item(ChooseNotes, Kind::Push("&Choose…"), "&Choose notes folder…", [24, 371, 77, 24]),
+    item(OpenNotes, Kind::Push("Open"), "Open notes folder", [107, 371, 55, 24]),
+    item(ResetNotes, Kind::Push("Reset"), "Reset notes folder", [168, 371, 58, 24]),
+    item(NotesPath, Kind::Path, "", [236, 371, 284, 24]),
+    item(NotesFallback, Kind::Detail, "", [24, 396, 496, 17]),
+    item(CapturesFolder, Kind::Title, "Captures folder", [24, 401, 496, 20]),
+    item(ChooseCaptures, Kind::Push("Ch&oose…"), "Ch&oose captures folder…", [24, 424, 77, 24]),
+    item(OpenCaptures, Kind::Push("Open"), "Open captures folder", [107, 424, 55, 24]),
+    item(ResetCaptures, Kind::Push("Reset"), "Reset captures folder", [168, 424, 58, 24]),
+    item(CapturesPath, Kind::Path, "", [236, 424, 284, 24]),
+    item(CapturesFallback, Kind::Detail, "", [24, 449, 496, 17]),
+    item(CardTitle, Kind::Title, "Card size", [36, 463, 220, 20]),
+    item(Small, Kind::Radio, "Small", [36, 488, 66, 26]),
+    item(Medium, Kind::Radio, "Medium", [108, 488, 75, 26]),
+    item(Large, Kind::Radio, "Large", [189, 488, 65, 26]),
+    item(Preview, Kind::Preview, "Card size preview", [412, 460, 96, 60]),
+    item(CardDimensions, Kind::Detail, "", [264, 491, 108, 20]),
+    item(LaunchTitle, Kind::Title, "Launch at login", [24, 534, 436, 24]),
+    item(Launch, Kind::Switch, "Launch at login", [470, 532, 50, 28]),
+    item(Status, Kind::Status, "", [24, 566, 414, STATUS_HEIGHT]),
+    item(Retry, Kind::Push("&Retry"), "&Retry saving settings", [450, 568, 70, 29]),
 ];
 
 /// The parts of one shortcut row, in the order of their control ids.
@@ -2709,6 +2719,7 @@ impl Window<'_> {
                     (Medium, settings.card_size == CardSize::Medium),
                     (Large, settings.card_size == CardSize::Large),
                     (Launch, model.launch.as_ref().is_ok_and(|&on| on)),
+                    (Carry, settings.carry_copied_images),
                 ],
                 model.load_error.is_none(),
                 model.launch.is_ok(),
@@ -2725,7 +2736,7 @@ impl Window<'_> {
             let mut motion = self.motion.borrow_mut();
             let duration = if self.started.get() { motion.duration(SWITCH_MS) } else { 0.0 };
             for (id, selected) in checked {
-                if matches!(id, Screenshots | Keep | Notes | Recording | Launch) {
+                if matches!(id, Screenshots | Keep | Carry | Notes | Recording | Launch) {
                     motion.buttons[id.index()].checked.retarget(
                         if selected { 1.0 } else { 0.0 },
                         now,
@@ -2982,6 +2993,10 @@ impl Window<'_> {
             Keep => {
                 let mut model = self.model.borrow_mut();
                 model.settings.keep_every_screenshot = !model.settings.keep_every_screenshot;
+            }
+            Carry => {
+                let mut model = self.model.borrow_mut();
+                model.settings.carry_copied_images = !model.settings.carry_copied_images;
             }
             Small | Medium | Large => {
                 self.model.borrow_mut().settings.card_size = match item.id {
@@ -4146,7 +4161,7 @@ impl Window<'_> {
                     );
                 }
                 Kind::Switch => {
-                    let background = if item.id == Keep { p.patch } else { p.paper };
+                    let background = if matches!(item.id, Keep | Carry) { p.patch } else { p.paper };
                     paint_switch(canvas, rect, state, disabled, background, p, frame.intro, dpi);
                 }
                 Kind::Radio => {

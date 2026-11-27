@@ -50,6 +50,7 @@ fn defaults_are_empty_and_off() {
     assert_eq!(settings.notes_folder, None);
     assert_eq!(settings.captures_folder, None);
     assert!(!settings.keep_every_screenshot);
+    assert!(!settings.carry_copied_images);
     assert!(!settings.launch_at_login);
     assert_eq!(settings.card_size, CardSize::Small);
     assert_eq!(
@@ -102,6 +103,7 @@ fn save_then_load_round_trips() {
     settings.notes_folder = Some(scratch.path("my notes"));
     settings.captures_folder = Some(scratch.path("my captures"));
     settings.keep_every_screenshot = true;
+    settings.carry_copied_images = true;
     settings.launch_at_login = true;
 
     settings.save(&path).unwrap();
@@ -198,6 +200,7 @@ fn unknown_fields_are_ignored_and_missing_fields_default() {
     assert_eq!(settings.notes_folder, None);
     assert_eq!(settings.captures_folder, None);
     assert!(!settings.keep_every_screenshot);
+    assert!(!settings.carry_copied_images);
     assert_eq!(
         settings.capabilities,
         BTreeMap::from([("notes".to_owned(), false)])

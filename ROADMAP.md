@@ -355,6 +355,8 @@ screenshot" saving.
 
 Check: `Win+Shift+S` puts a card on the pile; copying an image in a browser does not.
 
+"Also carry copied images" (off by default): an image copied in another app, with no plain text or files, also becomes a card; it is never kept.
+
 ### M4. Drops
 
 Mouse hook and double-click, `uia.rs`, drop router, paste with clipboard restore,
