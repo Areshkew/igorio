@@ -37,7 +37,7 @@ From the review of the M0 spikes. The spikes break some of these; do not copy th
    (0x200 to 0x3FF) and OLE private formats, and cap the total size.
 7. Right before `SendInput`, check the foreground window and the modifier keys again,
    and fill scan codes.
-8. Set Per-Monitor V2 DPI awareness in the manifest only. Get DPI with
+8. Declare Per-Monitor V2 DPI awareness in the manifest. Get DPI with
    `GetDpiForMonitor`. Keep one cached bitmap for drawing, and tick only while
    something moves.
 
@@ -150,19 +150,20 @@ administrator.
 Background: a normal process cannot read (UI Automation), send keys to, or hook input
 for an elevated window. Windows blocks this (UIPI).
 
-Chosen design: **`uiAccess="true"` in the release manifest.**
+The installer uses an `asInvoker` manifest with `uiAccess="true"`. Windows requires a
+trusted signature and a protected location, so Setup asks for admin once and installs
+to Program Files. Igorio starts with no UAC prompt. When started by a user in the
+Administrators group, it can read and paste into elevated windows on that desktop.
 
-- The app runs as the normal user. No UAC prompt at start, no admin rights at run time.
-- Windows lets a `uiAccess` process read and drive elevated windows.
-- Requirements: the exe is signed, the certificate is trusted on the machine, and the
-  exe is installed under `C:\Program Files`. So the installer needs admin once.
-- For a personal build: a self-signed certificate added to the machine's Trusted Root
-  store works. For public release: a real code-signing certificate.
-- Autostart: normal `Run` registry key works, because the process is not elevated.
+Setup creates a self-signed code-signing certificate for this machine, trusts the
+public certificate, signs and verifies the exe, and deletes the private key. Uninstall
+removes the certificate. If signing fails, Setup installs the regular build and shows
+a message. The setup exe itself is unsigned, so SmartScreen can warn on download.
+Later options are SignPath Foundation if the repo becomes public or Azure Trusted Signing.
 
-Dev builds (`cargo run`) have no `uiAccess` manifest, because Windows refuses to start
-an unsigned `uiAccess` exe. In dev builds elevated windows are ignored: when the window
-under the cursor is elevated, the overlay shows a "can't reach this window" hint.
+Normal Cargo builds, including `--release`, embed `uiAccess="false"` and can run from
+the build folder. The app checks its token at startup and shows "can't reach this
+window" when Windows blocks access to an elevated target.
 
 Rejected:
 
@@ -363,8 +364,15 @@ the card size resizes the pile on screen at once.
 
 ### M6. Packaging
 
-Manifest (DPI awareness v2, `uiAccess` in release), signing script, installer to
-Program Files, autostart.
+The exe embeds a Per-Monitor V2 manifest, its Cargo version, and an icon made from
+the tray drawing. A session mutex keeps Start menu and sign-in launches from running
+two copies. Inno Setup installs to Program Files, adds a Start menu shortcut, and
+offers launch at sign-in using the same `HKCU\Run` value as Settings. Uninstall keeps
+the user's settings, captures and notes.
+
+With the Windows SDK and Inno Setup 6 installed, run `./installer/build.ps1` from
+the repo root. It builds the UI access and fallback exes under `target/dist` and writes
+`target/dist/installer/Igorio-Setup-<version>.exe`.
 
 Check: clean install on a second user account; starts with no prompt; pastes into an
 elevated window.

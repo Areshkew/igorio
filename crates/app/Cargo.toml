@@ -11,6 +11,12 @@ name = "igorio_app"
 name = "igorio"
 path = "src/main.rs"
 
+[features]
+ui-access = []
+
+[build-dependencies]
+winresource = "0.1.34"
+
 [dependencies]
 igorio-core = { path = "../core" }
 igorio-kit = { path = "../kit" }

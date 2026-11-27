@@ -10,8 +10,8 @@
 //! Every event carries [`INJECTED_MARKER`] in `dwExtraInfo`, so the app's own low-level hooks
 //! can tell these events from the user's (`KBDLLHOOKSTRUCT::dwExtraInfo`).
 //!
-//! `SendInput` cannot report that UIPI dropped the events (an elevated target from a normal
-//! process): the call then still reports them all as sent.
+//! Without UI access, UIPI can block input to a higher-integrity target. `SendInput` does
+//! not report UIPI as the reason.
 
 use std::mem::size_of;
 

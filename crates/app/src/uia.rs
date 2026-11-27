@@ -1509,6 +1509,7 @@ impl Win32Backend {
         let token = Handle::token(process)?;
         let mut ui_access = 0u32;
         let mut size = 0;
+        // Read the actual token once at startup. The manifest alone does not grant UI access.
         // SAFETY: the buffer is a u32 of the size given, as `TokenUIAccess` returns.
         unsafe {
             GetTokenInformation(
@@ -2906,8 +2907,15 @@ mod tests {
         assert!(is_elevated(MEDIUM, false, None));
         assert!(!is_elevated(MEDIUM, false, Some(MEDIUM)));
         assert!(!is_elevated(MEDIUM, false, Some(0x1000)));
-        assert!(!is_elevated(MEDIUM, true, Some(HIGH)));
         assert!(!is_elevated(HIGH, false, Some(HIGH)));
+    }
+
+    #[test]
+    fn ui_access_allows_higher_and_unknown_integrity_targets() {
+        for target in [Some(0x3000), None] {
+            assert!(!is_elevated(0x2000, true, target));
+            assert!(is_elevated(0x2000, false, target));
+        }
     }
 
     #[test]

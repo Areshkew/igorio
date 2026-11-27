@@ -3,7 +3,7 @@
 //!
 //! This module only owns the window. `draw` paints the pixmap, `follower` picks the origin.
 //! All coordinates are physical pixels with a top-left origin, so the process must be
-//! Per-Monitor V2 aware (the manifest sets it; dev builds call [`ensure_dpi_awareness`]).
+//! Per-Monitor V2 aware (the manifest sets it; examples can call [`ensure_dpi_awareness`]).
 //!
 //! The window never takes input or focus:
 //! - `WS_EX_LAYERED | WS_EX_TRANSPARENT` makes the window manager skip it in hit tests, so
