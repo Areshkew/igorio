@@ -1262,12 +1262,18 @@ impl Window<'_> {
             notes: true,
             recording_available: Action::ToggleRecording.available(),
             recording_enabled: self.features.recording,
+            // The user's order, hidden tools left out, as the real menu.
+            menu: self.options.settings.tool_menu,
             ..ToolContext::default()
         };
         let rows: Vec<(ToolId, Vec<String>)> = summoner::offered(&context)
             .into_iter()
             .map(|id| (id, summoner::tool_chips(id, &self.shortcuts)))
             .collect();
+        // Every tool hidden: the real menu never opens, so the scene shows none.
+        if rows.is_empty() {
+            return;
+        }
         let scale_ = f64::from(dpi) / 96.0;
         let px = |v: f64| (v * scale_).round() as i32;
         // The hot spot where the window's top-left corner comes out at (0, 0).

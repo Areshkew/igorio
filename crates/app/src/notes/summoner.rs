@@ -1,7 +1,8 @@
 //! The tool menu at the cursor: hold Alt on its own anywhere except over a text field (a
 //! button, a link, page text, the desktop, a window background) and a small menu of tools
-//! opens under the cursor (New note, Record screen; [`TOOLS`]). Its first row sits under the
-//! cursor, so "hold Alt, click" still makes a note in one click; moving to another row and
+//! opens under the cursor (New note, Record screen; [`TOOLS`], in the order the user chose in
+//! the settings, hidden ones left out: [`ToolMenu`]). Its first row sits under the cursor, so
+//! "hold Alt, click" runs the first tool (a new note by default) in one click; moving to another row and
 //! clicking runs that tool. The click is swallowed, so the app underneath never sees an
 //! Alt+click. Releasing Alt closes the menu.
 //! It replaces the summon pill of `NoteSummoner.swift` (the gesture is the same; the direct
@@ -92,8 +93,9 @@
 //!   terminal (they take typed text), our own windows and elevated windows. A lookup that
 //!   times out or fails allows it: a wrong open costs little. The lookup runs once the hold
 //!   delay has passed, not on every move.
-//! - At least one tool is offered ([`offered`], from the [`ToolContext`] the app passes in
-//!   and the kind of spot the lookup found). No tool: the menu does not open, nothing is
+//! - At least one tool is offered ([`offered`], from the [`ToolContext`] the app passes in,
+//!   the user's tool menu list in it, and the kind of spot the lookup found). No tool (every
+//!   tool hidden, or none can run): the menu does not open, nothing is
 //!   armed or injected, and the hold is used up.
 //!
 //! # While the menu shows
@@ -138,7 +140,7 @@
 //!   [`feed`](Summoner::feed) with the mouse events its own mouse hook delivers (there is
 //!   still exactly one mouse hook in the process), [`set_blocked`](Summoner::set_blocked),
 //!   [`set_enabled`](Summoner::set_enabled), [`apply_config`](Summoner::apply_config),
-//!   [`set_tool_context`](Summoner::set_tool_context),
+//!   [`set_tool_context`](Summoner::set_tool_context), [`set_tool_menu`](Summoner::set_tool_menu),
 //!   [`set_shortcuts`](Summoner::set_shortcuts),
 //!   [`summon_at_cursor`](Summoner::summon_at_cursor) for the NewNote hotkey, and
 //!   [`drain`](Summoner::drain) after [`wake_handle`](Summoner::wake_handle) is signalled.
@@ -388,7 +390,7 @@ pub enum ToolId {
 }
 
 impl ToolId {
-    /// Short id for logs and the demo (`note`, `record`).
+    /// Short stable id for settings.json (`tool_menu`), logs and the demo (`note`, `record`).
     pub fn id(self) -> &'static str {
         tool(self).id_text
     }
@@ -449,6 +451,9 @@ pub struct ToolContext {
     /// The user carries cards.
     pub cards_held: bool,
     pub spot: Spot,
+    /// The user's order of the tools and which ones the menu shows (`tool_menu` in the
+    /// settings; [`Summoner::set_tool_menu`]).
+    pub menu: ToolMenu,
 }
 
 /// One entry of the menu.
@@ -464,7 +469,8 @@ pub struct Tool {
     pub offered: fn(&ToolContext) -> bool,
 }
 
-/// Every tool, in menu order; the first offered one sits under the cursor. Only tools go
+/// Every tool, in the default menu order (the user can change it: [`ToolMenu`]); the first
+/// offered one sits under the cursor. Only tools go
 /// here (restore, discard, settings and recent notes stay in the tray menu). This list is
 /// where later, context-aware tools go (an idea for later, not built: a grammar check offered
 /// while the user types in a text field): an entry whose `offered` reads the facts it needs
@@ -495,13 +501,123 @@ pub fn tool(id: ToolId) -> &'static Tool {
         .expect("every ToolId is in TOOLS")
 }
 
-/// The tools offered in this context, in menu order.
+/// The tools offered in this context, in the user's order: shown in the menu and able to
+/// run now. Empty when every tool is hidden; then the menu never opens.
 pub fn offered(context: &ToolContext) -> Vec<ToolId> {
-    TOOLS
+    context
+        .menu
+        .entries()
         .iter()
-        .filter(|t| (t.offered)(context))
-        .map(|t| t.id)
+        .filter(|entry| entry.shown && (tool(entry.tool).offered)(context))
+        .map(|entry| entry.tool)
         .collect()
+}
+
+/// How many tools there are.
+pub const TOOL_COUNT: usize = TOOLS.len();
+
+/// One row of the user's tool menu list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuEntry {
+    pub tool: ToolId,
+    /// Listed in the menu. A hidden tool still runs from its shortcut.
+    pub shown: bool,
+}
+
+/// The user's order of the tools and which ones the menu shows; every tool is in it once.
+/// Stored as `tool_menu` in settings.json: `[{"id": "note", "shown": true}, ...]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolMenu([MenuEntry; TOOL_COUNT]);
+
+impl Default for ToolMenu {
+    /// The order of [`TOOLS`], all shown.
+    fn default() -> Self {
+        ToolMenu::from_entries([])
+    }
+}
+
+impl ToolMenu {
+    /// The given rows in order. A later row for the same tool is dropped; tools that are
+    /// missing are added at the end in [`TOOLS`] order, shown.
+    pub fn from_entries(entries: impl IntoIterator<Item = MenuEntry>) -> ToolMenu {
+        let mut list: Vec<MenuEntry> = Vec::with_capacity(TOOL_COUNT);
+        for entry in entries {
+            if !list.iter().any(|e| e.tool == entry.tool) {
+                list.push(entry);
+            }
+        }
+        for t in TOOLS {
+            if !list.iter().any(|e| e.tool == t.id) {
+                list.push(MenuEntry { tool: t.id, shown: true });
+            }
+        }
+        ToolMenu(list.try_into().expect("every tool once"))
+    }
+
+    pub fn entries(&self) -> &[MenuEntry] {
+        &self.0
+    }
+
+    /// Where `tool` is in the list.
+    pub fn position(&self, tool: ToolId) -> usize {
+        self.0.iter().position(|e| e.tool == tool).expect("every tool is in the list")
+    }
+
+    pub fn set_shown(&mut self, tool: ToolId, shown: bool) {
+        let index = self.position(tool);
+        self.0[index].shown = shown;
+    }
+
+    /// At least one tool is shown.
+    pub fn any_shown(&self) -> bool {
+        self.0.iter().any(|e| e.shown)
+    }
+
+    /// The row at `from` taken out and put back at `to` (clamped to the list); the rows in
+    /// between close up.
+    pub fn moved(&self, from: usize, to: usize) -> ToolMenu {
+        let mut list = self.0.to_vec();
+        if from < list.len() {
+            let entry = list.remove(from);
+            list.insert(to.min(list.len()), entry);
+        }
+        ToolMenu(list.try_into().expect("the same rows"))
+    }
+
+    /// Reads the `tool_menu` value of settings.json leniently: a value that is not a list
+    /// gives the default; a row without a known `id` is dropped, as is a later row for the
+    /// same tool; a `shown` that is missing or not a boolean is true; missing tools are added
+    /// at the end, shown.
+    pub fn from_json(value: &serde_json::Value) -> ToolMenu {
+        let Some(rows) = value.as_array() else {
+            return ToolMenu::default();
+        };
+        ToolMenu::from_entries(rows.iter().filter_map(|row| {
+            let tool = ToolId::parse(row.get("id")?.as_str()?)?;
+            let shown = row.get("shown").and_then(serde_json::Value::as_bool).unwrap_or(true);
+            Some(MenuEntry { tool, shown })
+        }))
+    }
+}
+
+impl serde::Serialize for ToolMenu {
+    /// A list of `{"id", "shown"}` in the user's order.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut list = serializer.serialize_seq(Some(TOOL_COUNT))?;
+        for entry in self.0 {
+            list.serialize_element(&serde_json::json!({ "id": entry.tool.id(), "shown": entry.shown }))?;
+        }
+        list.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ToolMenu {
+    /// Never fails on a well-formed JSON value; see [`ToolMenu::from_json`].
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(ToolMenu::from_json(&value))
+    }
 }
 
 /// The key chips of a tool's current shortcut (none when it has none).
@@ -1797,6 +1913,11 @@ const fn rgb(hex: u32) -> COLORREF {
 }
 
 /// A tool's icon in an [`ICON`]-DIP square, in the canvas's channel order.
+/// A tool's icon as the menu draws it (BGRA, for a DIB), for the settings window's tool list.
+pub fn tool_icon(id: ToolId, scale: f64, dark: bool) -> Option<Pixmap> {
+    icon_pixmap(tool(id).icon, scale, &Palette::for_theme(dark))
+}
+
 fn icon_pixmap(icon: Icon, scale: f64, palette: &Palette) -> Option<Pixmap> {
     let size = px(ICON, dpi_of(scale)).max(1) as u32;
     let mut pixmap = Pixmap::new(size, size)?;
@@ -2980,10 +3101,21 @@ impl Summoner {
 
     /// What the tools' conditions look at; sent on only when it changed. Read when the menu
     /// opens.
+    /// Its `menu` is ignored: [`set_tool_menu`](Self::set_tool_menu) sets that.
     pub fn set_tool_context(&mut self, context: ToolContext) {
+        let context = ToolContext { menu: self.start.context.menu, ..context };
         if context != self.start.context {
             self.start.context = context;
             self.shared.send(Command::Context(context));
+        }
+    }
+
+    /// The user's order of the tools and which ones the menu shows (the settings'
+    /// `tool_menu`); sent on only when it changed. Read when the menu opens.
+    pub fn set_tool_menu(&mut self, menu: ToolMenu) {
+        if menu != self.start.context.menu {
+            self.start.context.menu = menu;
+            self.shared.send(Command::Context(self.start.context));
         }
     }
 
@@ -4327,6 +4459,90 @@ mod tests {
         assert_eq!(offered(&app), vec![ToolId::NewNote, ToolId::RecordScreen]);
         let running = ToolContext { recording: true, ..app };
         assert_eq!(offered(&running), vec![ToolId::NewNote]);
+    }
+
+    fn entry(tool: ToolId, shown: bool) -> MenuEntry {
+        MenuEntry { tool, shown }
+    }
+
+    #[test]
+    fn offered_follows_the_users_order_and_leaves_hidden_tools_out() {
+        let reversed = ToolMenu::default().moved(0, 1);
+        assert_eq!(offered(&ToolContext { menu: reversed, ..both() }), vec![ToolId::RecordScreen, ToolId::NewNote]);
+        let mut hidden = reversed;
+        hidden.set_shown(ToolId::RecordScreen, false);
+        assert_eq!(offered(&ToolContext { menu: hidden, ..both() }), vec![ToolId::NewNote]);
+        // A shown tool that cannot run is still not offered.
+        assert_eq!(offered(&ToolContext { menu: reversed, ..notes_only() }), vec![ToolId::NewNote]);
+        hidden.set_shown(ToolId::NewNote, false);
+        assert!(!hidden.any_shown());
+        assert!(offered(&ToolContext { menu: hidden, ..both() }).is_empty());
+    }
+
+    #[test]
+    fn every_tool_hidden_never_opens_the_menu_and_uses_the_hold_up() {
+        let mut menu = ToolMenu::default();
+        for t in TOOLS {
+            menu.set_shown(t.id, false);
+        }
+        let mut s = Script::with(Modifier::Alt, ToolContext { menu, ..both() });
+        s.key(0.0, LALT, true);
+        s.tick_to(0.35);
+        s.answer(0.36, true);
+        assert!(s.untouched());
+        assert_eq!(s.g.phase(), Phase::Cancelled);
+        s.key(1.0, LALT, false);
+        assert!(s.untouched());
+        // The same hold with one tool shown opens the menu with just that tool.
+        menu.set_shown(ToolId::RecordScreen, true);
+        let s = Script::showing_with(Modifier::Alt, ToolContext { menu, ..both() });
+        assert_eq!(s.g.tools(), &[ToolId::RecordScreen]);
+    }
+
+    #[test]
+    fn the_tool_menu_list_reads_leniently() {
+        let read = |text: &str| ToolMenu::from_json(&serde_json::from_str(text).unwrap());
+        let default = ToolMenu::default();
+        assert_eq!(default.entries(), &[entry(ToolId::NewNote, true), entry(ToolId::RecordScreen, true)]);
+        for text in ["null", "{}", "\"note\"", "3", "[]"] {
+            assert_eq!(read(text), default, "{text}");
+        }
+        // Order kept, shown read; a row that is not a known id is dropped.
+        assert_eq!(
+            read(r#"[{"id": "record", "shown": false}, {"id": "grammar"}, 5, {"shown": false}, {"id": "note"}]"#).entries(),
+            &[entry(ToolId::RecordScreen, false), entry(ToolId::NewNote, true)]
+        );
+        // A later row for the same tool is dropped; a bad `shown` is true.
+        assert_eq!(
+            read(r#"[{"id": "record", "shown": "no"}, {"id": "record", "shown": false}, {"id": "note", "shown": false}]"#).entries(),
+            &[entry(ToolId::RecordScreen, true), entry(ToolId::NewNote, false)]
+        );
+        // Partial: the missing tool is appended, shown.
+        assert_eq!(
+            read(r#"[{"id": "record", "shown": false}]"#).entries(),
+            &[entry(ToolId::RecordScreen, false), entry(ToolId::NewNote, true)]
+        );
+        // Written as a list of rows, and read back the same.
+        let menu = read(r#"[{"id": "record", "shown": false}]"#);
+        let json = serde_json::to_value(menu).unwrap();
+        assert_eq!(json, serde_json::json!([{"id": "record", "shown": false}, {"id": "note", "shown": true}]));
+        assert_eq!(ToolMenu::from_json(&json), menu);
+    }
+
+    #[test]
+    fn moving_a_row_closes_up_the_rows_between() {
+        let menu = ToolMenu::default();
+        let ids = |m: ToolMenu| m.entries().iter().map(|e| e.tool).collect::<Vec<_>>();
+        assert_eq!(ids(menu.moved(0, 1)), [ToolId::RecordScreen, ToolId::NewNote]);
+        assert_eq!(ids(menu.moved(1, 0)), [ToolId::RecordScreen, ToolId::NewNote]);
+        assert_eq!(menu.moved(0, 0), menu);
+        // Past the end goes to the end; a row that is not there changes nothing.
+        assert_eq!(ids(menu.moved(0, 9)), [ToolId::RecordScreen, ToolId::NewNote]);
+        assert_eq!(menu.moved(5, 0), menu);
+        let mut hidden = menu;
+        hidden.set_shown(ToolId::RecordScreen, false);
+        assert_eq!(hidden.moved(1, 0).entries()[0], entry(ToolId::RecordScreen, false));
+        assert_eq!(hidden.moved(1, 0).position(ToolId::NewNote), 1);
     }
 
     // --- Motion and drawing ---

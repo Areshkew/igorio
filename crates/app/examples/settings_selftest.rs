@@ -1,4 +1,9 @@
-//! Exercises only our settings window and scratch files. No foreground activation or synthetic input.
+//! Exercises only our settings window and scratch files. No foreground activation or synthetic input:
+//! key and mouse messages go to our own test window only. With `IGORIO_TEST_MONITOR=secondary` the
+//! windows open on a monitor other than the primary one.
+#[path = "common/test_monitor.rs"]
+mod test_monitor;
+
 use std::cell::{Cell, RefCell};
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt;
@@ -10,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use igorio_app::input::Held;
 use igorio_app::layout::CardSize;
+use igorio_app::notes::summoner::{ToolId, ToolMenu};
 use igorio_app::overlay::ensure_dpi_awareness;
 use igorio_app::settings::Settings;
 use igorio_app::settings_window::{
@@ -20,7 +26,7 @@ use igorio_app::shortcuts::{
     Action, Chord, Registration, RegistrationReport, Shortcuts, display_for_layout,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, FILETIME, HANDLE, HWND, LPARAM, RECT, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, FILETIME, HANDLE, HWND, LPARAM, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
@@ -588,10 +594,10 @@ fn verify_pages(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: HWND
         [ShortcutPart::Label, ShortcutPart::Recorder, ShortcutPart::Status].map(|part| Control::shortcut(action, part))
     });
     checks.check(
-        "General page: its controls show, the Shortcuts page's are hidden and disabled",
+        "General page: its controls show, the Shortcuts and Tool menu pages' are hidden and disabled",
         checked(child(hwnd, GeneralTab))
             && general.iter().all(|&id| visible(child(hwnd, id)))
-            && shortcut_parts.clone().all(|id| !visible(child(hwnd, id)) && !enabled(child(hwnd, id))),
+            && shortcut_parts.clone().chain(TOOL_CONTROLS).all(|id| !visible(child(hwnd, id)) && !enabled(child(hwnd, id))),
     );
     click(hwnd, ShortcutsTab);
     checks.check(
@@ -614,23 +620,31 @@ fn verify_pages(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: HWND
                 && text(row(hwnd, action, ShortcutPart::Status)) == "Keyboard shortcuts are off."
         }),
     );
-    // Ctrl+Tab goes through the window's own message loop: post it, with Ctrl held per the seam.
-    controller.test_modifiers(Held { ctrl: true, ..Held::default() });
-    // SAFETY: a key message posted to our own test window, not synthetic input.
-    unsafe {
-        let _ = PostMessageW(Some(row(hwnd, Action::RestoreLast, ShortcutPart::Recorder)), WM_KEYDOWN, WPARAM(VK_TAB as usize), LPARAM(1));
-    }
-    thread::sleep(Duration::from_millis(100));
-    let general_again = checked(child(hwnd, GeneralTab)) && visible(child(hwnd, Screenshots));
-    // SAFETY: as above.
-    unsafe {
-        let _ = PostMessageW(Some(child(hwnd, Screenshots)), WM_KEYDOWN, WPARAM(VK_TAB as usize), LPARAM(1));
-    }
-    thread::sleep(Duration::from_millis(100));
-    controller.test_modifiers(Held::default());
+    // Ctrl+Tab goes through the window's own message loop: post it, with Ctrl (and Shift) held
+    // per the seam.
+    let ctrl_tab = |target: HWND, shift: bool| {
+        controller.test_modifiers(Held { ctrl: true, shift, ..Held::default() });
+        // SAFETY: a key message posted to our own test window, not synthetic input.
+        unsafe {
+            let _ = PostMessageW(Some(target), WM_KEYDOWN, WPARAM(VK_TAB as usize), LPARAM(1));
+        }
+        thread::sleep(Duration::from_millis(100));
+        controller.test_modifiers(Held::default());
+    };
+    let shown = |tab: Control, control: Control| checked(child(hwnd, tab)) && visible(child(hwnd, control));
+    ctrl_tab(row(hwnd, Action::RestoreLast, ShortcutPart::Recorder), false);
+    let tools = shown(ToolMenuTab, ToolRow0);
+    ctrl_tab(child(hwnd, ToolRow0), false);
+    let general = shown(GeneralTab, Screenshots);
+    ctrl_tab(child(hwnd, Screenshots), true);
+    let tools_back = shown(ToolMenuTab, ToolRow0);
+    ctrl_tab(child(hwnd, ToolRow0), true);
     checks.check(
-        "Ctrl+Tab switches to General and back to Shortcuts",
-        general_again && checked(child(hwnd, ShortcutsTab)) && visible(row(hwnd, Action::RestoreLast, ShortcutPart::Label)),
+        "Ctrl+Tab goes Shortcuts, Tool menu, General; Ctrl+Shift+Tab back to Tool menu and Shortcuts",
+        tools && general && tools_back
+            && checked(child(hwnd, ShortcutsTab))
+            && visible(row(hwnd, Action::RestoreLast, ShortcutPart::Label))
+            && !visible(child(hwnd, ToolRow0)),
     );
 }
 
@@ -827,6 +841,164 @@ fn verify_shortcuts(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: 
     Ok(())
 }
 
+const TOOL_CONTROLS: [Control; 4] = [ToolRow0, ToolSwitch0, ToolRow1, ToolSwitch1];
+const VK_UP: u16 = 0x26;
+const VK_DOWN: u16 = 0x28;
+/// The tool list's row pitch, logical px.
+const TOOL_PITCH: i32 = 52;
+
+/// Sends one mouse message to a tool row, at a point of its client area, as Windows would.
+fn mouse(target: HWND, message: u32, x: i32, y: i32) {
+    let held = if message == WM_LBUTTONUP { 0 } else { 1 }; // MK_LBUTTON
+    let point = ((y as u16 as u32) << 16 | x as u16 as u32) as isize;
+    // SAFETY: a mouse message to a control of our own test window, not synthetic input.
+    unsafe { SendMessageW(target, message, Some(WPARAM(held)), Some(LPARAM(point))) };
+}
+
+/// Drags the row at `from` by `dy` physical px, pressed 10 px into it.
+fn drag(hwnd: HWND, from: Control, dy: i32) {
+    let target = child(hwnd, from);
+    mouse(target, WM_LBUTTONDOWN, 10, 10);
+    mouse(target, WM_MOUSEMOVE, 10, 10 + dy / 2);
+    mouse(target, WM_MOUSEMOVE, 10, 10 + dy);
+    mouse(target, WM_LBUTTONUP, 10, 10 + dy);
+}
+
+fn tool_order(path: &Path) -> Vec<(ToolId, bool)> {
+    Settings::load(path).map_or_else(
+        |_| Vec::new(),
+        |settings| settings.tool_menu.entries().iter().map(|e| (e.tool, e.shown)).collect(),
+    )
+}
+
+fn row_name(label: &str, place: usize) -> String {
+    format!("{label}, {place} of 2, Alt+Up or Alt+Down moves it")
+}
+
+/// The Tool menu page: names, tab stops, switches, Alt+Up and Alt+Down, and drags, each saved
+/// and published at once.
+fn verify_tool_menu(checks: &mut Checks, controller: &mut SettingsWindow, hwnd: HWND, path: &Path, dpi: u32) -> Result<()> {
+    let mut expected = Settings::load(path)?;
+    let note = ToolId::NewNote;
+    let record = ToolId::RecordScreen;
+    click(hwnd, ToolMenuTab);
+    checks.check(
+        "Tool menu page: rows and switches show and are named; the General page's are hidden",
+        checked(child(hwnd, ToolMenuTab))
+            && TOOL_CONTROLS.iter().all(|&id| visible(child(hwnd, id)) && enabled(child(hwnd, id)))
+            && !visible(child(hwnd, Screenshots))
+            && !visible(child(hwnd, ToolMenuEmpty))
+            && text(child(hwnd, ToolRow0)) == row_name("New note", 1)
+            && text(child(hwnd, ToolRow1)) == row_name("Record screen", 2)
+            && text(child(hwnd, ToolSwitch0)) == "Show New note in the tool menu"
+            && text(child(hwnd, ToolSwitch1)) == "Show Record screen in the tool menu"
+            && checked(child(hwnd, ToolSwitch0))
+            && checked(child(hwnd, ToolSwitch1))
+            && text(child(hwnd, ToolMenuEmpty)) == "Every tool is hidden, so holding Alt opens no menu.",
+    );
+    let stops: Vec<HWND> = [ToolMenuTab, ToolRow0, ToolSwitch0, ToolRow1, ToolSwitch1].iter().map(|&id| child(hwnd, id)).collect();
+    checks.check("Tool menu page: Tab visits the tab, then each row and its switch", tab_cycle(hwnd) == stops);
+
+    // The switches hide and show a tool; with both hidden, the page says so.
+    click(hwnd, ToolSwitch1);
+    expected.tool_menu.set_shown(record, false);
+    checks.check(
+        "hiding Record screen saves, publishes and unchecks its switch",
+        disk(controller, path, &expected) && !checked(child(hwnd, ToolSwitch1)) && !visible(child(hwnd, ToolMenuEmpty)),
+    );
+    click(hwnd, ToolSwitch0);
+    expected.tool_menu.set_shown(note, false);
+    checks.check(
+        "hiding every tool saves and shows the empty line",
+        disk(controller, path, &expected) && !expected.tool_menu.any_shown() && visible(child(hwnd, ToolMenuEmpty)),
+    );
+    click(hwnd, ToolSwitch0);
+    expected.tool_menu.set_shown(note, true);
+    checks.check("showing New note again hides the empty line", disk(controller, path, &expected) && !visible(child(hwnd, ToolMenuEmpty)));
+
+    // Alt+Down on the first row moves it down; the switches go with their tools.
+    let alt = Held { alt: true, ..Held::default() };
+    key(controller, child(hwnd, ToolRow0), VK_DOWN, alt, true, false);
+    key(controller, child(hwnd, ToolRow0), VK_DOWN, alt, false, false);
+    expected.tool_menu = expected.tool_menu.moved(0, 1);
+    checks.check(
+        "Alt+Down moves New note below Record screen; saved; names and switches follow",
+        disk(controller, path, &expected)
+            && tool_order(path) == [(record, false), (note, true)]
+            && text(child(hwnd, ToolRow0)) == row_name("Record screen", 1)
+            && text(child(hwnd, ToolRow1)) == row_name("New note", 2)
+            && !checked(child(hwnd, ToolSwitch0))
+            && checked(child(hwnd, ToolSwitch1)),
+    );
+    // Nothing moves past the ends, and arrows without Alt do nothing.
+    key(controller, child(hwnd, ToolRow0), VK_UP, alt, true, false);
+    key(controller, child(hwnd, ToolRow1), VK_DOWN, alt, true, false);
+    key(controller, child(hwnd, ToolRow1), VK_UP, Held::default(), true, false);
+    controller.test_modifiers(Held::default());
+    checks.check(
+        "Alt+Up on the first row, Alt+Down on the last and a plain Up change nothing",
+        Settings::load(path)? == expected && controller.saved(None, &expected.shortcuts).is_empty(),
+    );
+    key(controller, child(hwnd, ToolRow1), VK_UP, alt, true, false);
+    controller.test_modifiers(Held::default());
+    expected.tool_menu = expected.tool_menu.moved(1, 0);
+    checks.check(
+        "Alt+Up moves New note back to the top",
+        disk(controller, path, &expected) && tool_order(path) == [(note, true), (record, false)],
+    );
+
+    // Drags: past half a row swaps the two; less leaves them; upward works too.
+    let pitch = (TOOL_PITCH * dpi as i32 + 48) / 96;
+    drag(hwnd, ToolRow0, pitch / 2 - 6);
+    checks.check(
+        "a drag of less than half a row puts the row back and saves nothing",
+        Settings::load(path)? == expected && controller.saved(None, &expected.shortcuts).is_empty(),
+    );
+    drag(hwnd, ToolRow0, pitch / 2 + 6);
+    expected.tool_menu = expected.tool_menu.moved(0, 1);
+    checks.check(
+        "dragging New note down past half a row drops it second; saved",
+        disk(controller, path, &expected)
+            && tool_order(path) == [(record, false), (note, true)]
+            && text(child(hwnd, ToolRow1)) == row_name("New note", 2),
+    );
+    drag(hwnd, ToolRow1, -3 * pitch);
+    expected.tool_menu = expected.tool_menu.moved(1, 0);
+    checks.check(
+        "dragging it far up drops it first",
+        disk(controller, path, &expected) && tool_order(path) == [(note, true), (record, false)],
+    );
+    // Back to every tool shown, as the other checks expect.
+    click(hwnd, ToolSwitch1);
+    expected.tool_menu.set_shown(record, true);
+    checks.check("showing Record screen again saves", disk(controller, path, &expected) && expected.tool_menu == ToolMenu::default());
+    click(hwnd, GeneralTab);
+    Ok(())
+}
+
+/// Each tool row and switch sits where it is painted: the row's patch fills it with paper
+/// above it, and the switch's rail is drawn inside its box.
+fn tool_rows_where_painted(checks: &mut Checks, hwnd: HWND, shot: &Shot, dpi: u32, label: &str) {
+    let px = |v: i32| (v * dpi as i32 + 48) / 96;
+    let paper = shot.at(2, 2);
+    for (row, switch) in [(ToolRow0, ToolSwitch0), (ToolRow1, ToolSwitch1)] {
+        let (Some(r), Some(s)) = (child_rect(hwnd, row), child_rect(hwnd, switch)) else {
+            checks.check(&format!("{label}: {row:?} and {switch:?} are visible"), false);
+            continue;
+        };
+        let middle = (r.top + r.bottom) / 2;
+        let face = shot.at(r.right - px(6), middle);
+        let above = shot.at(r.right - px(6), r.top - px(3));
+        let below = shot.at(r.right - px(6), r.bottom + px(3));
+        let rail = shot.at(s.right - px(24), (s.top + s.bottom) / 2);
+        let beside = shot.at(s.left + px(2), (s.top + s.bottom) / 2);
+        checks.check(
+            &format!("{label}: {row:?} is painted inside its box, paper above and below; {switch:?}'s rail inside its box"),
+            face != paper && above == paper && below == paper && rail != beside && beside == face,
+        );
+    }
+}
+
 /// Starts recording on Restore last screenshot and waits for the pause.
 fn start_recording(controller: &mut SettingsWindow, hwnd: HWND, ui: &mut Loop<'_>) -> bool {
     click(hwnd, ShortcutsTab);
@@ -898,7 +1070,39 @@ fn check_idle(checks: &mut Checks, window: &SettingsWindow, page: &str) -> Resul
     Ok(())
 }
 
+fn child_rect(hwnd: HWND, id: Control) -> Option<RECT> {
+    // SAFETY: a same-process child; its screen rectangle is mapped into the parent's client.
+    unsafe {
+        let child = GetDlgItem(Some(hwnd), id as i32).ok()?;
+        if !IsWindowVisible(child).as_bool() {
+            return None;
+        }
+        let mut rect = RECT::default();
+        GetWindowRect(child, &mut rect).ok()?;
+        let mut points = [POINT { x: rect.left, y: rect.top }, POINT { x: rect.right, y: rect.bottom }];
+        MapWindowPoints(None, Some(hwnd), &mut points);
+        Some(RECT { left: points[0].x, top: points[0].y, right: points[1].x, bottom: points[1].y })
+    }
+}
+
+/// A captured client area, RGB.
+struct Shot {
+    width: i32,
+    rgb: Vec<u8>,
+}
+
+impl Shot {
+    fn at(&self, x: i32, y: i32) -> [u8; 3] {
+        let i = ((y * self.width + x) * 3) as usize;
+        [self.rgb[i], self.rgb[i + 1], self.rgb[i + 2]]
+    }
+}
+
 fn capture(hwnd: HWND, path: &Path, dpi: u32) -> Result<bool> {
+    Ok(capture_shot(hwnd, path, dpi)?.0)
+}
+
+fn capture_shot(hwnd: HWND, path: &Path, dpi: u32) -> Result<(bool, Shot)> {
     // SAFETY: wait for the compositor to consume the frozen client paint before PrintWindow.
     let _ = unsafe { DwmFlush() };
     let mut client = RECT::default();
@@ -953,7 +1157,7 @@ fn capture(hwnd: HWND, path: &Path, dpi: u32) -> Result<bool> {
     encoder.write_header()?.write_image_data(&rgb)?;
     let pixels = rgb.as_chunks::<3>().0;
     let varied = pixels.iter().filter(|pixel| **pixel != pixels[0]).count() > 1000;
-    Ok(rendered && varied && (w, h) == test_client_size(dpi))
+    Ok((rendered && varied && (w, h) == test_client_size(dpi), Shot { width: w, rgb }))
 }
 
 /// Waits up to two seconds for a saved snapshot with `count` recording hints.
@@ -1015,6 +1219,7 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
         dark: true,
         dpi: 96,
         run_suffix: 0,
+        at: test_monitor::test_monitor_point(),
     };
     fs::create_dir_all(defaults.notes.parent().unwrap())?;
     fs::create_dir_all(defaults.captures.parent().unwrap())?;
@@ -1040,11 +1245,21 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
     for cycle in 1..=3 {
         let hwnd = open(&mut controller)?;
         if cycle == 1 {
+            let at = defaults.at;
+            println!("INFO test windows open {}", at.map_or("on the cursor's monitor".into(), |(x, y)| format!("around ({x}, {y})")));
+            if let Some((x, y)) = at {
+                // SAFETY: monitor lookups for our own window and a point; no pointers kept.
+                let same = unsafe {
+                    MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL) == MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL)
+                };
+                checks.check("the window opens on the test monitor", same);
+            }
             // Include the composed surface after the opening transition settles.
             thread::sleep(Duration::from_millis(200));
             report_memory("while open")?;
             verify_controls(&mut checks, &mut controller, hwnd, &path, &defaults)?;
             verify_shortcuts(&mut checks, &mut controller, hwnd, &path)?;
+            verify_tool_menu(&mut checks, &mut controller, hwnd, &path, defaults.dpi)?;
         } else {
             checks.check(
                 &format!("cycle {cycle} reloads the saved check states and shortcuts"),
@@ -1161,6 +1376,9 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
             click(hwnd, ShortcutsTab);
             ui.idle(&mut window);
             check_idle(&mut checks, &window, "Shortcuts")?;
+            click(hwnd, ToolMenuTab);
+            ui.idle(&mut window);
+            check_idle(&mut checks, &window, "Tool menu")?;
             click(hwnd, GeneralTab);
             ui.idle(&mut window);
         }
@@ -1195,9 +1413,46 @@ fn run(cycles_done: &AtomicBool) -> Result<bool> {
         } else {
             capture_rows(&mut checks, &mut window, hwnd, &mut ui, &folder)?;
         }
+        click(hwnd, ToolMenuTab);
+        ui.idle(&mut window);
+        window.test_scene(TestScene::Settled);
+        let name = format!("settings-pages-toolmenu-{suffix}.png");
+        let (painted, shot) = capture_shot(hwnd, &folder.join(&name), dpi)?;
+        checks.check(&name, painted);
+        tool_rows_where_painted(&mut checks, hwnd, &shot, dpi, &name);
+        if !dark {
+            capture_tools(&mut checks, &window, hwnd, &folder)?;
+        }
         checks.check("capture window closes within one second", close(&mut window, hwnd));
     }
     Ok(checks.ok)
+}
+
+/// The Tool menu page mid-drag, with a hidden tool and a tool whose capability is off, and
+/// with every tool hidden, at 100% light.
+fn capture_tools(checks: &mut Checks, window: &SettingsWindow, hwnd: HWND, folder: &Path) -> Result<()> {
+    let shot = |checks: &mut Checks, name: &str| -> Result<()> {
+        window.test_scene(TestScene::Settled);
+        checks.check(name, capture(hwnd, &folder.join(name), 96)?);
+        Ok(())
+    };
+    // New note held two thirds of a row down: Record screen has moved up under it.
+    let row = child(hwnd, ToolRow0);
+    mouse(row, WM_LBUTTONDOWN, 10, 10);
+    mouse(row, WM_MOUSEMOVE, 10, 10 + TOOL_PITCH * 2 / 3);
+    shot(checks, "settings-toolmenu-drag.png")?;
+    // Let go where it started: nothing changes.
+    mouse(row, WM_MOUSEMOVE, 10, 10);
+    mouse(row, WM_LBUTTONUP, 10, 10);
+    // New note hidden; Screen recording switched off, so its row is dimmed and says so.
+    click(hwnd, ToolSwitch0);
+    click(hwnd, GeneralTab);
+    click(hwnd, Recording);
+    click(hwnd, ToolMenuTab);
+    shot(checks, "settings-toolmenu-hidden.png")?;
+    click(hwnd, ToolSwitch1);
+    shot(checks, "settings-toolmenu-empty.png")?;
+    Ok(())
 }
 
 /// The Shortcuts page in its states, at 100% light.
