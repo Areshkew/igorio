@@ -61,6 +61,10 @@ use crate::overlay::{cursor_pos, monitor_bounds_at};
 use crate::settings::{DefaultFolders, Settings};
 use crate::shortcuts::{Action, Shortcuts, display_for_layout};
 
+/// The zoom hint shows at the start of this many recordings. Nothing counts them up yet:
+/// the settings are written by the settings window's thread, which has no path for the app
+/// to change a value, so `recording_hints_shown` stays 0 and the hint shows every time.
+pub const START_HINT_RECORDINGS: u32 = 3;
 /// The capability's id in `settings.json` (`RecordingCapability.manifest.id`).
 pub const CAPABILITY: &str = "fairy.screen-recording";
 /// The drawn cursor's size: `CursorScale.enlarge` turns the usual size 1 into
@@ -96,6 +100,9 @@ pub enum Input {
     Failed,
     /// The capability was switched off in the settings.
     SwitchedOff,
+    /// The stop button on the recording strip. Unlike `Toggle` it can only stop: a late click
+    /// never starts a new recording.
+    StopRequested,
 }
 
 /// What to do for an input, in this order.
@@ -128,7 +135,7 @@ pub fn advance(state: RecordingState, input: Input) -> (RecordingState, &'static
         (Starting, I::SwitchedOff) => (Stopping, &[Step::StopRecorder]),
         // Not expected (the recorder starts before it finishes), but a file is a file.
         (Starting, I::Finished) => (Idle, &[Step::Carry]),
-        (Recording, I::Toggle | I::SwitchedOff) => {
+        (Recording, I::Toggle | I::SwitchedOff | I::StopRequested) => {
             (Stopping, &[Step::StopUi, Step::StopRecorder])
         }
         (Recording, I::UiFailed) => (Stopping, &[Step::StopRecorder, Step::Explain]),
@@ -290,6 +297,8 @@ pub struct RecordingFeature {
     frame: f64,
     recorder_events: Vec<RecorderEvent>,
     ui_events: Vec<UiEvent>,
+    /// The strip's stop button was clicked, for this pass.
+    stop_requested: bool,
 }
 
 impl RecordingFeature {
@@ -316,6 +325,7 @@ impl RecordingFeature {
             frame,
             recorder_events: Vec::new(),
             ui_events: Vec::new(),
+            stop_requested: false,
         }
     }
 
@@ -438,6 +448,10 @@ impl RecordingFeature {
         }
         self.recorder_pass(settings, now, &mut out);
         self.ui_pass(now);
+        if std::mem::take(&mut self.stop_requested) {
+            self.line(now, "stop button");
+            self.input(Input::StopRequested, settings, now, &mut out);
+        }
         self.step_viewport(now, &mut out);
         self.closing_pass(now, &mut out);
         let block = self.state != RecordingState::Idle;
@@ -625,6 +639,7 @@ impl RecordingFeature {
         }
         let config = RecordingUiConfig {
             labels: labels(&settings.shortcuts),
+            show_start_hint: settings.recording_hints_shown < START_HINT_RECORDINGS,
             capturable: std::env::var_os("FAIRY_CAPTURABLE").is_some_and(|v| v == "1"),
             debug: self.log.enabled(),
             ..RecordingUiConfig::default()
@@ -686,6 +701,7 @@ impl RecordingFeature {
                     self.tool = tool;
                     self.line(now, &format!("tool {tool:?}"));
                 }
+                UiEvent::StopRequested => self.stop_requested = true,
                 UiEvent::Hidden => {}
                 UiEvent::Log(line) => self.ui_log(now, &line),
             }
@@ -886,19 +902,20 @@ mod tests {
     use RecordingState::{Idle, Recording, Starting, Stopping};
 
     const STATES: [RecordingState; 4] = [Idle, Starting, Recording, Stopping];
-    const INPUTS: [Input; 6] = [
+    const INPUTS: [Input; 7] = [
         Input::Toggle,
         Input::Started,
         Input::UiFailed,
         Input::Finished,
         Input::Failed,
         Input::SwitchedOff,
+        Input::StopRequested,
     ];
 
     #[test]
     fn every_input_in_every_state() {
         use Step::*;
-        let table: [(RecordingState, Input, RecordingState, &[Step]); 24] = [
+        let table: [(RecordingState, Input, RecordingState, &[Step]); 28] = [
             (Idle, Input::Toggle, Starting, &[Launch]),
             (Idle, Input::Started, Idle, &[]),
             (Idle, Input::UiFailed, Idle, &[]),
@@ -925,6 +942,11 @@ mod tests {
             (Stopping, Input::Finished, Idle, &[Carry]),
             (Stopping, Input::Failed, Idle, &[Explain]),
             (Stopping, Input::SwitchedOff, Stopping, &[]),
+            // The strip's stop button stops a recording and nothing else.
+            (Idle, Input::StopRequested, Idle, &[]),
+            (Starting, Input::StopRequested, Starting, &[]),
+            (Recording, Input::StopRequested, Stopping, &[StopUi, StopRecorder]),
+            (Stopping, Input::StopRequested, Stopping, &[]),
         ];
         for (state, input, next, steps) in table {
             assert_eq!(advance(state, input), (next, steps), "{state:?} + {input:?}");

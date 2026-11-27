@@ -1,14 +1,16 @@
-//! Self-check for the recording UI (`igorio_app::recording`): the ink window, the outline
-//! and the pill, and the input gates. Non-interactive; prints PASS, FAIL or INFO per check
-//! and exits 0 only if every hard check passed.
+//! Self-check for the recording UI (`igorio_app::recording`): the ink window, the outline,
+//! the control strip and its tip, and the input gates. Non-interactive; prints PASS, FAIL or
+//! INFO per check and exits 0 only if every hard check passed.
 //!
-//! It sends no keyboard or mouse input and never moves the cursor. The ink is drawn with
-//! messages posted to our own ink window, the path real mouse messages take. To stay out of
-//! the way of a person using the desktop:
+//! It sends no keyboard or mouse input and never moves the cursor. The ink is drawn, and the
+//! strip's buttons are clicked and hovered, with messages posted to our own windows, the path
+//! real mouse messages take. To stay out of the way of a person using the desktop:
 //! - the "monitor" of the main run is a small region of the real one, so the ink window, the
-//!   outline and the pill only cover that region, for a few seconds;
+//!   outline and the strip only cover that region, for a few seconds;
+//! - an opaque backdrop window of our own (not topmost) lies under that region, so the
+//!   screen captures compare our own pixels and not whatever the desktop shows there;
 //! - a tool is in hand (the region takes the mouse, Esc, Backspace, Delete and Ctrl+Z are
-//!   swallowed) for about a second;
+//!   swallowed) for about two seconds;
 //! - the mask key is off; the wheel gate is armed while the UI runs (Alt + wheel does not
 //!   scroll for those seconds);
 //! - the 4K timing runs keep the ink window click-through and install no keyboard hook.
@@ -32,31 +34,46 @@ use igorio_app::hook::{CLICK_GATE, WHEEL_GATE};
 use igorio_app::ink_draw::{InkRenderer, tool_cursor};
 use igorio_app::overlay::{MonitorBounds, cursor_pos, ensure_dpi_awareness, monitor_bounds_at};
 use igorio_app::recording::frame::{
-    self, Fonts, Labels, outline_rect, outline_strips, pill_origin, pill_text, render_pill,
+    self, Fonts, Labels, Part, PillLook, Tip, outline_rect, outline_strips, pill_layout,
+    pill_model, pill_origin, render_pill, render_tip, tip_origin, tip_segments,
 };
 use igorio_app::recording::ink_overlay::{InkStats, RecordingUi, RecordingUiConfig, UiEvent};
 use igorio_app::recording::input::{DRAW_KEYS, ZoomModifier};
 use igorio_core::geom::{Point, Rect};
 use igorio_core::ink::{Ink, InkKey, InkTool};
 use tiny_skia::{Color, Paint, Pixmap, PixmapPaint, Transform};
-use windows::Win32::Foundation::{FILETIME, HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, FILETIME, HINSTANCE, HWND, LPARAM, POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, HBITMAP, HDC, HGDIOBJ, ReleaseDC,
-    SRCCOPY, SelectObject,
+    CreateSolidBrush, DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetDC, HBITMAP, HBRUSH,
+    HDC, HGDIOBJ, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, ReleaseDC, SRCCOPY,
+    SelectObject,
 };
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EVENT_SYSTEM_FOREGROUND, GA_ROOT, GWL_EXSTYLE, GetAncestor,
-    GetForegroundWindow, GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowThreadProcessId,
-    IsWindow, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, PostMessageW, WDA_EXCLUDEFROMCAPTURE,
-    WDA_NONE, WINEVENT_OUTOFCONTEXT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WindowFromPoint,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EVENT_SYSTEM_FOREGROUND,
+    GA_ROOT, GW_HWNDNEXT, GWL_EXSTYLE, GetAncestor, GetForegroundWindow, GetWindow,
+    GetWindowDisplayAffinity, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOP,
+    IsWindow, IsWindowVisible, MSG, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos, WDA_EXCLUDEFROMCAPTURE,
+    WDA_NONE, WINEVENT_OUTOFCONTEXT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WindowFromPoint,
 };
+use windows::core::w;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// `WM_MOUSELEAVE`.
+const WM_MOUSELEAVE: u32 = 0x02A3;
+/// The backdrop's colour (RGB): a quiet blue-grey, so the ink, the outline and the strip all
+/// differ from it.
+const BACKDROP: [u8; 3] = [205, 213, 224];
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -114,6 +131,144 @@ fn region(monitor: &MonitorBounds) -> MonitorBounds {
     }
 }
 
+// MARK: - The backdrop
+
+/// An opaque window of our own under the test region: what the captures see behind our
+/// windows. Not topmost, never activated; raised to the top of the normal band before each
+/// capture.
+struct Backdrop {
+    hwnd: HWND,
+}
+
+impl Backdrop {
+    fn new(rect: (i32, i32, i32, i32)) -> Result<Backdrop> {
+        // SAFETY: plain calls; the brush is owned by the class for the process's life, the
+        // class only points to static data and a system function.
+        unsafe {
+            let instance = HINSTANCE(GetModuleHandleW(None)?.0);
+            let brush: HBRUSH = CreateSolidBrush(COLORREF(
+                u32::from(BACKDROP[0]) | u32::from(BACKDROP[1]) << 8 | u32::from(BACKDROP[2]) << 16,
+            ));
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(backdrop_proc),
+                hInstance: instance,
+                hbrBackground: brush,
+                lpszClassName: w!("IgorioSelftestBackdrop"),
+                ..Default::default()
+            };
+            RegisterClassW(&class);
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("IgorioSelftestBackdrop"),
+                w!("recording_ui_selftest backdrop"),
+                WS_POPUP,
+                rect.0,
+                rect.1,
+                rect.2,
+                rect.3,
+                None,
+                None,
+                Some(instance),
+                None,
+            )?;
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            let _ = RedrawWindow(
+                Some(hwnd),
+                None,
+                None,
+                RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW,
+            );
+            Ok(Backdrop { hwnd })
+        }
+    }
+
+    /// Back to the top of the normal band (a window the person activated may have covered
+    /// it); our test windows are topmost and stay above it.
+    fn raise(&self) {
+        // SAFETY: our own window; no activation.
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = RedrawWindow(
+                Some(self.hwnd),
+                None,
+                None,
+                RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW,
+            );
+        }
+        pump();
+        flush();
+    }
+}
+
+impl Drop for Backdrop {
+    fn drop(&mut self) {
+        // SAFETY: made on this thread, destroyed once.
+        let _ = unsafe { DestroyWindow(self.hwnd) };
+    }
+}
+
+// MARK: - The strip
+
+fn window_rect(hwnd: HWND) -> (i32, i32, i32, i32) {
+    let mut r = RECT::default();
+    // SAFETY: writes into a local.
+    let _ = unsafe { GetWindowRect(hwnd, &mut r) };
+    (r.left, r.top, r.right - r.left, r.bottom - r.top)
+}
+
+/// The centre of a strip part, in the strip window's client pixels and on screen.
+fn part_point(ui: &RecordingUi, part: Part) -> Option<((i32, i32), POINT)> {
+    let pill = ui.pill();
+    let b = pill.parts.iter().find(|(p, _)| *p == part)?.1;
+    let screen = POINT {
+        x: b.x + b.w / 2,
+        y: b.y + b.h / 2,
+    };
+    Some(((screen.x - pill.origin.0, screen.y - pill.origin.1), screen))
+}
+
+/// A click on a part of the strip: press and release posted to its window.
+fn click(ui: &RecordingUi, pill: HWND, part: Part) -> bool {
+    let Some((client, _)) = part_point(ui, part) else {
+        return false;
+    };
+    post(pill, WM_LBUTTONDOWN, 1, client);
+    post(pill, WM_LBUTTONUP, 0, client);
+    true
+}
+
+/// Is `upper` above `lower` in the z-order?
+fn above(upper: HWND, lower: HWND) -> bool {
+    let mut next = upper;
+    for _ in 0..10_000 {
+        // SAFETY: walks the z-order; a stale handle just ends the walk.
+        next = match unsafe { GetWindow(next, GW_HWNDNEXT) } {
+            Ok(h) if !h.is_invalid() => h,
+            _ => return false,
+        };
+        if next == lower {
+            return true;
+        }
+    }
+    false
+}
+
 fn run() -> Result<bool> {
     ensure_dpi_awareness();
     let mut report = Report { pass: true };
@@ -140,10 +295,13 @@ fn run() -> Result<bool> {
             "off (reduced motion)"
         }
     ));
+    let rect = (r.x as i32, r.y as i32, r.width as i32, r.height as i32);
+    let backdrop = Backdrop::new(rect)?;
+    settle_plain(150);
 
     let config = RecordingUiConfig {
         inject_mask: false,
-        debug: false,
+        show_start_hint: true,
         ..RecordingUiConfig::default()
     };
     let mut events = Vec::new();
@@ -166,6 +324,8 @@ fn run() -> Result<bool> {
 
     // 1. Styles.
     let ink = HWND(windows.ink as *mut c_void);
+    let pill_hwnd = HWND(windows.frame[4] as *mut c_void);
+    let tip_hwnd = HWND(windows.frame[5] as *mut c_void);
     let ink_style = ex_style(ink);
     let base = WS_EX_LAYERED.0 | WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0;
     report.check(
@@ -179,27 +339,42 @@ fn run() -> Result<bool> {
             affinity(ink)
         ),
     );
-    let mut frame_ok = windows.frame.len() == 5;
-    let mut frame_text = Vec::new();
-    for &hwnd in &windows.frame {
+    let visible = |h: HWND| {
+        // SAFETY: reads a flag of a window handle.
+        unsafe { IsWindowVisible(h) }.as_bool()
+    };
+    let mut strips_ok = windows.frame.len() == 6;
+    for &hwnd in &windows.frame[..4] {
         let hwnd = HWND(hwnd as *mut c_void);
         let style = ex_style(hwnd);
-        let affinity = affinity(hwnd);
-        // SAFETY: reads a flag of a window handle.
-        let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
-        frame_ok &= style & (base | WS_EX_TRANSPARENT.0) == base | WS_EX_TRANSPARENT.0
-            && affinity == WDA_EXCLUDEFROMCAPTURE.0
-            && visible;
-        frame_text.push(format!(
-            "0x{style:08X}/{affinity:02X}/{}",
-            if visible { "shown" } else { "hidden" }
-        ));
+        strips_ok &= style & (base | WS_EX_TRANSPARENT.0) == base | WS_EX_TRANSPARENT.0
+            && affinity(hwnd) == WDA_EXCLUDEFROMCAPTURE.0
+            && visible(hwnd);
     }
     report.check(
-        frame_ok,
+        strips_ok,
+        "outline strips: layered, click-through, topmost, no-activate, tool windows, excluded from capture, shown",
+    );
+    let pill_style = ex_style(pill_hwnd);
+    report.check(
+        pill_style & base == base
+            && pill_style & WS_EX_TRANSPARENT.0 == 0
+            && affinity(pill_hwnd) == WDA_EXCLUDEFROMCAPTURE.0
+            && visible(pill_hwnd),
+        format_args!("control strip: layered, topmost, no-activate, tool window, takes the mouse (not click-through), excluded from capture, shown (ex-style 0x{pill_style:08X})"),
+    );
+    let tip_style = ex_style(tip_hwnd);
+    report.check(
+        tip_style & (base | WS_EX_TRANSPARENT.0) == base | WS_EX_TRANSPARENT.0
+            && affinity(tip_hwnd) == WDA_EXCLUDEFROMCAPTURE.0,
+        "tip window: click-through, topmost, no-activate, excluded from capture",
+    );
+    let (_, _, pill_w, _) = window_rect(pill_hwnd);
+    report.check(
+        f64::from(pill_w) / scale <= frame::PILL_MAX_WIDTH + 50.0,
         format_args!(
-            "outline strips and pill: layered, click-through, topmost, no-activate, tool windows, excluded from capture, shown ({})",
-            frame_text.join(" ")
+            "the strip is {:.0} DIPs wide with the 2.0x badge",
+            f64::from(pill_w) / scale
         ),
     );
     report.check(
@@ -211,13 +386,29 @@ fn run() -> Result<bool> {
         "drawing keys not taken with no tool in hand",
     );
 
-    // 2. Baseline capture of the region (the outline and the pill are up, excluded).
-    let rect = (r.x as i32, r.y as i32, r.width as i32, r.height as i32);
-    let mut capture = Capture::new(rect.2, rect.3)?;
-    flush();
-    let baseline = capture.grab(rect)?.to_vec();
+    // 2. The start hint fades in under the strip.
+    let hinted = wait_until(&ui, &mut events, 2000, |ui| {
+        ui.pill().tip == Some(Tip::StartHint)
+    });
+    report.check(
+        hinted,
+        "the start hint \"Hold Alt and scroll to zoom\" shows under the strip",
+    );
 
-    // 3. Click-through from another process with no tool.
+    // 3. Baseline capture of the region: our backdrop under excluded windows.
+    let mut capture = Capture::new(rect.2, rect.3)?;
+    backdrop.raise();
+    let baseline = capture.grab(rect)?.to_vec();
+    let backdrop_share = share_of(&baseline, BACKDROP);
+    report.check(
+        backdrop_share > 0.99,
+        format_args!(
+            "the capture of the region shows only our backdrop ({:.2}% of its pixels)",
+            backdrop_share * 100.0
+        ),
+    );
+
+    // 4. Who takes the mouse, seen from a second process.
     let spot = POINT {
         x: rect.0 + rect.2 / 2,
         y: rect.1 + rect.3 * 3 / 4,
@@ -225,29 +416,73 @@ fn run() -> Result<bool> {
     let own_pid = std::process::id();
     let before = run_probe(spot, &ui, &mut events)?;
     report.check(
-        before.0 != windows.ink && before.1 != own_pid,
-        format_args!("no tool: a second process finds the window below at {},{} (window 0x{:X}, pid {}), not the ink window", spot.x, spot.y, before.0, before.1),
+        before.0 == backdrop.hwnd.0 as isize,
+        format_args!("no tool: a second process finds the window below at {},{} (our backdrop 0x{:X}), not the ink window", spot.x, spot.y, before.0),
+    );
+    let (_, pen_screen) = part_point(&ui, Part::Pen).ok_or("no pen button")?;
+    let on_pen = run_probe(pen_screen, &ui, &mut events)?;
+    report.check(
+        on_pen.0 == windows.frame[4] && on_pen.1 == own_pid,
+        format_args!("a second process finds the strip under its pen button at {},{}: the strip takes its own clicks", pen_screen.x, pen_screen.y),
+    );
+    let top = outline_strips(area, r, scale)[0].ok_or("no top strip")?;
+    let outline = outline_rect(area, scale).ok_or("no outline")?;
+    let on_line = POINT {
+        x: outline.x + outline.w / 2,
+        y: outline.y,
+    };
+    let through = run_probe(on_line, &ui, &mut events)?;
+    report.check(
+        through.0 != windows.frame[0] && through.0 == backdrop.hwnd.0 as isize,
+        format_args!("the outline is click-through (a second process at {},{} on the line finds the backdrop; strip {top:?})", on_line.x, on_line.y),
     );
 
-    // 4. Pen in hand: the ink window takes the point, also where there is no ink.
-    ui.tool_shortcut(InkTool::Pen);
+    // 5. The pen button picks the pen up; the click draws nothing.
+    click(&ui, pill_hwnd, Part::Pen);
     let picked = wait_event(&ui, &mut events, 1000, |e| {
         *e == UiEvent::ToolChanged(Some(InkTool::Pen))
     });
-    report.check(picked, "pen shortcut picks the pen up (ToolChanged event)");
-    settle(&ui, &mut events, 60);
+    settle(&ui, &mut events, 80);
+    let state = ui.ink_state();
+    report.check(
+        picked && state.strokes == 0 && state.tool == Some(InkTool::Pen),
+        "a click on the pen button picks the pen up (ToolChanged) and draws no stroke",
+    );
+    let tool_hint = wait_until(&ui, &mut events, 500, |ui| {
+        ui.pill().tip == Some(Tip::ToolHint)
+    });
+    report.check(
+        tool_hint,
+        "picking a tool up shows its keys under the strip",
+    );
     let style = ex_style(ink);
     let after = run_probe(spot, &ui, &mut events)?;
     report.check(
         style & WS_EX_TRANSPARENT.0 == 0 && after.0 == windows.ink && after.1 == own_pid,
         format_args!("pen in hand: the second process finds the ink window at {},{} (window 0x{:X}, ours 0x{:X}), with no ink there", spot.x, spot.y, after.0, windows.ink),
     );
+    let on_pen = run_probe(pen_screen, &ui, &mut events)?;
+    report.check(
+        above(pill_hwnd, ink) && on_pen.0 == windows.frame[4],
+        "pen in hand: the strip stays above the ink window and still takes its clicks",
+    );
     report.check(
         DRAW_KEYS.load(Relaxed),
         "drawing keys taken while the pen is in hand",
     );
+    click(&ui, pill_hwnd, Part::Grip);
+    if let Some((client, _)) = part_point(&ui, Part::Grip) {
+        post(pill_hwnd, WM_LBUTTONDOWN, 1, client);
+        post(pill_hwnd, WM_MOUSEMOVE, 1, (client.0 + 3, client.1));
+        post(pill_hwnd, WM_LBUTTONUP, 0, (client.0 + 3, client.1));
+    }
+    settle(&ui, &mut events, 80);
+    report.check(
+        ui.ink_state().strokes == 0 && ui.ink_state().tool == Some(InkTool::Pen),
+        "pen in hand: presses and a drag on the strip draw nothing and change no tool",
+    );
 
-    // 5. Draw a stroke with posted messages, in the middle of the region.
+    // 6. Draw a stroke with posted messages, in the middle of the region.
     let stroke = |from: (i32, i32), to: (i32, i32)| -> Vec<(i32, i32)> {
         (0..=40)
             .map(|i| {
@@ -264,7 +499,7 @@ fn run() -> Result<bool> {
     let line = stroke((mid.0 - rect.2 / 6, mid.1), (mid.0 + rect.2 / 6, mid.1));
     draw(ink, &line);
     let drawn = wait_state(&ui, &mut events, 1000, |s| s.strokes == 1);
-    flush();
+    backdrop.raise();
     let with_ink = capture.grab(rect)?.to_vec();
     let ink_box = bbox(&line, (20.0 * scale) as i32);
     let ink_pixels = count_diff(&baseline, &with_ink, rect, Some(ink_box), None, 40);
@@ -273,34 +508,24 @@ fn run() -> Result<bool> {
         format_args!("the stroke is on screen and in a screen capture ({ink_pixels} pixels changed around it)"),
     );
 
-    // 6. The outline and the pill are not in the capture; the control run shows they are
-    //    on screen.
+    // 7. The outline, the strip and the tip are not in the capture; the control run shows
+    //    they are on screen.
     let strips = outline_strips(area, r, scale);
-    let fonts = Fonts::new();
-    let pill = render_pill(
-        &fonts,
-        &pill_text(
-            1.0,
-            Some(InkTool::Pen),
-            &Labels::default(),
-            ZoomModifier::Alt,
-        ),
-        scale,
-        frame::system_dark(),
-    );
-    let pill_at = pill_origin(&fake, (pill.width(), pill.height()));
     let mut frame_boxes: Vec<(i32, i32, i32, i32)> = strips
         .iter()
         .flatten()
         .map(|s| (s.x - rect.0, s.y - rect.1, s.w, s.h))
         .collect();
-    frame_boxes.push((
-        pill_at.0 - rect.0,
-        pill_at.1 - rect.1,
-        pill.width() as i32,
-        pill.height() as i32,
-    ));
-    let frame_area: usize = frame_boxes.iter().map(|b| (b.2 * b.3) as usize).sum();
+    for hwnd in [pill_hwnd, tip_hwnd] {
+        if visible(hwnd) {
+            let (x, y, w, h) = window_rect(hwnd);
+            frame_boxes.push((x - rect.0, y - rect.1, w, h));
+        }
+    }
+    let frame_area: usize = frame_boxes
+        .iter()
+        .map(|b| (b.2.max(0) * b.3.max(0)) as usize)
+        .sum();
     let tolerance = frame_area / 1000 + 4;
     let hidden = frame_boxes
         .iter()
@@ -308,7 +533,7 @@ fn run() -> Result<bool> {
         .sum::<usize>();
     ui.test_set_capturable(true);
     settle(&ui, &mut events, 60);
-    flush();
+    backdrop.raise();
     let control = capture.grab(rect)?.to_vec();
     ui.test_set_capturable(false);
     let shown = frame_boxes
@@ -317,14 +542,14 @@ fn run() -> Result<bool> {
         .sum::<usize>();
     report.check(
         hidden <= tolerance && shown > tolerance * 4,
-        format_args!("outline and pill not in the capture: {hidden} pixels differ under them (tolerance {tolerance}); control with the exclusion off: {shown}"),
+        format_args!("outline, strip and tip not in the capture: {hidden} pixels differ under them (tolerance {tolerance}); control with the exclusion off: {shown}"),
     );
     settle(&ui, &mut events, 60);
 
-    // 7. Undo, clear, put down.
+    // 8. Undo, clear, put down.
     ui.ink_key(InkKey::Undo);
     let undone = wait_state(&ui, &mut events, 1000, |s| s.strokes == 0 && !s.content);
-    flush();
+    backdrop.raise();
     let after_undo = capture.grab(rect)?.to_vec();
     let left = count_diff(&baseline, &after_undo, rect, Some(ink_box), None, 3);
     report.check(
@@ -341,7 +566,7 @@ fn run() -> Result<bool> {
     let two = wait_state(&ui, &mut events, 1000, |s| s.strokes == 2);
     ui.ink_key(InkKey::Clear);
     let cleared = wait_state(&ui, &mut events, 1000, |s| s.strokes == 0 && !s.content);
-    flush();
+    backdrop.raise();
     let after_clear = capture.grab(rect)?.to_vec();
     let both = bbox(
         &[line.clone(), second.clone()].concat(),
@@ -378,31 +603,76 @@ fn run() -> Result<bool> {
         style & WS_EX_TRANSPARENT.0 != 0 && !DRAW_KEYS.load(Relaxed),
         "put down: click-through again and the drawing keys are free",
     );
-    flush();
+    backdrop.raise();
     let after_fade = capture.grab(rect)?.to_vec();
-    // Where the stroke was: the capture is back to the baseline. (The rest of the region is
-    // whatever the person has on screen there and may change by itself; it is reported.)
-    let left = count_diff(&baseline, &after_fade, rect, Some(ink_box), None, 3);
-    let elsewhere = count_diff(&baseline, &after_fade, rect, None, Some(ink_box), 3);
+    let left = count_diff(&baseline, &after_fade, rect, None, None, 3);
     let animated = frame::animation_effects();
     report.check(
         faded && left <= 4 && (!animated || lowest < 200),
         format_args!(
-            "the ink fades (lowest alpha seen {lowest}) and ends fully transparent and hidden after {:.0} ms ({left} pixels differ where the stroke was)",
+            "the ink fades (lowest alpha seen {lowest}) and ends fully transparent and hidden after {:.0} ms ({left} pixels of the region differ from before)",
             fade_time * 1000.0
         ),
     );
-    report.info(format_args!(
-        "after the fade, {elsewhere} pixels of the rest of the region differ from the baseline (the desktop under it)"
-    ));
     let gone = run_probe(spot, &ui, &mut events)?;
     report.check(
         gone.0 != windows.ink,
         "after put-down a second process no longer finds the ink window",
     );
 
-    // 8. Idle: nothing moving, no timer but the pill's.
-    settle(&ui, &mut events, 300);
+    // 9. The other buttons.
+    click(&ui, pill_hwnd, Part::Highlighter);
+    let high = wait_event(&ui, &mut events, 1000, |e| {
+        *e == UiEvent::ToolChanged(Some(InkTool::Highlighter))
+    });
+    events.clear();
+    click(&ui, pill_hwnd, Part::Highlighter);
+    let down = wait_event(&ui, &mut events, 1000, |e| *e == UiEvent::ToolChanged(None));
+    report.check(
+        high && down && ui.ink_state().strokes == 0,
+        "the highlighter button picks the highlighter up, and a second click puts it down",
+    );
+    events.clear();
+    let badge = click(&ui, pill_hwnd, Part::Zoom);
+    let reset = wait_event(&ui, &mut events, 1000, |e| *e == UiEvent::ResetZoom);
+    report.check(
+        badge && reset,
+        "the 2.0x zoom badge shows while zoomed in, and a click on it asks for the whole screen",
+    );
+    ui.set_area(r);
+    let no_badge = wait_until(&ui, &mut events, 500, |ui| {
+        ui.pill().parts.iter().all(|(p, _)| *p != Part::Zoom)
+    });
+    report.check(no_badge, "at the whole screen the badge is gone");
+    events.clear();
+    click(&ui, pill_hwnd, Part::Stop);
+    let stop = wait_event(&ui, &mut events, 1000, |e| *e == UiEvent::StopRequested);
+    report.check(
+        stop && WHEEL_GATE.is_armed(),
+        "the stop button asks the app to stop (StopRequested); the UI itself waits for stop()",
+    );
+
+    // 10. A tooltip under a hovered button, and gone when the pointer leaves.
+    let (stop_client, _) = part_point(&ui, Part::Stop).ok_or("no stop button")?;
+    let hovered_at = Instant::now();
+    post(pill_hwnd, WM_MOUSEMOVE, 0, stop_client);
+    let tooltip = wait_until(&ui, &mut events, 1500, |ui| {
+        ui.pill().tip == Some(Tip::Tooltip(Part::Stop))
+    });
+    let delay = hovered_at.elapsed().as_secs_f64();
+    report.check(
+        tooltip && delay >= frame::TOOLTIP_DELAY - 0.05,
+        format_args!(
+            "hovering the stop button shows its tooltip after {:.0} ms",
+            delay * 1000.0
+        ),
+    );
+    post(pill_hwnd, WM_MOUSELEAVE, 0, (0, 0));
+    let untipped = wait_until(&ui, &mut events, 1000, |ui| ui.pill().tip.is_none());
+    report.check(untipped, "leaving the strip takes the tooltip away");
+
+    // 11. Idle: nothing moving, no timer but the strip's once-a-second time.
+    settle(&ui, &mut events, 400);
     let passes = ui.passes();
     let cpu = process_cpu();
     let idle = Duration::from_millis(3000);
@@ -414,10 +684,10 @@ fn run() -> Result<bool> {
     let spent = process_cpu() - cpu;
     report.check(
         woke <= 4 && spent < 0.05,
-        format_args!("idle for 3 s: the UI thread woke {woke} times (the pill's once-a-second update), process CPU {:.1} ms", spent * 1000.0),
+        format_args!("idle for 3 s: the UI thread woke {woke} times (the strip's once-a-second time), process CPU {:.1} ms", spent * 1000.0),
     );
 
-    // 9. Stop: gates at once, then the fade, then everything hidden.
+    // 12. Stop: gates at once, then the fade, then everything hidden.
     ui.tool_shortcut(InkTool::Highlighter);
     wait_event(&ui, &mut events, 1000, |e| {
         *e == UiEvent::ToolChanged(Some(InkTool::Highlighter))
@@ -429,10 +699,7 @@ fn run() -> Result<bool> {
     );
     let stopped_at = Instant::now();
     let hidden_event = wait_event(&ui, &mut events, 2000, |e| *e == UiEvent::Hidden);
-    let all_hidden = ours.iter().all(|&h| {
-        // SAFETY: reads a flag of a window handle.
-        !unsafe { IsWindowVisible(HWND(h as *mut c_void)) }.as_bool()
-    });
+    let all_hidden = ours.iter().all(|&h| !visible(HWND(h as *mut c_void)));
     report.check(
         hidden_event && all_hidden,
         format_args!(
@@ -440,10 +707,12 @@ fn run() -> Result<bool> {
             stopped_at.elapsed().as_secs_f64() * 1000.0
         ),
     );
-    let followed_off = events.contains(&UiEvent::ToolChanged(None));
-    report.check(followed_off, "stop puts the tool down (ToolChanged(None))");
+    report.check(
+        events.contains(&UiEvent::ToolChanged(None)),
+        "stop puts the tool down (ToolChanged(None))",
+    );
 
-    // 10. Shutdown within its bound.
+    // 13. Shutdown within its bound.
     let started = Instant::now();
     let ended = ui.shutdown(Duration::from_secs(1));
     let took = started.elapsed();
@@ -472,16 +741,56 @@ fn run() -> Result<bool> {
         "no window of the recording UI ever became the foreground window",
     );
     drop(watch);
+    drop(backdrop);
 
-    // 11. Timing on 3840x2160, at 1x and 2x.
+    // 14. Timing on 3840x2160, at 1x and 2x.
     for scale in [1.0, 2.0] {
         timing(&mut report, &monitor, scale)?;
     }
     Ok(report.pass)
 }
 
-/// Draws a scripted 400-point stroke on a 3840x2160 ink window, one posted move at a time,
-/// and reports the frame times.
+/// The share of pixels (BGRA capture) that are `rgb`, within one level.
+fn share_of(capture: &[u8], rgb: [u8; 3]) -> f64 {
+    let pixels = capture.as_chunks::<4>().0;
+    let same = pixels
+        .iter()
+        .filter(|p| {
+            p[2].abs_diff(rgb[0]) <= 1 && p[1].abs_diff(rgb[1]) <= 1 && p[0].abs_diff(rgb[2]) <= 1
+        })
+        .count();
+    same as f64 / pixels.len().max(1) as f64
+}
+
+/// Pumps for `ms` with no UI to drain.
+fn settle_plain(ms: u64) {
+    let until = Instant::now() + Duration::from_millis(ms);
+    while Instant::now() < until {
+        pump();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_until(
+    ui: &RecordingUi,
+    events: &mut Vec<UiEvent>,
+    ms: u64,
+    want: impl Fn(&RecordingUi) -> bool,
+) -> bool {
+    let until = Instant::now() + Duration::from_millis(ms);
+    loop {
+        pump();
+        ui.drain(events);
+        if want(ui) {
+            return true;
+        }
+        if Instant::now() > until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn timing(report: &mut Report, monitor: &MonitorBounds, scale: f64) -> Result<()> {
     let bounds = Rect::new(monitor.bounds.x, monitor.bounds.y, 3840.0, 2160.0);
     let big = MonitorBounds {
@@ -795,7 +1104,7 @@ fn probe(x: &str, y: &str) -> Result<()> {
 
 // MARK: - Foreground watch
 
-static WATCHED: [AtomicIsize; 6] = [const { AtomicIsize::new(0) }; 6];
+static WATCHED: [AtomicIsize; 8] = [const { AtomicIsize::new(0) }; 8];
 static WAS_FOREGROUND: AtomicBool = AtomicBool::new(false);
 
 struct ForegroundWatch {
@@ -950,48 +1259,185 @@ impl Drop for Capture {
 
 // MARK: - PNGs
 
-/// Renders the pill, the outline and the ink off screen into `crates/app/examples/`.
+/// One state of the strip for the sheets: content, hovered part, tip.
+struct Scene {
+    label: &'static str,
+    seconds: f64,
+    zoom: f64,
+    tool: Option<InkTool>,
+    hover: Option<Part>,
+    tip: Option<Tip>,
+}
+
+const SCENES: [Scene; 6] = [
+    Scene {
+        label: "rest",
+        seconds: 42.0,
+        zoom: 1.0,
+        tool: None,
+        hover: None,
+        tip: None,
+    },
+    Scene {
+        label: "start hint",
+        seconds: 2.0,
+        zoom: 1.0,
+        tool: None,
+        hover: None,
+        tip: Some(Tip::StartHint),
+    },
+    Scene {
+        label: "pen selected",
+        seconds: 75.0,
+        zoom: 1.0,
+        tool: Some(InkTool::Pen),
+        hover: None,
+        tip: Some(Tip::ToolHint),
+    },
+    Scene {
+        label: "zoomed",
+        seconds: 75.0,
+        zoom: 2.0,
+        tool: None,
+        hover: None,
+        tip: None,
+    },
+    Scene {
+        label: "hover pen",
+        seconds: 42.0,
+        zoom: 1.0,
+        tool: None,
+        hover: Some(Part::Pen),
+        tip: Some(Tip::Tooltip(Part::Pen)),
+    },
+    Scene {
+        label: "hover zoom",
+        seconds: 75.0,
+        zoom: 2.5,
+        tool: Some(InkTool::Highlighter),
+        hover: Some(Part::Zoom),
+        tip: Some(Tip::Tooltip(Part::Zoom)),
+    },
+];
+
+/// Draws one scene: the strip at the top centre of a `width`-wide band, its tip below.
+fn scene(fonts: &Fonts, s: &Scene, scale: f64, dark: bool, width: u32) -> Pixmap {
+    let band_h = ((frame::PILL_HEIGHT + 60.0) * scale) as u32;
+    let mut page = Pixmap::new(width, band_h).expect("band");
+    page.fill(backdrop(dark));
+    let model = pill_model(s.seconds, s.zoom, s.tool);
+    let layout = pill_layout(fonts, &model, scale);
+    let mut look = PillLook::default();
+    if let Some(part) = s.hover {
+        look.hover[Part::ALL.iter().position(|p| *p == part).unwrap_or(0)] = 1.0;
+    }
+    let pill = render_pill(fonts, &model, &layout, &look, scale, dark);
+    let band = Rect::new(0.0, 0.0, f64::from(width), f64::from(band_h));
+    let monitor = MonitorBounds {
+        bounds: band,
+        work_area: band,
+        scale,
+    };
+    let at = pill_origin(&monitor, layout.width, 0);
+    page.draw_pixmap(
+        at.0,
+        at.1,
+        pill.as_ref(),
+        &PixmapPaint::default(),
+        Transform::identity(),
+        None,
+    );
+    if let Some(tip) = s.tip {
+        let segments = tip_segments(tip, &Labels::default(), ZoomModifier::Alt);
+        let tip_pixmap = render_tip(fonts, &segments, scale, dark);
+        let strip = frame::Strip {
+            x: at.0,
+            y: at.1,
+            w: layout.width as i32,
+            h: layout.height as i32,
+        };
+        let anchor = match (tip, s.hover.and_then(|p| layout.part(p))) {
+            (Tip::Tooltip(_), Some(b)) => at.0 + b.x + b.w / 2,
+            _ => at.0 + layout.width as i32 / 2,
+        };
+        let (x, y) = tip_origin(
+            &monitor,
+            strip,
+            anchor,
+            (tip_pixmap.width(), tip_pixmap.height()),
+        );
+        page.draw_pixmap(
+            x,
+            y,
+            tip_pixmap.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+    }
+    let _ = s.label;
+    page
+}
+
+fn backdrop(dark: bool) -> Color {
+    if dark {
+        Color::from_rgba8(0x1b, 0x1f, 0x27, 255)
+    } else {
+        Color::from_rgba8(0xdf, 0xe6, 0xee, 255)
+    }
+}
+
+/// Renders the strip's states, the outline and the ink off screen into
+/// `crates/app/examples/`.
 fn pngs() -> Result<()> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     let fonts = Fonts::new();
-    let labels = Labels::default();
     for (dark, theme) in [(false, "light"), (true, "dark")] {
         for (scale, percent) in [(1.0, 100), (1.25, 125)] {
-            let text = pill_text(42.0, None, &labels, ZoomModifier::Alt);
-            let pill = render_pill(&fonts, &text, scale, dark);
-            let page = on_desktop(&pill, dark, 24);
+            let width = (420.0 * scale) as u32;
+            let bands: Vec<Pixmap> = SCENES
+                .iter()
+                .map(|s| scene(&fonts, s, scale, dark, width))
+                .collect();
+            let height = bands.iter().map(Pixmap::height).sum();
+            let mut sheet = Pixmap::new(width, height).ok_or("sheet")?;
+            let mut y = 0;
+            for band in &bands {
+                sheet.draw_pixmap(
+                    0,
+                    y,
+                    band.as_ref(),
+                    &PixmapPaint::default(),
+                    Transform::identity(),
+                    None,
+                );
+                y += band.height() as i32;
+            }
             save(
-                &dir.join(format!("recording-pill-{theme}-{percent}.png")),
-                &page,
+                &dir.join(format!("recording-strip-{theme}-{percent}.png")),
+                &sheet,
             )?;
         }
     }
-    let pen = pill_text(75.0, Some(InkTool::Pen), &labels, ZoomModifier::Alt);
-    save(
-        &dir.join("recording-pill-pen-light-100.png"),
-        &on_desktop(&render_pill(&fonts, &pen, 1.0, false), false, 24),
-    )?;
 
-    // The outline around a 2x zoom on a 1280x720 "screen", with the pill.
+    // The outline around a 2x zoom on a 1280x720 "screen", with the strip.
     let mut screen = text_page(1280, 720);
     let screen_rect = Rect::new(0.0, 0.0, 1280.0, 720.0);
     let area = Rect::new(420.0, 230.0, 640.0, 360.0);
     if let Some(outline) = outline_rect(area, 1.0) {
         frame::draw_outline(&mut screen, outline, (0, 0), 1.0);
     }
-    let pill = render_pill(
-        &fonts,
-        &pill_text(42.0, None, &labels, ZoomModifier::Alt),
-        1.0,
-        false,
-    );
+    let model = pill_model(42.0, 2.0, None);
+    let layout = pill_layout(&fonts, &model, 1.0);
+    let pill = render_pill(&fonts, &model, &layout, &PillLook::default(), 1.0, false);
     let at = pill_origin(
         &MonitorBounds {
             bounds: screen_rect,
             work_area: screen_rect,
             scale: 1.0,
         },
-        (pill.width(), pill.height()),
+        layout.width,
+        0,
     );
     screen.draw_pixmap(
         at.0,
@@ -1058,26 +1504,6 @@ fn pngs() -> Result<()> {
     Ok(())
 }
 
-/// The pill on a plain desktop-like backdrop, with `pad` pixels around it.
-fn on_desktop(pill: &Pixmap, dark: bool, pad: u32) -> Pixmap {
-    let mut page = Pixmap::new(pill.width() + 2 * pad, pill.height() + 2 * pad).expect("page");
-    page.fill(if dark {
-        Color::from_rgba8(0x1b, 0x1f, 0x27, 255)
-    } else {
-        Color::from_rgba8(0xdf, 0xe6, 0xee, 255)
-    });
-    page.draw_pixmap(
-        pad as i32,
-        pad as i32,
-        pill.as_ref(),
-        &PixmapPaint::default(),
-        Transform::identity(),
-        None,
-    );
-    page
-}
-
-/// A light page with a heading and lines of "text".
 fn text_page(width: u32, height: u32) -> Pixmap {
     let mut page = Pixmap::new(width, height).expect("page");
     page.fill(Color::from_rgba8(250, 249, 246, 255));
@@ -1120,4 +1546,14 @@ fn save(path: &Path, page: &Pixmap) -> Result<()> {
     writer.write_image_data(&data)?;
     println!("wrote {}", path.display());
     Ok(())
+}
+
+unsafe extern "system" fn backdrop_proc(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    // SAFETY: the arguments come unchanged from the system.
+    unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }

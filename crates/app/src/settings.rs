@@ -44,6 +44,8 @@ pub struct Settings {
     /// Action id -> chord text or null. Read leniently: a bad entry gives that action its
     /// default and leaves the rest alone (see `Shortcuts::from_json`).
     pub shortcuts: Shortcuts,
+    /// How many recordings showed the "Hold Alt and scroll to zoom" hint. Missing: 0.
+    pub recording_hints_shown: u32,
 }
 
 /// Reads one card size, falling back to the default for an unknown or malformed value so a
