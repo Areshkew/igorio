@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use igorio_app::draw::Renderer;
 use igorio_app::drop_router::{DebugLog, Drops};
 use igorio_app::follower::Follower;
+use igorio_app::guide::{GuideWindow, Tried};
 use igorio_app::hook::{self, MouseEvent, MouseHook};
 use igorio_app::layout::CardSize;
 use igorio_app::notes::panel::menu_notes;
@@ -65,6 +66,7 @@ const MENU_RECORD: u32 = 6;
 const MENU_PEN: u32 = 7;
 const MENU_HIGHLIGHTER: u32 = 8;
 const MENU_NOTES_PANEL: u32 = 9;
+const MENU_GUIDE: u32 = 10;
 /// A recent note in the tray menu: this id plus its place in the list.
 const MENU_NOTE_BASE: u32 = 100;
 /// How long stopping the notes may take: saving the text and closing the windows.
@@ -84,7 +86,7 @@ const END_NOTES: Duration = Duration::from_millis(1200);
 const END_RECORDING: Duration = Duration::from_secs(5);
 /// How long a console handler waits for the quit path. Windows ends the process about 5 s
 /// after the console window is closed; Ctrl+C and Ctrl+Break run the normal quit, whose steps
-/// add up to about 17.3 s at worst. If the quit has not finished by then, the default
+/// add up to about 18.3 s at worst. If the quit has not finished by then, the default
 /// handler ends the process.
 const CONSOLE_CLOSE_WAIT: Duration = Duration::from_millis(4500);
 const CONSOLE_BREAK_WAIT: Duration = Duration::from_secs(19);
@@ -110,6 +112,8 @@ struct App {
     /// The last frame was drawn mid-animation, so one more frame shows the end state.
     was_animating: bool,
     demo_count: usize,
+    /// What the user did this pass that the guide's "Try it now" lines wait for.
+    tried: Vec<Tried>,
 }
 
 impl App {
@@ -221,6 +225,7 @@ impl App {
                     self.shake.captured();
                     self.state
                         .hold(image, scale, captured_at, kept, None, None, hook::now());
+                    self.tried.push(Tried::CardLanded);
                     self.dirty = true;
                 }
                 // The detector already wrote the reason to its debug log.
@@ -244,10 +249,12 @@ impl App {
             match self.shake.move_(x as f64 / scale, y as f64 / scale, time, holding) {
                 ShakeResult::DiscardTop => {
                     self.state.dissolve(time);
+                    self.tried.push(Tried::Shaken);
                     self.dirty = true;
                 }
                 ShakeResult::DiscardAll => {
                     self.state.discard_all(time);
+                    self.tried.push(Tried::Shaken);
                     self.dirty = true;
                 }
                 ShakeResult::None => {}
@@ -590,6 +597,8 @@ struct NotesFeature {
     summoner_events: Vec<SummonerEvent>,
     /// The tool menu's Record screen was chosen: the loop hands it to the recording.
     record: bool,
+    /// The tool menu opened: the loop tells the guide.
+    menu_opened: bool,
 }
 
 /// What the tool menu and the note gesture need to know about screen recording.
@@ -617,6 +626,7 @@ impl NotesFeature {
             shown: Vec::new(),
             summoner_events: Vec::new(),
             record: false,
+            menu_opened: false,
         }
     }
 
@@ -819,6 +829,7 @@ impl NotesFeature {
                         }
                     }
                 }
+                SummonerEvent::MenuOpened => self.menu_opened = true,
                 // The line starts with its own time on the same clock ("  1.234 summon: …").
                 SummonerEvent::Log(line) => {
                     let timed = line.trim_start().split_once(' ').and_then(|(at, text)| {
@@ -1063,6 +1074,7 @@ impl<T> QuitOnce<T> {
 struct Parts {
     settings: LiveSettings,
     settings_window: SettingsWindow,
+    guide: GuideWindow,
     hotkeys: Option<Hotkeys>,
     detector: Detector,
     drops: Option<Drops>,
@@ -1127,19 +1139,23 @@ impl Quit {
     }
 
     /// Every step, in this order. Worst cases, each for a stuck thread (a quit normally takes
-    /// milliseconds): the settings window 0.95 s; a screen recording in progress 3 s for its
+    /// milliseconds): the settings window 0.95 s; the guide 0.95 s; a screen recording in progress 3 s for its
     /// file, its UI included ([`RECORDING_STOP`]; finishing a file usually takes well under
     /// a second, plus a copy for long ones); the shortcut thread 1 s; the note gesture 1 s and
     /// the notes 2 s (plus up to 8 s while a notes start is in flight); screenshot detection
     /// 1.8 s (plus up to 3.6 s while its start is in flight); then the drop router: the
     /// clipboard restore 1 s, the clipboard thread 2 s, UI Automation 1.5 s, the key watch 1 s,
-    /// the Explorer lookup 1 s and the PNG saver 1 s. About 17.3 s with nothing in flight.
+    /// the Explorer lookup 1 s and the PNG saver 1 s. About 18.3 s with nothing in flight.
     fn stop_all(&self, parts: Parts) {
-        let Parts { settings, settings_window, mut hotkeys, detector, drops } = parts;
+        let Parts { settings, settings_window, mut guide, mut hotkeys, detector, drops } = parts;
         // The settings window goes first: a shortcut being recorded in it resumes the hotkeys.
         let service = hotkeys.as_ref().map(|hotkeys| hotkeys as &dyn ShortcutService);
         settings_window.shutdown(service, &settings.snapshot.shortcuts);
         self.line("quit: settings window closed");
+        if !guide.close() {
+            self.problem("the guide thread did not stop within its budget");
+        }
+        self.line("quit: guide closed");
         // A screen recording in progress: the UI first (its input gates), then the file is
         // finished. It is not put on the pile: the app is ending.
         match self.recording.try_borrow_mut() {
@@ -1370,6 +1386,7 @@ fn main() -> windows::core::Result<()> {
         dirty: false,
         was_animating: false,
         demo_count: 0,
+        tried: Vec::new(),
     }));
     app.borrow_mut().apply_card_size(settings.card_size, hook::now());
     for _ in 0..demo_count_from_args() {
@@ -1381,6 +1398,8 @@ fn main() -> windows::core::Result<()> {
     let action_app = Rc::clone(&app);
     let open_settings = Rc::new(Cell::new(false));
     let action_settings = Rc::clone(&open_settings);
+    let open_guide = Rc::new(Cell::new(false));
+    let action_guide = Rc::clone(&open_guide);
     let menu_notes = Rc::clone(&notes);
     let action_notes = Rc::clone(&notes);
     let menu_recording = Rc::clone(&recording);
@@ -1410,6 +1429,7 @@ fn main() -> windows::core::Result<()> {
             }
             items.extend([
                 MenuItem::Separator,
+                MenuItem::action(MENU_GUIDE, "Guide…"),
                 MenuItem::action(MENU_SETTINGS, "Settings…"),
                 MenuItem::action(MENU_QUIT, "Quit"),
             ]);
@@ -1419,6 +1439,7 @@ fn main() -> windows::core::Result<()> {
             MENU_RESTORE => action_app.borrow_mut().restore_last(),
             MENU_ADD_DEMO => action_app.borrow_mut().add_demo(),
             MENU_SETTINGS => action_settings.set(true),
+            MENU_GUIDE => action_guide.set(true),
             // SAFETY: posts WM_QUIT to this thread's own queue.
             MENU_QUIT => unsafe { PostQuitMessage(0) },
             // The loop's pass right after this message starts or stops it.
@@ -1447,6 +1468,13 @@ fn main() -> windows::core::Result<()> {
         }
     };
     let settings_window = SettingsWindow::new(settings_path)?;
+    // The first-run guide, until it was shown once; then from the tray's "Guide…".
+    let mut guide = GuideWindow::new();
+    if !settings.snapshot.guide_seen
+        && let Err(error) = guide.open(&settings.snapshot, app.borrow().state.is_holding())
+    {
+        eprintln!("could not open the guide: {error}");
+    }
     let hotkeys = match Hotkeys::start(&settings.snapshot.shortcuts) {
         Ok(hotkeys) => Some(hotkeys),
         Err(error) => {
@@ -1469,6 +1497,7 @@ fn main() -> windows::core::Result<()> {
         parts: QuitOnce::new(Parts {
             settings,
             settings_window,
+            guide,
             hotkeys,
             detector: Detector::default(),
             drops,
@@ -1504,13 +1533,16 @@ fn main() -> windows::core::Result<()> {
     let mut next_health_check = hook::now() + HEALTH_CHECK;
     // The Pen and Highlighter registrations of this recording were looked at.
     let mut pen_keys_checked = false;
+    // For the guide: the pastes and saves counted so far, and whether a recording ran.
+    let mut deliveries = 0;
+    let mut was_recording = false;
 
     while pump_messages() {
         // None once the quit ran inside the window procedure (WM_ENDSESSION).
         let Some(mut parts) = quit.parts.get() else {
             break;
         };
-        let Parts { settings, settings_window, hotkeys, detector, drops } = &mut *parts;
+        let Parts { settings, settings_window, guide, hotkeys, detector, drops } = &mut *parts;
         let now = hook::now();
         if let Some(hotkeys) = &hotkeys {
             hotkeys.drain(&mut presses);
@@ -1528,6 +1560,15 @@ fn main() -> windows::core::Result<()> {
         notes.borrow_mut().open_panel_if_asked(|| tray.icon_rect().ok());
         if open_settings.replace(false) && let Err(error) = settings_window.open() {
             eprintln!("could not queue Settings: {error}");
+        }
+        if open_guide.replace(false)
+            && let Err(error) = guide.open(&settings.snapshot, app.borrow().state.is_holding())
+        {
+            eprintln!("could not open the guide: {error}");
+        }
+        // The guide is on screen for the first time: it is not opened on start again.
+        if guide.take_shown() && !settings.snapshot.guide_seen {
+            settings_window.note_guide_seen();
         }
         // Also carries the shortcut recorder's pause, resume and registration checks.
         let service = hotkeys.as_ref().map(|hotkeys| hotkeys as &dyn ShortcutService);
@@ -1572,6 +1613,11 @@ fn main() -> windows::core::Result<()> {
                 }
             }
             pen_keys_checked &= pen_keys;
+            let started = recording.state() == RecordingState::Recording;
+            if started && !was_recording {
+                guide.tried(Tried::RecordingStarted);
+            }
+            was_recording = started;
             RecordingFacts {
                 enabled: settings.recording,
                 running: recording.state() != RecordingState::Idle,
@@ -1611,6 +1657,18 @@ fn main() -> windows::core::Result<()> {
                 app.dirty = true;
                 router_due = drops.as_ref().and_then(Drops::next_deadline);
             }
+            // What the guide's "Try it now" lines wait for.
+            if std::mem::take(&mut notes.borrow_mut().menu_opened) {
+                app.tried.push(Tried::MenuOpened);
+            }
+            if app.state.deliveries() != deliveries {
+                deliveries = app.state.deliveries();
+                app.tried.push(Tried::Dropped);
+            }
+            for tried in app.tried.drain(..) {
+                guide.tried(tried);
+            }
+            guide.set_holding(app.state.is_holding());
             events.clear();
             if app.needs_frame() {
                 due = Some(now);

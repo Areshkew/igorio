@@ -157,6 +157,8 @@ pub struct FairyState {
     next_card_id: u64,
     rng: u64,
     card_size: CardSize,
+    /// How many deliveries started (a paste or a save took cards), for the guide.
+    deliveries: u64,
 }
 
 impl FairyState {
@@ -188,6 +190,7 @@ impl FairyState {
                 seed
             },
             card_size: CardSize::default(),
+            deliveries: 0,
         }
     }
 
@@ -234,6 +237,11 @@ impl FairyState {
 
     pub fn reject_tick(&self) -> u64 {
         self.reject_tick
+    }
+
+    /// Counts the deliveries that took at least one card (a successful paste or save).
+    pub fn deliveries(&self) -> u64 {
+        self.deliveries
     }
 
     /// The fairy is hidden, for any reason (`AppDelegate.captureUIOwners` is not empty).
@@ -353,6 +361,9 @@ impl FairyState {
         let taken = self
             .pile
             .begin_leaving(ids, LeaveStyle::Queued, ReleaseReason::Delivered, now);
+        if !taken.is_empty() {
+            self.deliveries += 1;
+        }
         // Keep the requested (top-first) order for the animation.
         let order: Vec<CardId> = ids
             .iter()

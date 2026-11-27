@@ -528,6 +528,8 @@ pub struct ToolChosen {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SummonerEvent {
     ToolChosen(ToolChosen),
+    /// The tool menu opened (for the guide's "try it").
+    MenuOpened,
     /// A debug line (only with `SummonConfig::debug`).
     Log(String),
 }
@@ -2613,6 +2615,7 @@ impl Driver {
                         names.join(", "),
                         if layout.upward { ", upward" } else { "" }
                     ));
+                    self.shared.emit(SummonerEvent::MenuOpened);
                     let more = self.gesture.step(Input::Placed(layout), now);
                     self.execute(more);
                 }

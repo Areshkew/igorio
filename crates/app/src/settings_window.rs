@@ -60,15 +60,22 @@ const OPEN: u32 = WM_APP + 1;
 const PICK: u32 = WM_APP + 2;
 const SHORTCUT_STATUS: u32 = WM_APP + 6;
 const TEST_DIE: u32 = WM_APP + 7;
-/// A recording showed the zoom hint: count it (`Lifetime::hint_bumps`) and save.
+/// A recording showed the zoom hint, or the guide was shown: write it (`Lifetime::hint_bumps`,
+/// `Lifetime::guide_seen`) and save.
 const HINT_SHOWN: u32 = WM_APP + 8;
+/// What the app writes in settings.json through the settings window.
+#[derive(Clone, Copy)]
+enum AppWrite {
+    RecordingHint,
+    GuideSeen,
+}
 /// Tags the window's registration checks. Tag 0 is the untagged status after a save or resume.
 static NEXT_TAG: AtomicUsize = AtomicUsize::new(1);
 const WORKER_EXITED: isize = -1;
 const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
 const EX_STYLE: WINDOW_EX_STYLE = WS_EX_APPWINDOW;
 
-fn wide(text: impl AsRef<OsStr>) -> Vec<u16> {
+pub(crate) fn wide(text: impl AsRef<OsStr>) -> Vec<u16> {
     text.as_ref().encode_wide().chain([0]).collect()
 }
 
@@ -121,6 +128,8 @@ struct Lifetime {
     test_choice: Mutex<Option<(Folder, PathBuf)>>,
     /// Recordings that showed the zoom hint, not yet counted in the window's settings.
     hint_bumps: AtomicU32,
+    /// The guide was shown, not yet written in the window's settings.
+    guide_seen: AtomicBool,
 }
 
 impl Lifetime {
@@ -276,12 +285,27 @@ impl SettingsWindow {
     /// counts and saves (`Settings::note_recording_hint_shown`); a window opened meanwhile
     /// waits for that thread before it loads the file, and so does the next such thread.
     pub fn note_recording_hint_shown(&mut self) {
+        self.write_through(AppWrite::RecordingHint);
+    }
+
+    /// The first-run guide was shown: `guide_seen` becomes true in settings.json, by the same
+    /// path as [`note_recording_hint_shown`](Self::note_recording_hint_shown).
+    pub fn note_guide_seen(&mut self) {
+        self.write_through(AppWrite::GuideSeen);
+    }
+
+    fn write_through(&mut self, change: AppWrite) {
         if let Some((life, thread)) = &self.worker
             && !thread.is_finished()
             && !life.exited()
         {
             // Counted first: a window still starting picks it up once it has loaded.
-            life.hint_bumps.fetch_add(1, SeqCst);
+            match change {
+                AppWrite::RecordingHint => {
+                    life.hint_bumps.fetch_add(1, SeqCst);
+                }
+                AppWrite::GuideSeen => life.guide_seen.store(true, SeqCst),
+            }
             life.post(HINT_SHOWN);
             return;
         }
@@ -289,23 +313,31 @@ impl SettingsWindow {
         let path = self.options.path.clone();
         let requests = self.requests_tx.clone();
         let wake = Arc::clone(&self.wake);
+        let what = match change {
+            AppWrite::RecordingHint => "the recording hint count",
+            AppWrite::GuideSeen => "that the guide was seen",
+        };
         let spawned = thread::Builder::new().name("settings-hint".into()).spawn(move || {
             if let Some(before) = before {
                 let _ = before.join();
             }
-            match Settings::note_recording_hint_shown(&path) {
+            let saved = match change {
+                AppWrite::RecordingHint => Settings::note_recording_hint_shown(&path),
+                AppWrite::GuideSeen => Settings::note_guide_seen(&path),
+            };
+            match saved {
                 Ok(settings) => {
                     if requests.send(Request::Saved(settings)).is_ok() {
                         // SAFETY: the Arc keeps the auto-reset event live during this call.
                         let _ = unsafe { SetEvent(wake.0) };
                     }
                 }
-                Err(error) => eprintln!("the recording hint count was not saved: {error}"),
+                Err(error) => eprintln!("{what} was not saved: {error}"),
             }
         });
         match spawned {
             Ok(thread) => self.counter = Some(thread),
-            Err(error) => eprintln!("the recording hint count was not saved: {error}"),
+            Err(error) => eprintln!("{what} was not saved: {error}"),
         }
     }
 
@@ -454,6 +486,7 @@ impl SettingsWindow {
             test_modifiers: Mutex::new(Held::default()),
             test_choice: Mutex::new(None),
             hint_bumps: AtomicU32::new(0),
+            guide_seen: AtomicBool::new(false),
         });
         let options = self.options.clone();
         let worker_life = Arc::clone(&life);
@@ -706,7 +739,7 @@ fn set_launch(run: &impl RunValue, exe: &Path, enabled: bool) -> io::Result<bool
     run.exists()
 }
 
-fn system_dark() -> bool {
+pub(crate) fn system_dark() -> bool {
     let mut light: u32 = 1;
     let mut size = size_of::<u32>() as u32;
     // SAFETY: the registry value is restricted to a DWORD and both out buffers are valid.
@@ -725,23 +758,23 @@ fn system_dark() -> bool {
 }
 
 #[derive(Clone, Copy)]
-struct Palette {
-    paper: COLORREF,
-    patch: COLORREF,
-    chip: COLORREF,
-    text: COLORREF,
-    muted: COLORREF,
-    outline: COLORREF,
-    accent: COLORREF,
-    selected: COLORREF,
-    on: COLORREF,
-    off: COLORREF,
-    thumb: COLORREF,
-    disabled: COLORREF,
-    error: COLORREF,
+pub(crate) struct Palette {
+    pub(crate) paper: COLORREF,
+    pub(crate) patch: COLORREF,
+    pub(crate) chip: COLORREF,
+    pub(crate) text: COLORREF,
+    pub(crate) muted: COLORREF,
+    pub(crate) outline: COLORREF,
+    pub(crate) accent: COLORREF,
+    pub(crate) selected: COLORREF,
+    pub(crate) on: COLORREF,
+    pub(crate) off: COLORREF,
+    pub(crate) thumb: COLORREF,
+    pub(crate) disabled: COLORREF,
+    pub(crate) error: COLORREF,
 }
 
-const fn rgb(hex: u32) -> COLORREF {
+pub(crate) const fn rgb(hex: u32) -> COLORREF {
     COLORREF(((hex & 0xff) << 16) | (hex & 0xff00) | ((hex >> 16) & 0xff))
 }
 
@@ -1136,7 +1169,7 @@ fn shortcut_warning(chord: &Chord) -> Option<&'static str> {
 }
 
 /// Key chips for the row: the modifiers, then the key as the active layout labels it.
-fn chord_chips(chord: &Chord) -> Vec<String> {
+pub(crate) fn chord_chips(chord: &Chord) -> Vec<String> {
     let mut chips = chord.chips();
     let modifiers = chips[..chips.len() - 1].iter().map(|chip| chip.len() + 1).sum::<usize>();
     if let Some(key) = chips.last_mut() {
@@ -1219,13 +1252,13 @@ const RESET: usize = 1;
 const NOTE: usize = 2;
 
 const TIMER: usize = 1;
-const FOCUS_MS: f64 = 80.0;
+pub(crate) const FOCUS_MS: f64 = 80.0;
 const SWITCH_MS: f64 = 150.0;
 const CARD_MS: f64 = 180.0;
 const ROW_MS: f64 = 150.0;
-const OPEN_MS: f64 = 120.0;
-const THEME_MS: f64 = 200.0;
-const PAGE_MS: f64 = 180.0;
+pub(crate) const OPEN_MS: f64 = 120.0;
+pub(crate) const THEME_MS: f64 = 200.0;
+pub(crate) const PAGE_MS: f64 = 180.0;
 const PULSE_MS: f64 = 1200.0;
 
 fn ease(progress: f64) -> f64 {
@@ -1235,15 +1268,15 @@ fn ease(progress: f64) -> f64 {
 }
 
 #[derive(Clone, Copy, Default)]
-struct Transition {
-    from: f64,
-    to: f64,
-    start: f64,
-    duration: f64,
+pub(crate) struct Transition {
+    pub(crate) from: f64,
+    pub(crate) to: f64,
+    pub(crate) start: f64,
+    pub(crate) duration: f64,
 }
 
 impl Transition {
-    fn value(self, now: f64) -> f64 {
+    pub(crate) fn value(self, now: f64) -> f64 {
         if self.active(now) {
             let progress = ease((now - self.start) / self.duration);
             self.from + (self.to - self.from) * progress
@@ -1252,11 +1285,11 @@ impl Transition {
         }
     }
 
-    fn active(self, now: f64) -> bool {
+    pub(crate) fn active(self, now: f64) -> bool {
         self.from != self.to && self.duration > 0.0 && now < self.start + self.duration
     }
 
-    fn retarget(&mut self, to: f64, now: f64, duration: f64) {
+    pub(crate) fn retarget(&mut self, to: f64, now: f64, duration: f64) {
         if duration == 0.0 {
             *self = Self { from: to, to, ..Self::default() };
         } else if self.to != to {
@@ -1266,15 +1299,15 @@ impl Transition {
 }
 
 #[derive(Clone, Copy, Default)]
-struct ButtonMotion {
-    checked: Transition,
-    hover: Transition,
-    press: Transition,
-    focus: Transition,
+pub(crate) struct ButtonMotion {
+    pub(crate) checked: Transition,
+    pub(crate) hover: Transition,
+    pub(crate) press: Transition,
+    pub(crate) focus: Transition,
 }
 
 impl ButtonMotion {
-    fn tracks(&self) -> [Transition; 4] {
+    pub(crate) fn tracks(&self) -> [Transition; 4] {
         [self.checked, self.hover, self.press, self.focus]
     }
 }
@@ -1388,7 +1421,7 @@ impl Motion {
     }
 }
 
-fn animation_effects() -> bool {
+pub(crate) fn animation_effects() -> bool {
     let mut enabled = windows::core::BOOL(0);
     // SAFETY: SPI_GETCLIENTAREAANIMATION writes exactly one BOOL.
     unsafe {
@@ -1425,7 +1458,7 @@ impl Layout {
     }
 }
 
-fn mix(a: COLORREF, b: COLORREF, amount: f64) -> COLORREF {
+pub(crate) fn mix(a: COLORREF, b: COLORREF, amount: f64) -> COLORREF {
     COLORREF([0, 8, 16].into_iter().fold(0, |value, shift| {
         let from = f64::from((a.0 >> shift) & 255);
         let to = f64::from((b.0 >> shift) & 255);
@@ -1434,7 +1467,7 @@ fn mix(a: COLORREF, b: COLORREF, amount: f64) -> COLORREF {
 }
 
 impl Palette {
-    fn at(amount: f64) -> Self {
+    pub(crate) fn at(amount: f64) -> Self {
         let color = |a, b| mix(a, b, amount);
         Self {
             paper: color(LIGHT.paper, DARK.paper),
@@ -1454,7 +1487,7 @@ impl Palette {
     }
 }
 
-fn scale(value: i32, dpi: u32) -> i32 {
+pub(crate) fn scale(value: i32, dpi: u32) -> i32 {
     (value * dpi as i32 + 48) / 96
 }
 
@@ -1472,7 +1505,7 @@ pub fn test_window_size(dpi: u32) -> (i32, i32) {
     (bounds.right - bounds.left, bounds.bottom - bounds.top)
 }
 
-fn scaled([x, y, w, h]: [i32; 4], dpi: u32) -> RECT {
+pub(crate) fn scaled([x, y, w, h]: [i32; 4], dpi: u32) -> RECT {
     RECT {
         left: scale(x, dpi),
         top: scale(y, dpi),
@@ -1598,31 +1631,34 @@ impl Model {
     }
 }
 
-struct Fonts([HFONT; 3]);
+pub(crate) struct Fonts(pub(crate) [HFONT; 3]);
 
 impl Fonts {
-    fn new(dpi: u32) -> Self {
-        Self([(14, 600), (13, 400), (12, 600)].map(|(size, weight)| {
-            // SAFETY: font family is a static string; CreateFontW returns an owned font.
-            unsafe {
-                CreateFontW(
-                    -scale(size, dpi),
-                    0,
-                    0,
-                    0,
-                    weight,
-                    0,
-                    0,
-                    0,
-                    DEFAULT_CHARSET,
-                    OUT_DEFAULT_PRECIS,
-                    CLIP_DEFAULT_PRECIS,
-                    CLEARTYPE_QUALITY,
-                    DEFAULT_PITCH.0.into(),
-                    w!("Segoe UI Variable Text"),
-                )
-            }
-        }))
+    pub(crate) fn new(dpi: u32) -> Self {
+        Self([(14, 600), (13, 400), (12, 600)].map(|(size, weight)| font(size, weight, dpi)))
+    }
+}
+
+/// The settings window's typeface at `size` logical px. The caller deletes it.
+pub(crate) fn font(size: i32, weight: i32, dpi: u32) -> HFONT {
+    // SAFETY: font family is a static string; CreateFontW returns an owned font.
+    unsafe {
+        CreateFontW(
+            -scale(size, dpi),
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            DEFAULT_PITCH.0.into(),
+            w!("Segoe UI Variable Text"),
+        )
     }
 }
 
@@ -2665,17 +2701,20 @@ impl Window<'_> {
         self.update_animation();
     }
 
-    /// Adds the recordings that showed the zoom hint to the settings and saves. Not when the
-    /// file could not be loaded: then nothing is saved (the counts are dropped).
+    /// Adds the recordings that showed the zoom hint, and that the guide was seen, to the
+    /// settings and saves. Not when the file could not be loaded: then nothing is saved (the
+    /// counts are dropped).
     fn count_hints(&self) {
         let count = self.lifetime.hint_bumps.swap(0, SeqCst);
-        if count == 0 || self.model.borrow().load_error.is_some() {
+        let guide_seen = self.lifetime.guide_seen.swap(false, SeqCst);
+        if (count == 0 && !guide_seen) || self.model.borrow().load_error.is_some() {
             return;
         }
         {
             let mut model = self.model.borrow_mut();
             model.settings.recording_hints_shown =
                 model.settings.recording_hints_shown.saturating_add(count);
+            model.settings.guide_seen |= guide_seen;
         }
         self.save();
     }
@@ -2946,7 +2985,7 @@ impl Drop for Apartment {
     }
 }
 
-fn settings_icon(instance: HINSTANCE, color: [u8; 4]) -> HICON {
+pub(crate) fn settings_icon(instance: HINSTANCE, color: [u8; 4]) -> HICON {
     let pixmap = crate::tray::logo_pixmap(32, color);
     let mut bgra = Vec::with_capacity(32 * 32 * 4);
     let mut mask = [0u8; 128];
@@ -3169,17 +3208,17 @@ fn pump(window: &Window<'_>) -> Result<()> {
     }
 }
 
-struct Surface {
-    dc: HDC,
+pub(crate) struct Surface {
+    pub(crate) dc: HDC,
     bitmap: HBITMAP,
     old: HGDIOBJ,
     bits: *mut u8,
-    width: u32,
-    height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 impl Surface {
-    fn new(width: u32, height: u32) -> Result<Self> {
+    pub(crate) fn new(width: u32, height: u32) -> Result<Self> {
         let mut bits = std::ptr::null_mut();
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -3207,7 +3246,7 @@ impl Surface {
         Ok(Self { dc, bitmap, old, bits: bits.cast(), width, height })
     }
 
-    fn canvas(&mut self, dirty: RECT) -> Canvas<'_> {
+    pub(crate) fn canvas(&mut self, dirty: RECT) -> Canvas<'_> {
         // SAFETY: GdiFlush finishes prior reads/writes to the selected DIB before CPU access.
         let _ = unsafe { GdiFlush() };
         // SAFETY: this owns the live DIB of the declared dimensions, borrowed for the canvas.
@@ -3236,28 +3275,28 @@ impl Drop for Surface {
     }
 }
 
-struct Label {
-    rect: RECT,
-    text: String,
-    ink: COLORREF,
-    format: DRAW_TEXT_FORMAT,
-    font: HFONT,
+pub(crate) struct Label {
+    pub(crate) rect: RECT,
+    pub(crate) text: String,
+    pub(crate) ink: COLORREF,
+    pub(crate) format: DRAW_TEXT_FORMAT,
+    pub(crate) font: HFONT,
 }
 
-struct Canvas<'a> {
-    pixmap: tiny_skia::PixmapMut<'a>,
-    labels: Vec<Label>,
+pub(crate) struct Canvas<'a> {
+    pub(crate) pixmap: tiny_skia::PixmapMut<'a>,
+    pub(crate) labels: Vec<Label>,
     dc: HDC,
-    dirty: RECT,
+    pub(crate) dirty: RECT,
     /// Moves everything drawn sideways, for the page slide.
-    dx: i32,
+    pub(crate) dx: i32,
 }
 
 fn intersects(a: RECT, b: RECT) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 
-fn inset(rect: RECT, amount: i32) -> RECT {
+pub(crate) fn inset(rect: RECT, amount: i32) -> RECT {
     RECT {
         left: rect.left + amount,
         top: rect.top + amount,
@@ -3266,7 +3305,7 @@ fn inset(rect: RECT, amount: i32) -> RECT {
     }
 }
 
-fn move_y(mut rect: RECT, amount: i32) -> RECT {
+pub(crate) fn move_y(mut rect: RECT, amount: i32) -> RECT {
     rect.top += amount;
     rect.bottom += amount;
     rect
@@ -3294,15 +3333,15 @@ fn rounded_path(rect: RECT, radius: f32) -> Option<tiny_skia::Path> {
 }
 
 impl Canvas<'_> {
-    fn moved(&self, rect: RECT) -> RECT {
+    pub(crate) fn moved(&self, rect: RECT) -> RECT {
         RECT { left: rect.left + self.dx, right: rect.right + self.dx, ..rect }
     }
 
-    fn visible(&self, rect: RECT) -> bool {
+    pub(crate) fn visible(&self, rect: RECT) -> bool {
         intersects(self.moved(rect), self.dirty)
     }
 
-    fn shape(&mut self, rect: RECT, radius: f32, color: COLORREF) {
+    pub(crate) fn shape(&mut self, rect: RECT, radius: f32, color: COLORREF) {
         let rect = self.moved(rect);
         if intersects(rect, self.dirty)
             && let Some(path) = rounded_path(rect, radius)
@@ -3320,12 +3359,12 @@ impl Canvas<'_> {
         }
     }
 
-    fn outlined(&mut self, rect: RECT, radius: f32, face: COLORREF, edge: COLORREF) {
+    pub(crate) fn outlined(&mut self, rect: RECT, radius: f32, face: COLORREF, edge: COLORREF) {
         self.shape(rect, radius, edge);
         self.shape(inset(rect, 1), (radius - 1.0).max(0.0), face);
     }
 
-    fn text(
+    pub(crate) fn text(
         &mut self,
         rect: RECT,
         text: impl Into<String>,
@@ -3339,7 +3378,7 @@ impl Canvas<'_> {
         }
     }
 
-    fn width(&self, text: &str, font: HFONT) -> i32 {
+    pub(crate) fn width(&self, text: &str, font: HFONT) -> i32 {
         // SAFETY: font and canvas DC are live, and the previous selection is restored.
         unsafe {
             let old = SelectObject(self.dc, font.into());
@@ -3357,7 +3396,7 @@ fn text_width(dc: HDC, text: &str) -> i32 {
     size.cx
 }
 
-fn draw_text(dc: HDC, mut rect: RECT, text: &str, color: COLORREF, format: DRAW_TEXT_FORMAT) {
+pub(crate) fn draw_text(dc: HDC, mut rect: RECT, text: &str, color: COLORREF, format: DRAW_TEXT_FORMAT) {
     if text.is_empty() {
         return;
     }
@@ -3370,7 +3409,7 @@ fn draw_text(dc: HDC, mut rect: RECT, text: &str, color: COLORREF, format: DRAW_
     }
 }
 
-fn with_paint(hwnd: HWND, draw: impl FnOnce(HDC)) {
+pub(crate) fn with_paint(hwnd: HWND, draw: impl FnOnce(HDC)) {
     let mut paint = PAINTSTRUCT::default();
     // SAFETY: initialized paint storage for this same-thread HWND's WM_PAINT.
     let dc = unsafe { BeginPaint(hwnd, &mut paint) };
@@ -3758,13 +3797,8 @@ impl Window<'_> {
                 Kind::Keys => {
                     let mut x = rect.left;
                     let mut key = |label: &str, chip: bool| {
-                        let width = (canvas.width(label, font) + px(10)).max(px(19));
-                        let bounds = RECT { left: x, right: x + width, ..rect };
-                        if chip {
-                            canvas.shape(bounds, px(4) as f32, fade(p.chip));
-                        }
-                        canvas.text(bounds, label, fade(p.muted), center | DT_NOPREFIX, font);
-                        x += width + px(3);
+                        let ink = [fade(p.chip), fade(p.muted)];
+                        x = key_chip(canvas, RECT { left: x, ..rect }, label, chip, ink, font, dpi);
                     };
                     if item.id == RecordingKeys {
                         // The user's own chords: one chip each, unset ones left out.
@@ -3835,8 +3869,33 @@ impl Window<'_> {
     }
 }
 
+/// The width of one key chip (or plain word) of a key line.
+pub(crate) fn key_chip_width(canvas: &Canvas<'_>, label: &str, font: HFONT, dpi: u32) -> i32 {
+    (canvas.width(label, font) + scale(10, dpi)).max(scale(19, dpi))
+}
+
+/// Draws one key chip of a key line from `row.left`, as tall as `row`; a plain word (`chip`
+/// false) gets no fill. `[fill, ink]` are its colors. Returns where the next one starts.
+pub(crate) fn key_chip(
+    canvas: &mut Canvas<'_>,
+    row: RECT,
+    label: &str,
+    chip: bool,
+    [fill, ink]: [COLORREF; 2],
+    font: HFONT,
+    dpi: u32,
+) -> i32 {
+    let width = key_chip_width(canvas, label, font, dpi);
+    let bounds = RECT { right: row.left + width, ..row };
+    if chip {
+        canvas.shape(bounds, scale(4, dpi) as f32, fill);
+    }
+    canvas.text(bounds, label, ink, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX, font);
+    bounds.right + scale(3, dpi)
+}
+
 /// The outer 2 dp ring surrounds a 1 dp gap painted in the surrounding surface color.
-fn paint_focus(
+pub(crate) fn paint_focus(
     canvas: &mut Canvas<'_>,
     shape: RECT,
     [radius, gap, ring]: [i32; 3],

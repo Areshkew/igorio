@@ -147,6 +147,7 @@ fn run(modifier: Modifier, tools: &[ToolId], seconds: Option<f64>) -> Result<(),
         for event in &out {
             match event {
                 SummonerEvent::Log(line) => println!("FAIRY_DEBUG {line}"),
+                SummonerEvent::MenuOpened => {}
                 SummonerEvent::ToolChosen(chosen) => println!(
                     "TOOL {} at {},{} (t={:.3}): {} | {}",
                     chosen.tool.id(),

@@ -48,6 +48,9 @@ pub struct Settings {
     /// this is below `recording::feature::START_HINT_RECORDINGS`. Missing: 0. To see the hint
     /// again, set it to 0 or delete it in settings.json.
     pub recording_hints_shown: u32,
+    /// The first-run guide was shown once. Missing: false, so the guide opens on the next
+    /// start. The tray's "Guide…" opens it any time.
+    pub guide_seen: bool,
 }
 
 /// Reads one card size, falling back to the default for an unknown or malformed value so a
@@ -121,6 +124,16 @@ impl Settings {
     pub fn note_recording_hint_shown(path: &Path) -> io::Result<Settings> {
         let mut settings = Settings::load(path)?;
         settings.recording_hints_shown = settings.recording_hints_shown.saturating_add(1);
+        settings.save(path)?;
+        Ok(settings)
+    }
+
+    /// Writes that the guide was shown (`guide_seen`) in the file at `path`, like
+    /// [`note_recording_hint_shown`](Self::note_recording_hint_shown): loads, sets, saves,
+    /// and returns what was saved.
+    pub fn note_guide_seen(path: &Path) -> io::Result<Settings> {
+        let mut settings = Settings::load(path)?;
+        settings.guide_seen = true;
         settings.save(path)?;
         Ok(settings)
     }
