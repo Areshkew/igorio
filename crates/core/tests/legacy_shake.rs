@@ -1,4 +1,4 @@
-//! Translated from `reference/fairy-cursor/tests/core/LegacyShakeTests.swift`.
+//! Translated from `fairy-cursor/tests/core/LegacyShakeTests.swift`.
 
 use std::f64::consts::PI;
 

@@ -1,4 +1,4 @@
-//! The overlay's facts, translated from `reference/fairy-cursor/sources/app/FairyState.swift`.
+//! The overlay's facts, translated from `fairy-cursor/sources/app/FairyState.swift`.
 //!
 //! No clocks, timers or threads: every operation that depends on time takes `now` (seconds,
 //! monotonic) and everything that would be a `Timer` or `DispatchQueue.main.asyncAfter` in

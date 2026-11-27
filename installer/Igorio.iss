@@ -24,8 +24,7 @@ Name: "autostart"; Description: "Start Igorio when I sign in"; Flags: unchecked
 Source: "{#IgorioExe}"; DestDir: "{app}"; Flags: ignoreversion; BeforeInstall: CloseBeforeUpgrade
 Source: "{#FallbackExe}"; Flags: dontcopy
 Source: "install-support.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\reference\fairy-cursor\LICENSE"; DestDir: "{app}"; DestName: "LICENSE-fairy-cursor.txt"
-Source: "..\assets\fonts\OFL.txt"; DestDir: "{app}"; DestName: "OFL-Barlow.txt"
+Source: "..\NOTICE"; DestDir: "{app}"; DestName: "NOTICE.txt"
 
 [Icons]
 Name: "{commonprograms}\Igorio"; Filename: "{app}\igorio.exe"; WorkingDir: "{app}"

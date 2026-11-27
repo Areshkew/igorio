@@ -1,4 +1,4 @@
-//! Translation of `reference/fairy-cursor/tests/core/InkTests.swift`.
+//! Translation of `fairy-cursor/tests/core/InkTests.swift`.
 //!
 //! Swift asks `CGPath` for its bounding box and for point containment; those helpers below
 //! flatten the quadratic path into a polygon the way CoreGraphics would fill it.

@@ -1,5 +1,5 @@
 //! Stale screenshot-session detection, translated from
-//! `reference/fairy-cursor/sources/core/CaptureWatchdog.swift`.
+//! `fairy-cursor/sources/core/CaptureWatchdog.swift`.
 
 /// The fairy hides while the system screenshot UI is up. ScreenshotMonitorKit ends an
 /// interactive (⌘⇧4 / ⌘⇧5) session on capture, Esc or a 3-minute timeout — but a selection

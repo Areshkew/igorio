@@ -1,6 +1,6 @@
 //! Sticky notes as plain Markdown files in a folder the caller chooses.
 //!
-//! Ported from `reference/fairy-cursor/sources/capabilities/notes/NoteStore.swift`. Each file
+//! Ported from `fairy-cursor/sources/capabilities/notes/NoteStore.swift`. Each file
 //! starts with the same short front matter block the macOS app writes (id, when, and where the
 //! note was written), so a notes folder can be shared between the two apps. The file is named
 //! after the note's first line and renamed as that changes; a blank note has no file until

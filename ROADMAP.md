@@ -3,6 +3,8 @@
 Source: https://github.com/Rrrima/fairy-cursor at commit `3d5f655` (MIT).
 About 8,500 lines of Swift plus 1,500 lines of tests. Its `ausm` dependency
 (screenshot and cursor monitoring) is mac-only and is replaced, not translated.
+The copy of the Swift source in `reference/` was removed once the port was done; its MIT
+notice and the Barlow font licence are in `NOTICE`.
 
 ## Rules for the translation
 

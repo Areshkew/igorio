@@ -1,4 +1,4 @@
-//! Translated from `reference/fairy-cursor/tests/core/CaptureWatchdogTests.swift`.
+//! Translated from `fairy-cursor/tests/core/CaptureWatchdogTests.swift`.
 
 use igorio_core::capture_watchdog::CaptureWatchdog;
 

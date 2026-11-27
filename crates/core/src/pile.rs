@@ -1,5 +1,5 @@
 //! The pile of held cards, translated from
-//! `reference/fairy-cursor/sources/core/HeldPile.swift`.
+//! `fairy-cursor/sources/core/HeldPile.swift`.
 
 use std::collections::HashMap;
 

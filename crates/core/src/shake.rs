@@ -1,4 +1,4 @@
-//! Shake detection, translated from `reference/fairy-cursor/sources/core/ShakeDetector.swift`.
+//! Shake detection, translated from `fairy-cursor/sources/core/ShakeDetector.swift`.
 //! All times are seconds and all distances are points, taken as parameters so the code stays
 //! pure.
 

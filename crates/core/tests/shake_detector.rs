@@ -1,4 +1,4 @@
-//! Translated from `reference/fairy-cursor/tests/core/ShakeDetectorTests.swift`.
+//! Translated from `fairy-cursor/tests/core/ShakeDetectorTests.swift`.
 
 use std::f64::consts::PI;
 

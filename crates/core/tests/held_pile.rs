@@ -1,4 +1,4 @@
-//! Translated from `reference/fairy-cursor/tests/core/HeldPileTests.swift`.
+//! Translated from `fairy-cursor/tests/core/HeldPileTests.swift`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

@@ -1,4 +1,4 @@
-//! Translation of `reference/fairy-cursor/tests/core/RecordingViewportTests.swift`.
+//! Translation of `fairy-cursor/tests/core/RecordingViewportTests.swift`.
 
 use igorio_core::geom::{Point, Rect};
 use igorio_core::viewport::RecordingViewport;
