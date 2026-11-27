@@ -114,6 +114,7 @@ fn tab_order(hwnd: HWND) -> bool {
             GeneralTab,
             Screenshots,
             Keep,
+            Notes,
             ChooseNotes,
             OpenNotes,
             ResetNotes,
@@ -154,7 +155,7 @@ fn verify_controls(
     for (id, name, state, available) in [
         (Screenshots, "Screenshots", expected.is_enabled("fairy.screenshots"), true),
         (Keep, "Keep every screenshot", expected.keep_every_screenshot, true),
-        (Notes, "Notes, not available yet", false, false),
+        (Notes, "Notes", expected.is_enabled("fairy.notes"), true),
         (Recording, "Screen recording, not available yet", false, false),
         (Small, "Small", false, true),
         (Medium, "Medium", true, true),
@@ -188,8 +189,8 @@ fn verify_controls(
                 (ScreenshotDetail, "Use Win+Shift+S or PrtScn and your cursor carries the shot."),
                 (KeepTitle, "Keep every screenshot"),
                 (NotesTitle, "Notes"),
-                (NotesKeys, "Alt plus click"),
-                (NotesDetail, "Not available yet"),
+                (NotesKeys, "Hold Alt and click on empty space"),
+                (NotesDetail, "A sticky note opens where you click, saved as Markdown."),
                 (RecordingTitle, "Screen recording"),
                 (RecordingKeys, "Control plus Shift plus 6, 7, or 8"),
                 (RecordingDetail, "Not available yet"),
@@ -232,9 +233,16 @@ fn verify_controls(
         "Keep every screenshot saves and publishes",
         disk(controller, path, &expected) && !checked(child(hwnd, Keep)),
     );
-    for id in [Notes, Recording] {
-        click(hwnd, id);
+    for _ in 0..2 {
+        let on = !expected.is_enabled("fairy.notes");
+        click(hwnd, Notes);
+        expected.set_enabled("fairy.notes", on);
+        checks.check(
+            &format!("Notes {on} saves and publishes"),
+            disk(controller, path, &expected) && checked(child(hwnd, Notes)) == on,
+        );
     }
+    click(hwnd, Recording);
     checks.check(
         "disabled capability notifications leave the file alone",
         Settings::load(path)? == expected && controller.saved(None, &expected.shortcuts).is_empty(),

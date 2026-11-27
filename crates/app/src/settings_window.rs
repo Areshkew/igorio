@@ -51,6 +51,9 @@ use crate::shortcuts::{
 };
 
 const SCREENSHOTS: &str = "fairy.screenshots";
+const NOTES: &str = "fairy.notes";
+/// Parts of a capability's key line drawn as plain text, not as key chips.
+const PLAIN_WORDS: &[&str] = &["or", "Hold", "and click on empty space"];
 const CLASS: PCWSTR = w!("IgorioSettings");
 const OPEN: u32 = WM_APP + 1;
 const PICK: u32 = WM_APP + 2;
@@ -69,6 +72,8 @@ fn wide(text: impl AsRef<OsStr>) -> Vec<u16> {
 /// Everything the overlay and workers need from a saved settings snapshot.
 pub struct LiveSettings {
     pub screenshot_detector: bool,
+    /// The Notes capability: note windows and the note gesture.
+    pub notes: bool,
     pub card_size: CardSize,
     pub snapshot: Settings,
 }
@@ -77,6 +82,7 @@ impl From<Settings> for LiveSettings {
     fn from(snapshot: Settings) -> Self {
         Self {
             screenshot_detector: snapshot.is_enabled(SCREENSHOTS),
+            notes: snapshot.is_enabled(NOTES),
             card_size: snapshot.card_size,
             snapshot,
         }
@@ -881,9 +887,14 @@ const ITEMS: &[Item] = &[
     item(KeepTitle, Kind::Title, "Keep every screenshot", [36, 156, 412, 24]),
     item(Keep, Kind::Switch, "Keep every screenshot", [458, 154, 50, 28]),
     item(NotesTitle, Kind::Title, "Notes", [24, 195, 45, 22]),
-    item(NotesKeys, Kind::Keys, "Alt+Click", [75, 196, 367, 20]),
-    item(Notes, Kind::Switch, "Notes, not available yet", [470, 192, 50, 28]),
-    item(NotesDetail, Kind::Detail, "Not available yet", [24, 219, 400, 18]),
+    item(NotesKeys, Kind::Keys, "Hold|Alt|and click on empty space", [75, 196, 367, 20]),
+    item(Notes, Kind::Switch, "Notes", [470, 192, 50, 28]),
+    item(
+        NotesDetail,
+        Kind::Detail,
+        "A sticky note opens where you click, saved as Markdown.",
+        [24, 219, 400, 18],
+    ),
     item(RecordingTitle, Kind::Title, "Screen recording", [24, 248, 119, 22]),
     item(RecordingKeys, Kind::Keys, "Ctrl+Shift+6|Ctrl+Shift+7|Ctrl+Shift+8", [149, 249, 315, 20]),
     item(Recording, Kind::Switch, "Screen recording, not available yet", [470, 245, 50, 28]),
@@ -1384,7 +1395,7 @@ impl Item {
         }
         match self.id {
             ScreenshotKeys => "Windows plus Shift plus S, or Print Screen",
-            NotesKeys => "Alt plus click",
+            NotesKeys => "Hold Alt and click on empty space",
             RecordingKeys => "Control plus Shift plus 6, 7, or 8",
             _ => self.text,
         }
@@ -2393,7 +2404,7 @@ impl Window<'_> {
                 [
                     (Screenshots, settings.is_enabled(SCREENSHOTS)),
                     (Keep, settings.keep_every_screenshot),
-                    (Notes, false),
+                    (Notes, settings.is_enabled(NOTES)),
                     (Recording, false),
                     (Small, settings.card_size == CardSize::Small),
                     (Medium, settings.card_size == CardSize::Medium),
@@ -2472,7 +2483,7 @@ impl Window<'_> {
                     || !item.button()
                     || loaded
                         && match item.id {
-                            Notes | Recording => false,
+                            Recording => false,
                             Launch => launch_available,
                             ResetNotes => reset_notes,
                             ResetCaptures => reset_captures,
@@ -2636,6 +2647,11 @@ impl Window<'_> {
                 let mut model = self.model.borrow_mut();
                 let on = model.settings.is_enabled(SCREENSHOTS);
                 model.settings.set_enabled(SCREENSHOTS, !on);
+            }
+            Notes => {
+                let mut model = self.model.borrow_mut();
+                let on = model.settings.is_enabled(NOTES);
+                model.settings.set_enabled(NOTES, !on);
             }
             Keep => {
                 let mut model = self.model.borrow_mut();
@@ -3624,7 +3640,7 @@ impl Window<'_> {
                             key(group, true);
                         } else {
                             for part in key_chips(group) {
-                                key(part, part != "or");
+                                key(part, !PLAIN_WORDS.contains(&part));
                             }
                         }
                     }
@@ -4202,5 +4218,9 @@ mod tests {
         assert!(!live.screenshot_detector);
         assert_eq!(live.card_size, CardSize::Large);
         assert_eq!(live.snapshot, settings);
+        // Notes are on unless switched off, like every capability.
+        assert!(live.notes);
+        settings.set_enabled(NOTES, false);
+        assert!(!LiveSettings::from(settings).notes);
     }
 }

@@ -1,6 +1,7 @@
 use igorio_app::input::Held;
 use igorio_app::shortcuts::{
-    Action, Chord, ChordError, Key, RecorderInput, SetError, Shortcuts, chord_from_key_event,
+    Action, Chord, ChordError, Hotkeys, Key, RecorderInput, Registration, SetError, Shortcuts,
+    chord_from_key_event,
 };
 
 fn chord(text: &str) -> Chord {
@@ -54,7 +55,31 @@ fn defaults_follow_the_roadmap() {
         }
     }
     assert!(Action::RestoreLast.available() && Action::OpenSettings.available());
-    assert!(!Action::NewNote.available() && !Action::Highlighter.available());
+    assert!(Action::NewNote.available() && !Action::Highlighter.available());
+}
+
+/// The note editor uses Ctrl+Shift+7 (numbered list) and Ctrl+Shift+8 (bulleted list), the
+/// default chords of Pen and Highlighter. A registered hotkey would take those keys from every
+/// note. While the actions are unavailable nothing registers them; whoever makes them available
+/// (the recording milestone) must decide the clash and change this test.
+#[test]
+fn pen_and_highlighter_keys_stay_free_for_the_note_editor() {
+    let defaults = Shortcuts::defaults();
+    assert_eq!(defaults.get(Action::Pen), Some(chord("Ctrl+Shift+7")));
+    assert_eq!(defaults.get(Action::Highlighter), Some(chord("Ctrl+Shift+8")));
+    assert!(!Action::Pen.available() && !Action::Highlighter.available());
+    // The rule itself: an unavailable action is never registered, whatever its chord.
+    let hotkeys = Hotkeys::start(&defaults).expect("hotkey thread");
+    let status = hotkeys.status();
+    assert!(hotkeys.shutdown());
+    for action in Action::ALL {
+        let state = status.iter().find(|(a, _)| a == action).map(|(_, s)| s.clone());
+        if action.available() {
+            assert_ne!(state, Some(Registration::Unavailable), "{action:?}");
+        } else {
+            assert_eq!(state, Some(Registration::Unavailable), "{action:?}");
+        }
+    }
 }
 
 #[test]

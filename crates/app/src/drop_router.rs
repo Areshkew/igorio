@@ -75,6 +75,15 @@
 //!   gets the re-check after the mouse-up with a longer deadline ([`SLOW_DEADLINE`]); if
 //!   that also times out, the fairy says so and keeps the card. It never pastes into a
 //!   window it knows nothing about.
+//!
+//! # Notes
+//!
+//! A note window is one of the app's own windows, and it takes the pile itself (Swift: the
+//! note's `DropZone`). A double-click over a note ([`Env::note_at`]) is never looked up and
+//! never pasted: the carried cards, top first, go to the note ([`Env::give_to_note`]) and stay
+//! on the pile until the notes thread says which it took ([`Router::note_took`]); with no
+//! answer within [`NOTE_TIMEOUT`] the fairy keeps them and says so. While the cursor rests over
+//! a note the hover hint is the note's own ([`DROP_HINT`]), with no lookup.
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -103,11 +112,12 @@ use crate::clipboard::{self, ClipError, Clipboard, Done, Expect, Payload, Reply,
 use crate::explorer::{Explorer, FolderOutcome, FolderRequest};
 use crate::hook::{self, Button, KeyWatch, MouseEvent};
 use crate::input::{self, Batch, Key, Modifier, Sent};
+use crate::notes::window::{DROP_HINT, DropZones};
 use crate::saver;
 use crate::settings::{DefaultFolders, Settings};
 use crate::state::FairyState;
 use crate::uia::{
-    self, ElementInfo, Lookup, Outcome, Probe, Shell, Snapshot, Target, Uia, UiaNode,
+    self, ElementInfo, Lookup, Outcome, Probe, Requester, Shell, Snapshot, Target, Uia, UiaNode,
 };
 
 // MARK: Constants
@@ -259,6 +269,12 @@ pub const HINT_ALREADY_SAVED: &str = "already saved here";
 pub const HINT_RESTORE_FAILED: &str = "couldn't put your clipboard back";
 /// Something read the paste but nothing proves the target took it: the card stays (a lost
 /// card is worse than a second paste) and the user is asked to look.
+/// A note did not say whether it took the cards.
+pub const HINT_NOTE_SLOW: &str = "the note didn't answer · still holding it";
+/// The note could not add the cards.
+pub const HINT_NOTE_FAILED: &str = "couldn't add to the note · still holding it";
+/// How long a note may take to answer a double-click (it writes one PNG per card).
+pub const NOTE_TIMEOUT: f64 = 10.0;
 pub const HINT_UNCERTAIN: &str = "check the paste · still holding it";
 /// How long after the paste keys the probe may still confirm a paste (`OutcomeRules`).
 pub const PROBE_TIMEOUT: f64 = 3.0;
@@ -759,6 +775,11 @@ pub trait Env {
     fn send(&mut self, batch: Batch, guard: SendGuard) -> (Sent, Option<isize>);
     /// One debug line. Only written when `FAIRY_DEBUG=1`.
     fn log(&mut self, now: f64, line: &str);
+    /// One of our note windows is at `point` (from the notes' drop zones, no lookup).
+    fn note_at(&self, point: (i32, i32)) -> bool;
+    /// Hands the carried cards, top first, to the note at `point`. The answer comes as
+    /// [`Router::note_took`] or [`Router::note_failed`].
+    fn give_to_note(&mut self, point: (i32, i32), cards: Vec<HeldCard>);
 }
 
 // MARK: Pure helpers
@@ -1275,6 +1296,10 @@ enum Phase {
     },
     Delivering(Box<Delivery>),
     Saving(Box<FolderSave>),
+    /// The cards went to a note; waiting for it to say which it took.
+    Note {
+        until: f64,
+    },
 }
 
 /// A save into a folder (`saveToFinder`); see the module comment.
@@ -1853,6 +1878,46 @@ impl<S: Clone> Router<S> {
         self.run(now, state, env);
     }
 
+    /// The note took these cards: they leave with its hint. Also after the wait was given up
+    /// or dropped: the cards are in the note by then, so the pile lets go of them.
+    pub fn note_took<E: Env<Snap = S>>(
+        &mut self,
+        ids: &[CardId],
+        hint: &str,
+        now: f64,
+        state: &mut FairyState,
+        env: &mut E,
+    ) {
+        if matches!(self.phase, Phase::Note { .. }) {
+            self.phase = Phase::Idle;
+            self.phase_wake = None;
+        }
+        env.log(now, &format!("the note took {} card(s) → {hint}", ids.len()));
+        state.deliver(ids, hint, now);
+        self.state_changed = true;
+        self.run(now, state, env);
+    }
+
+    /// The notes thread reported an error. While a note is being given the cards, the wait
+    /// ends and the fairy keeps them; returns true then.
+    pub fn note_failed<E: Env<Snap = S>>(
+        &mut self,
+        now: f64,
+        state: &mut FairyState,
+        env: &mut E,
+    ) -> bool {
+        if !matches!(self.phase, Phase::Note { .. }) {
+            return false;
+        }
+        self.phase = Phase::Idle;
+        self.phase_wake = None;
+        env.log(now, "the note could not add the cards → keep them");
+        state.reject(HINT_NOTE_FAILED, now);
+        self.state_changed = true;
+        self.run(now, state, env);
+        true
+    }
+
     // MARK: Quit
 
     /// The app quits: stop any delivery and put the user's clipboard back if ours is still
@@ -2120,6 +2185,22 @@ impl<S: Clone> Router<S> {
         }
         // The hover hint must not look meanwhile.
         self.hover.in_flight = None;
+        // A note takes the pile itself: no lookup, nothing pasted into what is behind it.
+        if env.note_at(point) {
+            let cards = state.deliverable();
+            env.log(
+                now,
+                &format!(
+                    "double-click at {point:?}: over a note → give it {} card(s)",
+                    cards.len()
+                ),
+            );
+            env.give_to_note(point, cards);
+            self.phase = Phase::Note {
+                until: now + NOTE_TIMEOUT,
+            };
+            return;
+        }
         let id = self.request(point, false, false, LOOKUP_DEADLINE, now, env);
         env.log(
             now,
@@ -3895,6 +3976,17 @@ impl<S: Clone> Router<S> {
                     self.phase = waiting;
                     return;
                 }
+                Phase::Note { until } => {
+                    if now >= until {
+                        env.log(now, "the note did not answer → keep the cards");
+                        state.reject(HINT_NOTE_SLOW, now);
+                        self.state_changed = true;
+                        return;
+                    }
+                    self.phase = Phase::Note { until };
+                    self.phase_wake = Some(until);
+                    return;
+                }
                 Phase::AwaitUp {
                     click,
                     first,
@@ -4134,13 +4226,25 @@ impl<S: Clone> Router<S> {
             return;
         }
         let rested = self.hover.moved_at + HOVER_REST;
+        if now < rested {
+            self.hover_wake = Some(rested);
+            return;
+        }
+        // Over a note: its own hint and no lookup (the drop zones of `scheduleHoverHint`).
+        if env.note_at(point) {
+            self.hover.resolved = true;
+            if state.hint() != Some(DROP_HINT) {
+                state.set_hover_hint(Some(DROP_HINT), now);
+                self.state_changed = true;
+            }
+            return;
+        }
         let allowed = self
             .hover
             .last_request
             .map_or(f64::NEG_INFINITY, |t| t + HOVER_MIN_GAP);
-        let at = rested.max(allowed);
-        if now < at {
-            self.hover_wake = Some(at);
+        if now < allowed {
+            self.hover_wake = Some(allowed);
             return;
         }
         let id = self.request(point, false, false, LOOKUP_DEADLINE, now, env);
@@ -4258,6 +4362,10 @@ pub struct LiveEnv {
     /// Converts the clipboard's `Instant`s to the `hook::now` clock.
     origin: Instant,
     origin_secs: f64,
+    /// The open notes' rectangles while the notes capability runs.
+    notes: Option<DropZones>,
+    /// Cards for a note, for the UI loop to send (`Drops::take_note_gifts`).
+    gifts: Vec<((i32, i32), Vec<HeldCard>)>,
 }
 
 impl LiveEnv {
@@ -4297,6 +4405,8 @@ impl LiveEnv {
             primary: LiveEnv::primary_button(),
             origin: Instant::now(),
             origin_secs: hook::now(),
+            notes: None,
+            gifts: Vec::new(),
         })
     }
 
@@ -4688,6 +4798,16 @@ impl Env for LiveEnv {
     fn log(&mut self, now: f64, line: &str) {
         self.log.line(now, line);
     }
+
+    fn note_at(&self, (x, y): (i32, i32)) -> bool {
+        self.notes
+            .as_ref()
+            .is_some_and(|zones| zones.note_at(Point::new(f64::from(x), f64::from(y))).is_some())
+    }
+
+    fn give_to_note(&mut self, point: (i32, i32), cards: Vec<HeldCard>) {
+        self.gifts.push((point, cards));
+    }
 }
 
 /// The router and its Windows environment, for the UI loop. Dropping it (at the end of
@@ -4743,6 +4863,52 @@ impl Drops {
 
     pub fn next_deadline(&self) -> Option<f64> {
         self.router.next_deadline()
+    }
+
+    /// A double-click is being handled or a delivery runs.
+    pub fn busy(&self) -> bool {
+        self.router.busy()
+    }
+
+    /// A lane of the router's UI Automation worker for the note gesture
+    /// (`notes::summoner::Summoner::start`).
+    pub fn requester(&self) -> Result<Requester, String> {
+        let uia = self.env.as_ref().and_then(|env| env.uia.as_ref());
+        let uia = uia.ok_or("UI Automation is not running")?;
+        uia.requester().map_err(|e| e.to_string())
+    }
+
+    /// The open notes' rectangles (None while the notes capability is off).
+    pub fn set_note_zones(&mut self, zones: Option<DropZones>) {
+        if let Some(env) = &mut self.env {
+            env.notes = zones;
+        }
+    }
+
+    /// Cards the router handed to a note since the last call: (point, cards top first).
+    pub fn take_note_gifts(&mut self) -> Vec<((i32, i32), Vec<HeldCard>)> {
+        self.env
+            .as_mut()
+            .map(|env| std::mem::take(&mut env.gifts))
+            .unwrap_or_default()
+    }
+
+    /// The notes thread's `CardsTaken`. Returns true when the state changed (redraw).
+    pub fn note_took(&mut self, ids: &[CardId], hint: &str, state: &mut FairyState, now: f64) -> bool {
+        let Some(env) = self.env.as_mut() else {
+            return false;
+        };
+        self.router.note_took(ids, hint, now, state, env);
+        self.router.take_state_changed()
+    }
+
+    /// The notes thread's `Error`. True when it ended a wait for a note (the router showed
+    /// its hint).
+    pub fn note_failed(&mut self, state: &mut FairyState, now: f64) -> bool {
+        let Some(env) = self.env.as_mut() else {
+            return false;
+        };
+        self.router.note_failed(now, state, env)
     }
 }
 

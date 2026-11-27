@@ -5,6 +5,7 @@
 //! `FAIRY_DEBUG=1` logs every drop decision (see `drop_router::DebugLog`).
 
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -15,6 +16,9 @@ use igorio_app::drop_router::{DebugLog, Drops};
 use igorio_app::follower::Follower;
 use igorio_app::hook::{self, MouseEvent, MouseHook};
 use igorio_app::layout::CardSize;
+use igorio_app::notes::store::{NoteId, RecycleBin};
+use igorio_app::notes::summoner::{Block, SummonConfig, Summoner, SummonerEvent};
+use igorio_app::notes::window::{Event as NotesEvent, Notes, NotesConfig, RecentNote, Theme};
 use igorio_app::overlay::{self, Overlay};
 use igorio_app::saver;
 use igorio_app::settings::{self, DefaultFolders, Settings};
@@ -23,6 +27,8 @@ use igorio_app::shortcuts::{Action, Hotkeys};
 use igorio_app::snip::{Snip, SnipEvent};
 use igorio_app::state::FairyState;
 use igorio_app::tray::{MenuItem, Tray};
+use igorio_app::uia::Requester;
+use igorio_core::geom::Point;
 use igorio_core::shake::{ShakeGate, ShakeResult};
 use igorio_kit::Image;
 use tiny_skia::Pixmap;
@@ -40,6 +46,11 @@ const MENU_RESTORE: u32 = 1;
 const MENU_ADD_DEMO: u32 = 2;
 const MENU_QUIT: u32 = 3;
 const MENU_SETTINGS: u32 = 4;
+const MENU_OPEN_NOTES_FOLDER: u32 = 5;
+/// A recent note in the tray menu: this id plus its place in the list.
+const MENU_NOTE_BASE: u32 = 100;
+/// How long stopping the notes may take: saving the text and closing the windows.
+const NOTES_STOP: Duration = Duration::from_secs(2);
 
 /// Frame interval while something moves, in seconds.
 const FRAME: f64 = 0.008;
@@ -433,10 +444,415 @@ impl Drop for Detector {
     }
 }
 
+/// The Notes capability while it runs. `stop` ends the gesture first, then the notes.
+struct NotesRunning {
+    summoner: Option<Summoner>,
+    notes: Notes,
+    /// The folder the notes thread uses, and the setting it came from.
+    folder: PathBuf,
+    chosen: Option<PathBuf>,
+}
+
+impl NotesRunning {
+    /// Runs off the UI thread: the folder check touches the disk and both starts wait (bounded)
+    /// for their threads. Returns the problems to log.
+    fn start(
+        settings: &Settings,
+        windows_file: PathBuf,
+        requester: Result<Requester, String>,
+        summon: SummonConfig,
+    ) -> (Option<NotesRunning>, Vec<String>) {
+        let mut problems = Vec::new();
+        let (folder, fallback) = settings.notes_dir(&DefaultFolders::from_system());
+        if fallback {
+            problems.push(format!("notes: the chosen folder is unavailable, using {}", folder.display()));
+        }
+        let notes = match Notes::start(NotesConfig {
+            folder: folder.clone(),
+            windows_file,
+            trash: Box::new(RecycleBin),
+            theme: Theme::System,
+            restore: true,
+            test: None,
+        }) {
+            Ok(notes) => notes,
+            Err(error) => {
+                problems.push(format!("notes are off: {error}"));
+                return (None, problems);
+            }
+        };
+        let summoner = match requester.and_then(|requester| Summoner::start(summon, requester)) {
+            Ok(summoner) => Some(summoner),
+            Err(error) => {
+                problems.push(format!("notes: the note gesture is off: {error}"));
+                None
+            }
+        };
+        let running = NotesRunning { summoner, notes, folder, chosen: settings.notes_folder.clone() };
+        (Some(running), problems)
+    }
+
+    /// The gesture first (it would ask for notes), then the notes: their text and window
+    /// states are written before the thread ends. Returns the problems to log.
+    fn stop(self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if let Some(summoner) = self.summoner
+            && !summoner.shutdown()
+        {
+            problems.push("notes: the note gesture did not stop within its budget".into());
+        }
+        if !self.notes.shutdown(NOTES_STOP) {
+            problems.push("notes: the notes thread did not stop within its budget".into());
+        }
+        problems
+    }
+}
+
+/// Starts and stops the Notes capability off the UI loop (like [`Detector`]) and connects it
+/// to the pile, the drop router and the tray.
+struct NotesFeature {
+    active: Option<NotesRunning>,
+    transition: Option<JoinHandle<(Option<NotesRunning>, Vec<String>)>>,
+    /// The transition is a start (not a stop).
+    starting: bool,
+    /// The last start failed: it is tried again after the switch goes off and on.
+    failed: bool,
+    windows_file: PathBuf,
+    log: DebugLog,
+    /// The last list from the notes thread, most recently edited first.
+    recent: Vec<RecentNote>,
+    /// The notes the tray menu shows, in menu order.
+    shown: Vec<NoteId>,
+    summoner_events: Vec<SummonerEvent>,
+}
+
+impl NotesFeature {
+    fn new(windows_file: PathBuf) -> NotesFeature {
+        NotesFeature {
+            active: None,
+            transition: None,
+            starting: false,
+            failed: false,
+            windows_file,
+            log: DebugLog::from_env(),
+            recent: Vec::new(),
+            shown: Vec::new(),
+            summoner_events: Vec::new(),
+        }
+    }
+
+    fn line(&mut self, now: f64, text: &str) {
+        if !self.log.enabled() {
+            eprintln!("{text}");
+        }
+        self.log.line(now, text);
+    }
+
+    fn summoner(&self) -> Option<&Summoner> {
+        self.active.as_ref()?.summoner.as_ref()
+    }
+
+    /// Follows the settings switch and the notes folder.
+    fn update(&mut self, enabled: bool, settings: &Settings, drops: Option<&mut Drops>, now: f64) {
+        let mut drops = drops;
+        if self.transition.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(transition) = self.transition.take()
+        {
+            let (running, problems) = transition.join().unwrap_or_else(|_| {
+                (None, vec!["notes: the start or stop thread panicked".into()])
+            });
+            for problem in problems {
+                self.line(now, &problem);
+            }
+            match running {
+                Some(running) => {
+                    let text = format!("notes: on, folder {}", running.folder.display());
+                    self.log.line(now, &text);
+                    if let Some(drops) = drops.as_deref_mut() {
+                        drops.set_note_zones(Some(running.notes.drop_zones()));
+                    }
+                    self.active = Some(running);
+                }
+                None if self.starting => self.failed = true,
+                None => {}
+            }
+            self.starting = false;
+        }
+        if !enabled {
+            self.failed = false;
+            self.stop(drops);
+            return;
+        }
+        if let Some(running) = &mut self.active {
+            if running.chosen != settings.notes_folder {
+                // Rare and asked for: the folder check runs here.
+                let (folder, _) = settings.notes_dir(&DefaultFolders::from_system());
+                running.chosen = settings.notes_folder.clone();
+                if folder != running.folder {
+                    running.notes.set_folder(folder.clone());
+                    self.log.line(now, &format!("notes: folder {}", folder.display()));
+                    running.folder = folder;
+                }
+            }
+        } else if self.transition.is_none() && !self.failed {
+            let requester = drops
+                .as_deref()
+                .map_or_else(|| Err("no UI Automation".to_string()), Drops::requester);
+            let summon = SummonConfig {
+                debug: self.log.enabled(),
+                capturable: std::env::var_os("FAIRY_CAPTURABLE").is_some_and(|v| v == "1"),
+                ..SummonConfig::default()
+            };
+            let settings = settings.clone();
+            let windows_file = self.windows_file.clone();
+            self.log.line(now, "notes: starting");
+            self.starting = true;
+            self.transition = Some(thread::spawn(move || {
+                NotesRunning::start(&settings, windows_file, requester, summon)
+            }));
+        }
+    }
+
+    /// Switch off: the gesture stops, open notes are put away with their text saved and come
+    /// back when the switch goes on again (Swift `deactivate` and `hideAll`).
+    fn stop(&mut self, drops: Option<&mut Drops>) {
+        if let Some(running) = self.active.take() {
+            if let Some(drops) = drops {
+                drops.set_note_zones(None);
+            }
+            self.recent.clear();
+            self.shown.clear();
+            self.log.line(hook::now(), "notes: off");
+            self.transition = Some(thread::spawn(move || (None, running.stop())));
+        }
+    }
+
+    /// At quit, on every way out: a start or stop in flight finishes, then the gesture stops,
+    /// then the notes (pending text written). Bounded by the starts' and stops' own waits.
+    fn stop_now(&mut self) {
+        if let Some(transition) = self.transition.take()
+            && let Ok((running, problems)) = transition.join()
+        {
+            for problem in problems {
+                self.line(hook::now(), &problem);
+            }
+            if running.is_some() {
+                self.active = running;
+            }
+        }
+        if let Some(running) = self.active.take() {
+            for problem in running.stop() {
+                self.line(hook::now(), &problem);
+            }
+        }
+    }
+
+    /// The mouse events of this pass, for the gesture (the app has one mouse hook).
+    fn feed(&self, events: &[MouseEvent]) {
+        if let Some(summoner) = self.summoner() {
+            summoner.feed(events);
+        }
+    }
+
+    /// One pass of the UI loop: cards for a note, the notes' events, summons, and what blocks
+    /// the gesture. Returns true when the pile changed.
+    fn pass(&mut self, state: &mut FairyState, drops: Option<&mut Drops>, now: f64) -> bool {
+        let mut dirty = false;
+        let mut drops = drops;
+        let gifts = drops.as_deref_mut().map(Drops::take_note_gifts).unwrap_or_default();
+        let Some(running) = self.active.as_mut() else {
+            return false;
+        };
+        for ((x, y), cards) in gifts {
+            running.notes.give_cards(Point::new(f64::from(x), f64::from(y)), cards);
+        }
+        let events = running.notes.events();
+        let mut summons = std::mem::take(&mut self.summoner_events);
+        if let Some(summoner) = &mut running.summoner {
+            summoner.drain(&mut summons);
+            summoner.set_blocked(Block::Paste, drops.as_deref().is_some_and(Drops::busy));
+            summoner.set_blocked(Block::Capture, state.hidden_for_capture());
+        }
+        for event in summons.drain(..) {
+            match event {
+                SummonerEvent::Summon(summon) => {
+                    let (x, y) = summon.point;
+                    // `new_note_frame` puts the card's top-left half a pill up and left of
+                    // the point, as `NotesController.create` does.
+                    running.notes.open_new(Point::new(f64::from(x), f64::from(y)), summon.origin.clone());
+                    self.log.line(
+                        now,
+                        &format!("notes: summon at ({x}, {y}) from {}", summon.origin.label()),
+                    );
+                }
+                // The line starts with its own time on the same clock ("  1.234 summon: …").
+                SummonerEvent::Log(line) => {
+                    let timed = line.trim_start().split_once(' ').and_then(|(at, text)| {
+                        at.parse::<f64>().ok().map(|at| (at, text))
+                    });
+                    match timed {
+                        Some((at, text)) => self.log.line(at, text),
+                        None => self.log.line(now, &line),
+                    }
+                }
+            }
+        }
+        self.summoner_events = summons;
+        for event in events {
+            match event {
+                NotesEvent::CardsTaken { ids, hint } => {
+                    self.log.line(now, &format!("notes: a note took {} card(s)", ids.len()));
+                    dirty |= match drops.as_deref_mut() {
+                        Some(drops) => drops.note_took(&ids, &hint, state, now),
+                        None => {
+                            state.deliver(&ids, &hint, now);
+                            true
+                        }
+                    };
+                }
+                NotesEvent::Recent(recent) => {
+                    self.log.line(now, &format!("notes: {} recent", recent.len()));
+                    self.recent = recent;
+                }
+                NotesEvent::Error(message) => {
+                    self.line(now, &format!("notes: error: {message}"));
+                    let handled =
+                        drops.as_deref_mut().is_some_and(|drops| drops.note_failed(state, now));
+                    if handled {
+                        dirty = true;
+                    } else if state.is_holding() {
+                        state.flash_hint(&overlay_hint(&message), 2.5, now);
+                        dirty = true;
+                    }
+                }
+            }
+        }
+        dirty
+    }
+
+    /// Restarts the gesture when its thread or keyboard hook died.
+    fn health(&mut self, now: f64) {
+        let Some(summoner) = self.active.as_mut().and_then(|running| running.summoner.as_mut())
+        else {
+            return;
+        };
+        if !summoner.is_alive() {
+            let result = summoner.restart();
+            let text = match result {
+                Ok(()) => "notes: the note gesture was restarted".to_string(),
+                Err(error) => format!("notes: the note gesture could not restart: {error}"),
+            };
+            self.line(now, &text);
+        }
+    }
+
+    fn wakes(&self, out: &mut Vec<HANDLE>) {
+        if let Some(running) = &self.active {
+            out.push(running.notes.wake_handle());
+            if let Some(summoner) = &running.summoner {
+                out.push(summoner.wake_handle());
+            }
+        }
+    }
+
+    /// The NewNote shortcut.
+    fn summon_at_cursor(&mut self) {
+        match self.summoner() {
+            Some(summoner) => {
+                summoner.summon_at_cursor();
+                self.log.line(hook::now(), "notes: new note shortcut");
+            }
+            None => self.log.line(hook::now(), "notes: new note shortcut, but notes are off"),
+        }
+    }
+
+    /// The tray menu's notes section (`NotesController.appendMenuItems`): "Recent Notes"
+    /// with every note, open ones checked, and "Open Notes Folder". Shows the last known list;
+    /// the refresh it asks for answers before the next opening.
+    fn menu_section(&mut self) -> Vec<MenuItem> {
+        let Some(running) = &self.active else {
+            self.shown.clear();
+            return Vec::new();
+        };
+        running.notes.refresh();
+        self.shown = self.recent.iter().map(|note| note.id).collect();
+        let mut items: Vec<MenuItem> = self
+            .recent
+            .iter()
+            .enumerate()
+            .map(|(index, note)| MenuItem::Action {
+                id: MENU_NOTE_BASE + index as u32,
+                label: format!("{}\t{}", menu_text(&note.title), menu_text(&note.label)),
+                enabled: true,
+                checked: note.is_open,
+            })
+            .collect();
+        if items.is_empty() {
+            items.push(MenuItem::Label("No notes yet — hold Alt on empty space".into()));
+        }
+        vec![
+            MenuItem::Submenu { label: "Recent Notes".into(), items },
+            MenuItem::action(MENU_OPEN_NOTES_FOLDER, "Open Notes Folder"),
+        ]
+    }
+
+    fn menu_action(&mut self, id: u32) {
+        let Some(running) = &self.active else { return };
+        if id == MENU_OPEN_NOTES_FOLDER {
+            let folder = running.folder.clone();
+            // Starting Explorer is a process launch: keep it off the UI thread.
+            thread::spawn(move || {
+                if let Err(error) = std::process::Command::new("explorer.exe").arg(&folder).spawn() {
+                    eprintln!("could not open the notes folder: {error}");
+                }
+            });
+            self.log.line(hook::now(), "notes: open the notes folder");
+        } else if let Some(&note) = id
+            .checked_sub(MENU_NOTE_BASE)
+            .and_then(|index| self.shown.get(index as usize))
+        {
+            running.notes.reopen(note);
+            self.log.line(hook::now(), &format!("notes: reopen {note} from the menu"));
+        }
+    }
+}
+
+/// Stops the Notes capability when `main` ends, on every way out (errors and unwinding
+/// included). Declared after `drops`, so the gesture and the notes stop before the UI
+/// Automation worker and the clipboard.
+struct NotesOwner(Rc<RefCell<NotesFeature>>);
+
+impl Drop for NotesOwner {
+    fn drop(&mut self) {
+        if let Ok(mut feature) = self.0.try_borrow_mut() {
+            feature.stop_now();
+        }
+    }
+}
+
+/// A label for a Windows menu: `&` would be taken for an access key, a tab for the column.
+fn menu_text(text: &str) -> String {
+    text.replace('&', "&&").replace('\t', " ")
+}
+
+/// The overlay's short form of a notes error: the part before the reason, in the hint style.
+fn overlay_hint(message: &str) -> String {
+    let short = message.split(':').next().unwrap_or(message).trim().trim_end_matches('.');
+    let mut chars = short.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 fn main() -> windows::core::Result<()> {
     overlay::ensure_dpi_awareness();
     let settings_path = settings::default_settings_path();
     let mut settings = LiveSettings::from(Settings::load(&settings_path).unwrap_or_default());
+    // Note window positions live next to the settings.
+    let notes = Rc::new(RefCell::new(NotesFeature::new(
+        settings_path.with_file_name("note-windows.json"),
+    )));
 
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -469,11 +885,13 @@ fn main() -> windows::core::Result<()> {
     let action_app = Rc::clone(&app);
     let open_settings = Rc::new(Cell::new(false));
     let action_settings = Rc::clone(&open_settings);
+    let menu_notes = Rc::clone(&notes);
+    let action_notes = Rc::clone(&notes);
     let _tray = Tray::new(
         "Igorio",
         Box::new(move || {
             let can_restore = menu_app.borrow().state.can_restore();
-            vec![
+            let mut items = vec![
                 MenuItem::Action {
                     id: MENU_RESTORE,
                     label: "Restore Last Screenshot".into(),
@@ -481,10 +899,18 @@ fn main() -> windows::core::Result<()> {
                     checked: false,
                 },
                 MenuItem::action(MENU_ADD_DEMO, "Add Demo Screenshot"),
+            ];
+            let section = menu_notes.borrow_mut().menu_section();
+            if !section.is_empty() {
+                items.push(MenuItem::Separator);
+                items.extend(section);
+            }
+            items.extend([
                 MenuItem::Separator,
                 MenuItem::action(MENU_SETTINGS, "Settings…"),
                 MenuItem::action(MENU_QUIT, "Quit"),
-            ]
+            ]);
+            items
         }),
         Box::new(move |id| match id {
             MENU_RESTORE => action_app.borrow_mut().restore_last(),
@@ -492,7 +918,7 @@ fn main() -> windows::core::Result<()> {
             MENU_SETTINGS => action_settings.set(true),
             // SAFETY: posts WM_QUIT to this thread's own queue.
             MENU_QUIT => unsafe { PostQuitMessage(0) },
-            _ => {}
+            id => action_notes.borrow_mut().menu_action(id),
         }),
     )?;
 
@@ -513,6 +939,8 @@ fn main() -> windows::core::Result<()> {
     // This local is declared after `drops`, so it stops before clipboard restore and
     // shutdown on normal quit, error returns and unwinding.
     let mut detector = Detector::default();
+    // Also after `drops`: the note gesture, then the notes, stop before UI Automation does.
+    let _notes_owner = NotesOwner(Rc::clone(&notes));
     // This owner is dropped first on quit, error, and unwind.
     let mut settings_window = SettingsWindow::new(settings_path)?;
     // Declared after the settings window, so it stops first (bounded) on every way out.
@@ -545,6 +973,7 @@ fn main() -> windows::core::Result<()> {
         for pressed in presses.drain(..) {
             match pressed.action {
                 Action::OpenSettings => open_settings.set(true),
+                Action::NewNote => notes.borrow_mut().summon_at_cursor(),
                 action => app.borrow_mut().shortcut(action, now),
             }
         }
@@ -568,7 +997,12 @@ fn main() -> windows::core::Result<()> {
             }
         }
         detector.update(settings.screenshot_detector, drops.as_ref(), now);
+        notes
+            .borrow_mut()
+            .update(settings.notes, &settings.snapshot, drops.as_mut(), now);
         mouse_hook.drain(&mut events);
+        // Before the capture rule below empties the batch: the gesture keeps its button state.
+        notes.borrow().feed(&events);
         if let Some(snip) = &detector.active {
             snip.drain(&mut snip_events);
         }
@@ -587,6 +1021,10 @@ fn main() -> windows::core::Result<()> {
                     app.dirty = true;
                 }
                 router_due = drops.next_deadline();
+            }
+            if notes.borrow_mut().pass(&mut app.state, drops.as_mut(), now) {
+                app.dirty = true;
+                router_due = drops.as_ref().and_then(Drops::next_deadline);
             }
             events.clear();
             if app.needs_frame() {
@@ -615,12 +1053,16 @@ fn main() -> windows::core::Result<()> {
                 }
                 detector.stop();
             }
+            notes.borrow_mut().health(now);
         }
         wakes.truncate(permanent_wakes);
         if let Some(snip) = &detector.active {
             wakes.push(snip.wake_handle());
         }
-        let transition_due = detector.transition.is_some().then_some(now + FRAME);
+        notes.borrow().wakes(&mut wakes);
+        let transition_due = (detector.transition.is_some()
+            || notes.borrow().transition.is_some())
+        .then_some(now + FRAME);
         let until = earlier(earlier(due, router_due), earlier(transition_due, Some(next_health_check)))
             .unwrap_or(next_health_check);
         let wait = Duration::from_secs_f64((until - hook::now()).max(0.0));
@@ -635,7 +1077,113 @@ fn main() -> windows::core::Result<()> {
     {
         eprintln!("the shortcut thread did not stop within its shutdown budget");
     }
+    // The note gesture, then the notes (pending text written), then the workers they use.
+    notes.borrow_mut().stop_now();
     drop(detector);
     drop(drops);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+    use std::time::Instant;
+
+    use igorio_app::notes::store::{NoteOrigin, Trash};
+    use igorio_app::notes::window::TestOptions;
+
+    use super::*;
+
+    /// Tests never touch the Recycle Bin.
+    struct NoTrash;
+
+    impl Trash for NoTrash {
+        fn trash(&self, _path: &Path) -> io::Result<()> {
+            Err(io::Error::other("no Recycle Bin in tests"))
+        }
+    }
+
+    /// A notes thread in a scratch folder with one new note holding typed, unsaved text.
+    fn running_with_typed_note(root: &Path, text: &str) -> NotesRunning {
+        let folder = root.join("Notes");
+        let notes = Notes::start(NotesConfig {
+            folder: folder.clone(),
+            windows_file: root.join("note-windows.json"),
+            trash: Box::new(NoTrash),
+            theme: Theme::Light,
+            restore: false,
+            test: Some(TestOptions { dpi: Some(96), motion: Some(false), no_activate: true }),
+        })
+        .expect("notes thread");
+        notes.open_new(Point::new(240.0, 240.0), NoteOrigin::desktop());
+        let until = Instant::now() + Duration::from_secs(5);
+        let id = loop {
+            if let Some(&id) = notes.test_open_ids().first() {
+                break id;
+            }
+            assert!(Instant::now() < until, "the note did not open");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let text = text.to_owned();
+        // Keys sent to the editor control itself (window messages, not system input). The
+        // store writes 0.5 s later, so right after this the text is only in memory.
+        notes.test_with(id, move |note| {
+            let editor = note.editor();
+            for ch in text.chars() {
+                editor.send_key(ch.to_ascii_uppercase() as u16, &ch.to_string());
+            }
+        });
+        NotesRunning { summoner: None, notes, folder, chosen: None }
+    }
+
+    fn on_disk(folder: &Path, text: &str) -> bool {
+        fs::read_dir(folder).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+                .any(|file| file.contains(text))
+        })
+    }
+
+    /// The quit paths of `main`: the explicit stop after the loop, and `NotesOwner` when
+    /// `main` ends by an error or a panic. Both write a note's unsaved text before the workers
+    /// stop. (The gesture is not started here: it needs a keyboard hook and UI Automation;
+    /// `NotesRunning::stop` shuts it down before the notes by construction.)
+    #[test]
+    fn quitting_writes_unsaved_note_text_on_every_way_out() {
+        let root = std::env::temp_dir().join(format!("igorio-main-notes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+
+        let normal = root.join("normal");
+        let mut feature = NotesFeature::new(normal.join("note-windows.json"));
+        feature.active = Some(running_with_typed_note(&normal, "quit"));
+        assert!(!on_disk(&normal.join("Notes"), "quit"), "written before the quit");
+        feature.stop_now();
+        assert!(feature.active.is_none());
+        assert!(on_disk(&normal.join("Notes"), "quit"));
+
+        let unwound = root.join("unwound");
+        let feature = Rc::new(RefCell::new(NotesFeature::new(unwound.join("note-windows.json"))));
+        feature.borrow_mut().active = Some(running_with_typed_note(&unwound, "drop"));
+        drop(NotesOwner(Rc::clone(&feature)));
+        assert!(feature.borrow().active.is_none());
+        assert!(on_disk(&unwound.join("Notes"), "drop"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn menu_labels_and_overlay_hints() {
+        assert_eq!(menu_text("Tom & Jerry\tnotes"), "Tom && Jerry notes");
+        assert_eq!(
+            overlay_hint("A screenshot could not be added to the note: access denied"),
+            "a screenshot could not be added to the note"
+        );
+        assert_eq!(
+            overlay_hint("The note's file could not be moved to the Recycle Bin."),
+            "the note's file could not be moved to the Recycle Bin"
+        );
+    }
 }

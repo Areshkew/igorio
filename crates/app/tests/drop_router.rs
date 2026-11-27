@@ -79,6 +79,10 @@ struct Fake {
     /// The saver refuses new jobs (queue full).
     saver_busy: bool,
     reveals: Vec<(isize, PathBuf)>,
+    /// One of our note windows covers this rectangle.
+    note: Option<Rect>,
+    /// Cards given to a note: (point, ids top first).
+    gifts: Vec<((i32, i32), Vec<CardId>)>,
 }
 
 impl Fake {
@@ -222,6 +226,14 @@ impl Env for Fake {
     }
     fn log(&mut self, now: f64, line: &str) {
         self.log.push(format!("{now:.3} {line}"));
+    }
+    fn note_at(&self, (x, y): (i32, i32)) -> bool {
+        self.note
+            .is_some_and(|r| r.contains(igorio_core::geom::Point::new(x as f64, y as f64)))
+    }
+    fn give_to_note(&mut self, point: (i32, i32), cards: Vec<HeldCard>) {
+        self.gifts
+            .push((point, cards.iter().map(|card| card.id).collect()));
     }
 }
 
@@ -3948,4 +3960,141 @@ fn an_answer_for_another_write_is_ignored() {
     assert!(rig.s.card(id).is_some() && rig.r.busy());
     rig.written(0.4, Ok(png(PICTURES, "a.png")));
     assert!(rig.s.card(id).is_none());
+}
+
+// MARK: Notes
+
+/// A note window under `AT`.
+fn note_rig(cards: usize) -> Rig {
+    let mut rig = Rig::new(cards);
+    rig.e.note = Some(Rect::new(400.0, 300.0, 304.0, 224.0));
+    rig
+}
+
+#[test]
+fn a_double_click_over_a_note_gives_it_the_cards_and_they_leave_on_its_reply() {
+    let mut rig = note_rig(2);
+    let ids = rig.ids();
+    rig.double_click();
+    assert_eq!(rig.e.gifts, vec![(AT, ids.clone())], "{:#?}", rig.e.log);
+    assert!(rig.e.logged("over a note → give it 2 card(s)"));
+    // No lookup, no clipboard: the note takes the pile itself.
+    assert!(rig.e.lookups.is_empty());
+    assert!(rig.e.snapshots.is_empty());
+    // The cards stay until the note answers.
+    rig.up(0.2);
+    rig.to(1.0);
+    assert_eq!(rig.ids(), ids);
+    assert!(rig.r.busy());
+    rig.r
+        .note_took(&ids, "added 2 to note", 1.0, &mut rig.s, &mut rig.e);
+    assert!(rig.ids().is_empty());
+    assert_eq!(rig.s.hint(), Some("added 2 to note"));
+    assert!(!rig.r.busy());
+    assert!(rig.r.take_state_changed());
+}
+
+#[test]
+fn a_note_that_never_answers_leaves_the_cards_on_the_pile_and_says_so() {
+    let mut rig = note_rig(1);
+    let ids = rig.ids();
+    rig.double_click();
+    let tick = rig.s.reject_tick();
+    rig.to(0.15 + NOTE_TIMEOUT - 0.01);
+    assert!(rig.r.busy());
+    rig.to(0.15 + NOTE_TIMEOUT + 0.01);
+    assert!(!rig.r.busy());
+    assert_eq!(rig.ids(), ids);
+    assert_eq!(rig.s.hint(), Some(HINT_NOTE_SLOW));
+    assert_eq!(rig.s.reject_tick(), tick + 1);
+    assert!(rig.e.logged("the note did not answer"));
+    // A late answer still lets go of the cards it took: they are in the note.
+    rig.r.note_took(&ids, "added to note", 12.0, &mut rig.s, &mut rig.e);
+    assert!(rig.ids().is_empty());
+}
+
+#[test]
+fn a_note_that_fails_keeps_the_cards_at_once() {
+    let mut rig = note_rig(1);
+    let ids = rig.ids();
+    rig.double_click();
+    assert!(rig.r.note_failed(0.5, &mut rig.s, &mut rig.e));
+    assert!(!rig.r.busy());
+    assert_eq!(rig.ids(), ids);
+    assert_eq!(rig.s.hint(), Some(HINT_NOTE_FAILED));
+    // An error with no gift waiting is not the router's.
+    assert!(!rig.r.note_failed(0.6, &mut rig.s, &mut rig.e));
+}
+
+#[test]
+fn without_cards_a_double_click_over_a_note_does_nothing() {
+    let mut rig = note_rig(0);
+    rig.double_click();
+    rig.up(0.2);
+    rig.to(3.0);
+    assert!(rig.e.gifts.is_empty());
+    assert!(rig.e.lookups.is_empty());
+    assert!(!rig.r.busy());
+}
+
+#[test]
+fn a_double_click_over_a_note_never_pastes_into_what_is_behind_it() {
+    let mut rig = note_rig(1);
+    // Whatever is behind the note would take a paste.
+    rig.focus = Some(focused_field(false, ""));
+    rig.double_click();
+    rig.up(0.2);
+    rig.to(NOTE_TIMEOUT + 1.0);
+    assert!(rig.e.lookups.is_empty());
+    assert!(rig.e.stages.is_empty());
+    assert!(rig.e.pressed.is_empty());
+    assert_eq!(rig.e.sent, 0);
+    assert!(rig.e.checks.borrow().is_empty());
+    // Outside the note the same double-click is an ordinary paste.
+    let mut rig = Rig::new(1);
+    rig.e.note = Some(Rect::new(0.0, 0.0, 100.0, 100.0));
+    paste_into_field(&mut rig);
+    assert!(rig.e.gifts.is_empty());
+}
+
+#[test]
+fn typing_in_the_note_while_it_takes_the_cards_does_not_stop_it() {
+    let mut rig = note_rig(1);
+    let ids = rig.ids();
+    rig.double_click();
+    rig.e.keys += 3;
+    rig.to(1.0);
+    assert!(rig.r.busy());
+    rig.r.note_took(&ids, "added to note", 1.0, &mut rig.s, &mut rig.e);
+    assert!(rig.ids().is_empty());
+}
+
+#[test]
+fn resting_over_a_note_shows_its_hint_without_a_lookup() {
+    let mut rig = note_rig(1);
+    rig.moved(0.0, AT.0, AT.1);
+    rig.to(0.2);
+    assert_ne!(rig.s.hint(), Some(igorio_app::notes::window::DROP_HINT));
+    rig.to(0.23);
+    assert_eq!(rig.s.hint(), Some(igorio_app::notes::window::DROP_HINT));
+    assert!(rig.e.lookups.is_empty());
+    // Off the note: the usual lookup.
+    rig.moved(0.3, 10, 10);
+    rig.to(0.6);
+    assert_eq!(rig.e.lookups.len(), 1);
+    // Nothing held: no hint.
+    let mut rig = note_rig(0);
+    rig.moved(0.0, AT.0, AT.1);
+    rig.to(1.0);
+    assert_eq!(rig.s.hint(), None);
+}
+
+#[test]
+fn a_delivery_in_progress_ignores_a_double_click_over_a_note() {
+    let mut rig = Rig::new(2);
+    paste_into_field(&mut rig);
+    rig.e.note = Some(Rect::new(400.0, 300.0, 304.0, 224.0));
+    rig.double_click_at(0.6);
+    assert!(rig.e.gifts.is_empty(), "{:#?}", rig.e.log);
+    assert!(rig.e.logged("busy=yes"));
 }
