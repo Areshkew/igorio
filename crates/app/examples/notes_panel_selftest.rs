@@ -356,6 +356,40 @@ fn run() -> Result<bool> {
     });
     checks.check("Show all shows every hidden note (closed ones stay closed)", shown);
 
+    // The two buttons one after the other, faster than the notes' motion.
+    for pause in [0u64, 40, 150, 300] {
+        for round in 0..3 {
+            click(HWND(buttons[0] as *mut _));
+            std::thread::sleep(Duration::from_millis(pause));
+            click(HWND(buttons[1] as *mut _));
+            std::thread::sleep(Duration::from_millis(pause));
+            let _ = round;
+        }
+        let shown = wait(Duration::from_secs(3), || {
+            let open = notes.test_open_ids();
+            open.contains(&trip)
+                && open.contains(&groceries)
+                && state_of(&notes, trip) == Some(NoteState::Shown)
+                && state_of(&notes, groceries) == Some(NoteState::Shown)
+        });
+        checks.check(&format!("Hide all then Show all, {pause} ms apart, three times: all shown"), shown);
+        click(HWND(buttons[0] as *mut _));
+        std::thread::sleep(Duration::from_millis(pause));
+        click(HWND(buttons[1] as *mut _));
+        std::thread::sleep(Duration::from_millis(pause));
+        click(HWND(buttons[0] as *mut _));
+        let hidden = wait(Duration::from_secs(3), || {
+            notes.test_open_ids().is_empty()
+                && state_of(&notes, trip) == Some(NoteState::Hidden)
+                && state_of(&notes, groceries) == Some(NoteState::Hidden)
+        });
+        checks.check(&format!("then Hide, Show, Hide, {pause} ms apart: all hidden"), hidden);
+        wait(Duration::from_secs(3), || notes.test_idle());
+        click(HWND(buttons[1] as *mut _));
+        wait_state(&notes, trip, NoteState::Shown);
+        wait(Duration::from_secs(3), || notes.test_idle());
+    }
+
     // --- Dark theme while open -----------------------------------------------------------
     wait(Duration::from_secs(3), || notes.test_idle());
     notes.set_theme(Theme::Dark);

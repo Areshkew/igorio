@@ -1330,7 +1330,12 @@ impl Hub {
         self.update_zones();
         if animate && self.motion.get() && !self.quitting.get() {
             window.fade_out();
-            self.closing.borrow_mut().insert(id, window);
+            // An earlier window of this note may still be fading (hidden, shown and hidden
+            // again quickly): destroy it now, or its state would be freed under a live window.
+            let earlier = self.closing.borrow_mut().insert(id, window);
+            if let Some(earlier) = earlier {
+                earlier.destroy();
+            }
         } else {
             window.destroy();
         }
