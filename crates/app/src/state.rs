@@ -37,6 +37,25 @@ const DROP_FINISH: f64 = 0.30;
 /// Delivered cards leave one after the other, this far apart.
 const DELIVER_STEP: f64 = 0.36;
 
+/// Why the fairy steps out of the way (`AppDelegate.captureUIOwners`, by owner).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hidden {
+    /// The system screenshot UI is up (the screenshot detector).
+    CaptureUi,
+    /// A pen or highlighter is in hand during a recording: the fairy must not follow the pen
+    /// around the video, and scribbling is not a shake.
+    Drawing,
+}
+
+impl Hidden {
+    fn bit(self) -> u8 {
+        match self {
+            Hidden::CaptureUi => 1,
+            Hidden::Drawing => 2,
+        }
+    }
+}
+
 /// A deferred step: the Rust stand-in for one `Timer` or `asyncAfter` closure.
 #[derive(Debug, Clone)]
 enum Task {
@@ -122,7 +141,8 @@ pub struct FairyState {
     hint_target: f64,
     reject_tick: u64,
     last_reject_at: Option<f64>,
-    hidden_for_capture: bool,
+    /// Why the fairy is hidden: a set of [`Hidden`] bits. Shown again when it is empty.
+    hidden: u8,
     opacity_from: f64,
     opacity_at: f64,
     opacity_target: f64,
@@ -151,7 +171,7 @@ impl FairyState {
             hint_target: 0.0,
             reject_tick: 0,
             last_reject_at: None,
-            hidden_for_capture: false,
+            hidden: 0,
             opacity_from: 1.0,
             opacity_at: 0.0,
             opacity_target: 1.0,
@@ -216,8 +236,14 @@ impl FairyState {
         self.reject_tick
     }
 
+    /// The fairy is hidden, for any reason (`AppDelegate.captureUIOwners` is not empty).
     pub fn hidden_for_capture(&self) -> bool {
-        self.hidden_for_capture
+        self.hidden != 0
+    }
+
+    /// The fairy is hidden for this reason, whatever the others.
+    pub fn hidden_by(&self, reason: Hidden) -> bool {
+        self.hidden & reason.bit() != 0
     }
 
     /// The card size; the next frame is drawn at it.
@@ -232,11 +258,27 @@ impl FairyState {
 
     /// The fairy steps out of the way while the system capture UI is up.
     pub fn set_hidden_for_capture(&mut self, hidden: bool, now: f64) {
-        let from = self.opacity_now(now);
-        self.hidden_for_capture = hidden;
-        self.opacity_from = from;
-        self.opacity_at = now;
-        self.opacity_target = if hidden { 0.0 } else { 1.0 };
+        self.set_hidden(Hidden::CaptureUi, hidden, now);
+    }
+
+    /// Adds or removes one reason to hide (`setCaptureUIVisible(_:owner:)`). The fairy is
+    /// hidden while any reason holds and comes back when the last one goes. Returns true when
+    /// that changed: the fade starts then, and the shake gate follows the same edge.
+    pub fn set_hidden(&mut self, reason: Hidden, hidden: bool, now: f64) -> bool {
+        let was = self.hidden_for_capture();
+        if hidden {
+            self.hidden |= reason.bit();
+        } else {
+            self.hidden &= !reason.bit();
+        }
+        let is = self.hidden_for_capture();
+        if is != was {
+            let from = self.opacity_now(now);
+            self.opacity_from = from;
+            self.opacity_at = now;
+            self.opacity_target = if is { 0.0 } else { 1.0 };
+        }
+        is != was
     }
 
     // MARK: Actions

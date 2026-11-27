@@ -156,19 +156,19 @@ impl Action {
         }
     }
 
-    /// False for actions whose feature is not built yet (recording): shown disabled, and
-    /// never registered. Pen and Highlighter default to Ctrl+Shift+7 and Ctrl+Shift+8, which
-    /// the note editor uses for its numbered and bulleted lists: making them available must
-    /// decide that clash first.
+    /// False for an action whose feature is not built yet: shown disabled, and never
+    /// registered. Every feature is built now (recording since M8); the rule stays for the
+    /// next action that arrives before its feature.
     pub fn available(self) -> bool {
-        matches!(
-            self,
-            Action::RestoreLast
-                | Action::DiscardTop
-                | Action::DiscardAll
-                | Action::OpenSettings
-                | Action::NewNote
-        )
+        true
+    }
+
+    /// Registered only while a recording runs ([`Hotkeys::set_recording`]). Pen and
+    /// Highlighter default to Ctrl+Shift+7 and Ctrl+Shift+8, which the note editor uses for
+    /// its numbered and bulleted lists: while no recording runs those keys stay free for it
+    /// (and for every other program), and a pen has nothing to draw on anyway.
+    pub fn recording_only(self) -> bool {
+        matches!(self, Action::Pen | Action::Highlighter)
     }
 }
 
@@ -807,10 +807,28 @@ pub enum Registration {
     NotSet,
     /// The action's feature is not built yet, so its shortcut is not registered.
     Unavailable,
+    /// A recording-only action ([`Action::recording_only`]) while no recording runs: its
+    /// shortcut is registered when one starts.
+    WhileRecording,
     /// Another program holds the chord (`ERROR_HOTKEY_ALREADY_REGISTERED`).
     Taken,
     /// `RegisterHotKey` failed for another reason.
     Failed(String),
+}
+
+/// The rule the hotkey thread follows for one action: `Ok` registers the chord, `Err` is the
+/// status of an action it leaves unregistered. `recording`: a recording runs now.
+pub fn registration_plan(
+    action: Action,
+    chord: Option<Chord>,
+    recording: bool,
+) -> Result<Chord, Registration> {
+    match chord {
+        _ if !action.available() => Err(Registration::Unavailable),
+        None => Err(Registration::NotSet),
+        Some(_) if action.recording_only() && !recording => Err(Registration::WhileRecording),
+        Some(chord) => Ok(chord),
+    }
 }
 
 /// Most presses kept between two drains. More are dropped (a person cannot press faster).
@@ -822,6 +840,7 @@ const WM_APPLY: u32 = WM_APP + 1;
 const WM_PAUSE: u32 = WM_APP + 2;
 const WM_STOP: u32 = WM_APP + 3;
 const WM_REPORT: u32 = WM_APP + 4;
+const WM_RECORDING: u32 = WM_APP + 5;
 
 /// An auto-reset event handle, closed on drop.
 struct Event(HANDLE);
@@ -847,6 +866,8 @@ struct Shared {
     /// The latest `apply`, not yet taken by the thread.
     pending: Mutex<Option<Shortcuts>>,
     paused: AtomicBool,
+    /// A recording runs: the recording-only actions are registered.
+    recording: AtomicBool,
 }
 
 /// A status snapshot taken after all earlier commands on the hotkey thread.
@@ -872,6 +893,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// receive an existing shortcut to record it (it would simply fire, or vanish if dropped).
 /// On resume the thread registers the latest shortcuts again. `status` keeps its last
 /// values while paused, and is refreshed on resume.
+///
+/// ## While recording
+///
+/// The recording-only actions ([`Action::recording_only`]: Pen and Highlighter) are
+/// registered only between `set_recording(true)` and `set_recording(false)`. Otherwise their
+/// status is [`Registration::WhileRecording`] and their keys reach the foreground program
+/// (the note editor uses them for lists). Like pause, the change is made on the hotkey
+/// thread, in order with apply and pause.
 pub struct Hotkeys {
     thread: Option<JoinHandle<()>>,
     /// The thread's message-only window, as an integer (`HWND` is not `Send`).
@@ -894,6 +923,7 @@ impl Hotkeys {
             reports: Mutex::new(Vec::new()),
             pending: Mutex::new(None),
             paused: AtomicBool::new(false),
+            recording: AtomicBool::new(false),
         });
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread_shared = Arc::clone(&shared);
@@ -974,6 +1004,14 @@ impl Hotkeys {
         }
     }
 
+    /// A recording started (`true`) or stopped: registers or unregisters the recording-only
+    /// actions (see the type's comment). Never blocks; the result arrives in `status`.
+    pub fn set_recording(&self, recording: bool) {
+        if self.shared.recording.swap(recording, Relaxed) != recording {
+            self.post(WM_RECORDING, 0);
+        }
+    }
+
     /// Posts `WM_HOTKEY` for `action` to the service's own window, as Windows would on a
     /// press. For the self-test: it exercises the message path without sending input.
     #[doc(hidden)]
@@ -1030,15 +1068,13 @@ struct Registrar {
 impl Registrar {
     /// Makes the registrations match `target` (None: nothing registered) and returns the
     /// status. Everything that changes is unregistered first, so two actions can swap chords.
-    fn sync(&mut self, target: Option<&Shortcuts>) -> Vec<(Action, Registration)> {
-        let wanted = |action: Action| {
-            target
-                .and_then(|shortcuts| shortcuts.get(action))
-                .filter(|_| action.available())
+    fn sync(&mut self, target: Option<&Shortcuts>, recording: bool) -> Vec<(Action, Registration)> {
+        let plan = |action: Action| {
+            registration_plan(action, target.and_then(|shortcuts| shortcuts.get(action)), recording)
         };
         for action in Action::ALL.iter().copied() {
             if self.registered[action.index()].is_some()
-                && self.registered[action.index()] != wanted(action)
+                && self.registered[action.index()] != plan(action).ok()
             {
                 // SAFETY: unregisters a hotkey this thread registered on its own window.
                 let _ = unsafe { UnregisterHotKey(Some(self.window), hotkey_id(action)) };
@@ -1047,13 +1083,12 @@ impl Registrar {
         }
         let mut status = Vec::with_capacity(Action::ALL.len());
         for action in Action::ALL.iter().copied() {
-            let state = match wanted(action) {
-                _ if !action.available() => Registration::Unavailable,
-                None => Registration::NotSet,
-                Some(chord) if self.registered[action.index()] == Some(chord) => {
+            let state = match plan(action) {
+                Err(state) => state,
+                Ok(chord) if self.registered[action.index()] == Some(chord) => {
                     Registration::Active
                 }
-                Some(chord) => {
+                Ok(chord) => {
                     // SAFETY: registers on this thread's own window; no pointers.
                     let result = unsafe {
                         RegisterHotKey(
@@ -1116,7 +1151,7 @@ fn run(shared: Arc<Shared>, initial: Shortcuts, ready: mpsc::Sender<windows::cor
         registered: [None; 8],
     };
     let mut desired = initial;
-    *lock(&shared.status) = registrar.sync(Some(&desired));
+    *lock(&shared.status) = registrar.sync(Some(&desired), shared.recording.load(Relaxed));
     let _ = ready.send(Ok(window.0 as isize));
     drop(ready);
 
@@ -1150,15 +1185,22 @@ fn run(shared: Arc<Shared>, initial: Shortcuts, ready: mpsc::Sender<windows::cor
                     desired = next;
                 }
                 if !shared.paused.load(Relaxed) {
-                    let status = registrar.sync(Some(&desired));
+                    let status = registrar.sync(Some(&desired), shared.recording.load(Relaxed));
                     *lock(&shared.status) = status;
                 }
             }
             WM_PAUSE if ours => {
                 if shared.paused.load(Relaxed) {
-                    registrar.sync(None);
+                    registrar.sync(None, false);
                 } else {
-                    let status = registrar.sync(Some(&desired));
+                    let status = registrar.sync(Some(&desired), shared.recording.load(Relaxed));
+                    *lock(&shared.status) = status;
+                }
+            }
+            // While paused nothing is registered; the resume uses the latest flag.
+            WM_RECORDING if ours => {
+                if !shared.paused.load(Relaxed) {
+                    let status = registrar.sync(Some(&desired), shared.recording.load(Relaxed));
                     *lock(&shared.status) = status;
                 }
             }
@@ -1178,7 +1220,7 @@ fn run(shared: Arc<Shared>, initial: Shortcuts, ready: mpsc::Sender<windows::cor
             }
         }
     }
-    registrar.sync(None);
+    registrar.sync(None, false);
     // SAFETY: the window was created by this thread and is destroyed once.
     let _ = unsafe { DestroyWindow(window) };
 }

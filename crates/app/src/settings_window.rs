@@ -52,6 +52,7 @@ use crate::shortcuts::{
 
 const SCREENSHOTS: &str = "fairy.screenshots";
 const NOTES: &str = "fairy.notes";
+const RECORDING: &str = crate::recording::feature::CAPABILITY;
 /// Parts of a capability's key line drawn as plain text, not as key chips.
 const PLAIN_WORDS: &[&str] = &["or", "Hold", "and click on empty space"];
 const CLASS: PCWSTR = w!("IgorioSettings");
@@ -74,6 +75,8 @@ pub struct LiveSettings {
     pub screenshot_detector: bool,
     /// The Notes capability: note windows and the note gesture.
     pub notes: bool,
+    /// The Screen recording capability: the shortcut, the tray item and the tool menu entry.
+    pub recording: bool,
     pub card_size: CardSize,
     pub snapshot: Settings,
 }
@@ -83,6 +86,7 @@ impl From<Settings> for LiveSettings {
         Self {
             screenshot_detector: snapshot.is_enabled(SCREENSHOTS),
             notes: snapshot.is_enabled(NOTES),
+            recording: snapshot.is_enabled(RECORDING),
             card_size: snapshot.card_size,
             snapshot,
         }
@@ -706,6 +710,26 @@ const DARK: Palette = Palette {
     error: rgb(0xffaaa4),
 };
 
+/// The recording actions in the order of their chips.
+const RECORDING_ACTIONS: [Action; 3] = [Action::ToggleRecording, Action::Pen, Action::Highlighter];
+
+/// The Screen recording row's chips: the user's chords for recording, pen and highlighter.
+fn recording_chords(shortcuts: &Shortcuts) -> Vec<Chord> {
+    RECORDING_ACTIONS.iter().filter_map(|&action| shortcuts.get(action)).collect()
+}
+
+/// The chips' accessible name, read by screen readers instead of the drawing.
+fn recording_keys_name(shortcuts: &Shortcuts) -> String {
+    let parts: Vec<String> = RECORDING_ACTIONS
+        .iter()
+        .filter_map(|&action| {
+            let chord = shortcuts.get(action)?;
+            Some(format!("{} {}", action.label(), display_for_layout(&chord)))
+        })
+        .collect();
+    if parts.is_empty() { "No recording shortcuts".to_owned() } else { parts.join(", ") }
+}
+
 fn key_chips(shortcut: &str) -> impl Iterator<Item = &str> {
     shortcut.split('+').map(str::trim).filter(|key| !key.is_empty())
 }
@@ -896,9 +920,15 @@ const ITEMS: &[Item] = &[
         [24, 219, 400, 18],
     ),
     item(RecordingTitle, Kind::Title, "Screen recording", [24, 248, 119, 22]),
-    item(RecordingKeys, Kind::Keys, "Ctrl+Shift+6|Ctrl+Shift+7|Ctrl+Shift+8", [149, 249, 315, 20]),
-    item(Recording, Kind::Switch, "Screen recording, not available yet", [470, 245, 50, 28]),
-    item(RecordingDetail, Kind::Detail, "Not available yet", [24, 272, 400, 18]),
+    // The chips are the user's chords (`recording_chords`), drawn from the settings.
+    item(RecordingKeys, Kind::Keys, "", [149, 249, 315, 20]),
+    item(Recording, Kind::Switch, "Screen recording", [470, 245, 50, 28]),
+    item(
+        RecordingDetail,
+        Kind::Detail,
+        "Records the screen under the cursor as MP4. Alt + wheel zooms.",
+        [24, 272, 440, 18],
+    ),
     item(General, Kind::Heading, "General", [24, 302, 496, 22]),
     item(NotesFolder, Kind::Title, "Notes folder", [24, 329, 496, 20]),
     item(ChooseNotes, Kind::Push("&Choose…"), "&Choose notes folder…", [24, 352, 77, 24]),
@@ -1010,6 +1040,8 @@ impl Page {
 }
 
 const RECORDING_PROMPT: &str = "Press the keys · Esc cancels · Backspace clears";
+/// The note under Pen and Highlighter while no recording runs (`Registration::WhileRecording`).
+const WHILE_RECORDING: &str = "Active while recording";
 
 /// The note shown under a row after its shortcut was set, if any. Muted: these are hints,
 /// not errors.
@@ -1396,7 +1428,8 @@ impl Item {
         match self.id {
             ScreenshotKeys => "Windows plus Shift plus S, or Print Screen",
             NotesKeys => "Hold Alt and click on empty space",
-            RecordingKeys => "Control plus Shift plus 6, 7, or 8",
+            // Replaced by `recording_keys_name` at the first refresh.
+            RecordingKeys => "Recording shortcuts",
             _ => self.text,
         }
     }
@@ -2103,6 +2136,10 @@ impl Window<'_> {
                 (Some(_), Some(Registration::Failed(message))) => {
                     Note::new(message.clone(), Tone::Error)
                 }
+                // Pen and Highlighter: their keys stay free until a recording starts.
+                (Some(_), Some(Registration::WhileRecording)) => {
+                    Note::new(WHILE_RECORDING, Tone::Muted)
+                }
                 _ => Note::default(),
             }
         }
@@ -2396,6 +2433,7 @@ impl Window<'_> {
             status,
             retry,
             dimensions,
+            keys_name,
         ) = {
             let model = self.model.borrow();
             let settings = &model.settings;
@@ -2405,7 +2443,7 @@ impl Window<'_> {
                     (Screenshots, settings.is_enabled(SCREENSHOTS)),
                     (Keep, settings.keep_every_screenshot),
                     (Notes, settings.is_enabled(NOTES)),
-                    (Recording, false),
+                    (Recording, settings.is_enabled(RECORDING)),
                     (Small, settings.card_size == CardSize::Small),
                     (Medium, settings.card_size == CardSize::Medium),
                     (Large, settings.card_size == CardSize::Large),
@@ -2418,6 +2456,7 @@ impl Window<'_> {
                 model.status(),
                 model.save_error.is_some(),
                 format!("{} × {} px", dimensions.width, dimensions.height),
+                recording_keys_name(&settings.shortcuts),
             )
         };
         let now = self.now();
@@ -2457,6 +2496,7 @@ impl Window<'_> {
             };
         }
         self.text(CardDimensions, &dimensions);
+        self.text(RecordingKeys, &keys_name);
         self.text(Status, &status);
         let show_status = !status.is_empty();
         if show_status {
@@ -2483,7 +2523,6 @@ impl Window<'_> {
                     || !item.button()
                     || loaded
                         && match item.id {
-                            Recording => false,
                             Launch => launch_available,
                             ResetNotes => reset_notes,
                             ResetCaptures => reset_captures,
@@ -2652,6 +2691,12 @@ impl Window<'_> {
                 let mut model = self.model.borrow_mut();
                 let on = model.settings.is_enabled(NOTES);
                 model.settings.set_enabled(NOTES, !on);
+            }
+            // Off during a recording: the app saves that recording first.
+            Recording => {
+                let mut model = self.model.borrow_mut();
+                let on = model.settings.is_enabled(RECORDING);
+                model.settings.set_enabled(RECORDING, !on);
             }
             Keep => {
                 let mut model = self.model.borrow_mut();
@@ -3635,13 +3680,15 @@ impl Window<'_> {
                         canvas.text(bounds, label, fade(p.muted), center | DT_NOPREFIX, font);
                         x += width + px(3);
                     };
+                    if item.id == RecordingKeys {
+                        // The user's own chords: one chip each, unset ones left out.
+                        for chord in recording_chords(&self.model.borrow().settings.shortcuts) {
+                            key(&display_for_layout(&chord), true);
+                        }
+                    }
                     for group in item.text.split('|') {
-                        if item.id == RecordingKeys {
-                            key(group, true);
-                        } else {
-                            for part in key_chips(group) {
-                                key(part, !PLAIN_WORDS.contains(&part));
-                            }
+                        for part in key_chips(group) {
+                            key(part, !PLAIN_WORDS.contains(&part));
                         }
                     }
                 }

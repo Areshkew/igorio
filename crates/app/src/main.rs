@@ -21,15 +21,17 @@ use igorio_app::notes::store::{NoteId, RecycleBin};
 use igorio_app::notes::summoner::{Block, SummonConfig, Summoner, SummonerEvent, ToolContext, ToolId};
 use igorio_app::notes::window::{Event as NotesEvent, Notes, NotesConfig, RecentNote, Theme};
 use igorio_app::overlay::{self, Overlay};
+use igorio_app::recording::feature::{self as rec, RecordingFeature, RecordingState};
 use igorio_app::saver;
 use igorio_app::settings::{self, DefaultFolders, Settings};
 use igorio_app::settings_window::{LiveSettings, SettingsWindow, ShortcutService};
-use igorio_app::shortcuts::{Action, Hotkeys};
+use igorio_app::shortcuts::{Action, Hotkeys, Registration, display_for_layout};
 use igorio_app::snip::{Snip, SnipEvent};
-use igorio_app::state::FairyState;
+use igorio_app::state::{FairyState, Hidden};
 use igorio_app::tray::{EndRequest, MenuItem, Tray};
 use igorio_app::uia::Requester;
 use igorio_core::geom::Point;
+use igorio_core::ink::InkTool;
 use igorio_core::shake::{ShakeGate, ShakeResult};
 use igorio_kit::Image;
 use tiny_skia::Pixmap;
@@ -53,22 +55,32 @@ const MENU_ADD_DEMO: u32 = 2;
 const MENU_QUIT: u32 = 3;
 const MENU_SETTINGS: u32 = 4;
 const MENU_OPEN_NOTES_FOLDER: u32 = 5;
+const MENU_RECORD: u32 = 6;
+const MENU_PEN: u32 = 7;
+const MENU_HIGHLIGHTER: u32 = 8;
 /// A recent note in the tray menu: this id plus its place in the list.
 const MENU_NOTE_BASE: u32 = 100;
 /// How long stopping the notes may take: saving the text and closing the windows.
 const NOTES_STOP: Duration = Duration::from_secs(2);
+/// How long the normal quit waits for a recording in progress to be finished (the Swift app
+/// waits 3 s too). Bounded by the recorder's own shutdown wait.
+const RECORDING_STOP: Duration = Duration::from_secs(3);
 /// At session end Windows may end the process a few seconds after WM_ENDSESSION, so the quit
 /// does only what matters, most important first, within 4.0 s in all: the clipboard restore
 /// (this), the notes' text and window positions ([`END_NOTES`]), then the clipboard thread's
-/// stop, which renders what we still own (its own bound, 2 s, in `Clipboard::drop`).
+/// stop, which renders what we still own (its own bound, 2 s, in `Clipboard::drop`). A
+/// recording in progress comes last ([`END_RECORDING`]): while one runs the tray window holds
+/// a shutdown block reason, so Windows shows "Saving a screen recording" and waits for it
+/// instead of ending the process after the usual few seconds.
 const END_RESTORE: Duration = Duration::from_millis(800);
 const END_NOTES: Duration = Duration::from_millis(1200);
+const END_RECORDING: Duration = Duration::from_secs(5);
 /// How long a console handler waits for the quit path. Windows ends the process about 5 s
 /// after the console window is closed; Ctrl+C and Ctrl+Break run the normal quit, whose steps
-/// add up to about 14.3 s at worst. If the quit has not finished by then, the default
+/// add up to about 17.3 s at worst. If the quit has not finished by then, the default
 /// handler ends the process.
 const CONSOLE_CLOSE_WAIT: Duration = Duration::from_millis(4500);
-const CONSOLE_BREAK_WAIT: Duration = Duration::from_secs(15);
+const CONSOLE_BREAK_WAIT: Duration = Duration::from_secs(19);
 
 /// Frame interval while something moves, in seconds.
 const FRAME: f64 = 0.008;
@@ -133,12 +145,29 @@ impl App {
     }
 
     fn capture_ui(&mut self, shown: bool, time: f64) {
-        self.state.set_hidden_for_capture(shown, time);
-        if shown {
-            self.shake.screenshot_ui_shown();
-        } else {
-            self.shake.screenshot_ui_gone();
+        self.hide(Hidden::CaptureUi, shown, time);
+    }
+
+    /// One reason to hide the fairy comes or goes (`setCaptureUIVisible(_:owner:)`): the
+    /// screenshot UI, or a pen in hand while recording. It is hidden while any reason holds;
+    /// the shake gate follows the overall edge.
+    fn hide(&mut self, reason: Hidden, hidden: bool, time: f64) {
+        if self.state.set_hidden(reason, hidden, time) {
+            if hidden {
+                self.shake.screenshot_ui_shown();
+            } else {
+                self.shake.screenshot_ui_gone();
+            }
+            self.dirty = true;
         }
+    }
+
+    /// A finished recording, carried like a screenshot (`carry(recording:poster:scale:duration:)`):
+    /// already saved, so a shake only lets go of it.
+    fn carry_recording(&mut self, finished: rec::Finished, now: f64) {
+        let rec::Finished { file, poster, scale, duration, captured_at } = finished;
+        self.state.hold(poster, scale, captured_at, true, Some(file), Some(duration), now);
+        self.shake.captured();
         self.dirty = true;
     }
 
@@ -550,6 +579,19 @@ struct NotesFeature {
     /// The notes the tray menu shows, in menu order.
     shown: Vec<NoteId>,
     summoner_events: Vec<SummonerEvent>,
+    /// The tool menu's Record screen was chosen: the loop hands it to the recording.
+    record: bool,
+}
+
+/// What the tool menu and the note gesture need to know about screen recording.
+#[derive(Debug, Clone, Copy, Default)]
+struct RecordingFacts {
+    /// The capability is switched on.
+    enabled: bool,
+    /// A recording is starting, running or being saved.
+    running: bool,
+    /// The note gesture and the tool menu are off ([`rec::exclusive`]).
+    exclusive: bool,
 }
 
 impl NotesFeature {
@@ -564,6 +606,7 @@ impl NotesFeature {
             recent: Vec::new(),
             shown: Vec::new(),
             summoner_events: Vec::new(),
+            record: false,
         }
     }
 
@@ -713,7 +756,13 @@ impl NotesFeature {
 
     /// One pass of the UI loop: cards for a note, the notes' events, summons, and what blocks
     /// the gesture. Returns true when the pile changed.
-    fn pass(&mut self, state: &mut FairyState, drops: Option<&mut Drops>, now: f64) -> bool {
+    fn pass(
+        &mut self,
+        state: &mut FairyState,
+        drops: Option<&mut Drops>,
+        recording: RecordingFacts,
+        now: f64,
+    ) -> bool {
         let mut dirty = false;
         let mut drops = drops;
         let gifts = drops.as_deref_mut().map(Drops::take_note_gifts).unwrap_or_default();
@@ -729,10 +778,13 @@ impl NotesFeature {
             summoner.drain(&mut summons);
             summoner.set_blocked(Block::Paste, drops.as_deref().is_some_and(Drops::busy));
             summoner.set_blocked(Block::Capture, state.hidden_for_capture());
-            // Recording is not built yet: the menu offers New note only.
+            // While recording, Alt is for the zoom (`host.setExclusive`).
+            summoner.set_blocked(Block::Recording, recording.exclusive);
             summoner.set_tool_context(ToolContext {
                 notes: true,
                 recording_available: Action::ToggleRecording.available(),
+                recording_enabled: recording.enabled,
+                recording: recording.running,
                 cards_held: state.is_holding(),
                 ..ToolContext::default()
             });
@@ -751,10 +803,10 @@ impl NotesFeature {
                                 &format!("notes: summon at ({x}, {y}) from {}", chosen.origin.label()),
                             );
                         }
-                        ToolId::RecordScreen if Action::ToggleRecording.available() => {
-                            self.log.line(now, &format!("record screen chosen at ({x}, {y}): not built yet"));
+                        ToolId::RecordScreen => {
+                            self.record = true;
+                            self.log.line(now, &format!("record screen chosen at ({x}, {y})"));
                         }
-                        ToolId::RecordScreen => {}
                     }
                 }
                 // The line starts with its own time on the same clock ("  1.234 summon: …").
@@ -1003,6 +1055,7 @@ struct Rest {
 struct Quit {
     parts: QuitOnce<Parts>,
     notes: Rc<RefCell<NotesFeature>>,
+    recording: Rc<RefCell<RecordingFeature>>,
     log: RefCell<DebugLog>,
     rest: RefCell<Option<Rest>>,
 }
@@ -1049,17 +1102,28 @@ impl Quit {
     }
 
     /// Every step, in this order. Worst cases, each for a stuck thread (a quit normally takes
-    /// milliseconds): the settings window 0.95 s; the shortcut thread 1 s; the note gesture
-    /// 1 s and the notes 2 s (plus up to 8 s while a notes start is in flight); screenshot
-    /// detection 1.8 s (plus up to 3.6 s while its start is in flight); then the drop router:
-    /// the clipboard restore 1 s, the clipboard thread 2 s, UI Automation 1.5 s, the key watch
-    /// 1 s, the Explorer lookup 1 s and the PNG saver 1 s. About 14.3 s with nothing in flight.
+    /// milliseconds): the settings window 0.95 s; a screen recording in progress 3 s for its
+    /// file, its UI included ([`RECORDING_STOP`]; finishing a file usually takes well under
+    /// a second, plus a copy for long ones); the shortcut thread 1 s; the note gesture 1 s and
+    /// the notes 2 s (plus up to 8 s while a notes start is in flight); screenshot detection
+    /// 1.8 s (plus up to 3.6 s while its start is in flight); then the drop router: the
+    /// clipboard restore 1 s, the clipboard thread 2 s, UI Automation 1.5 s, the key watch 1 s,
+    /// the Explorer lookup 1 s and the PNG saver 1 s. About 17.3 s with nothing in flight.
     fn stop_all(&self, parts: Parts) {
         let Parts { settings, settings_window, mut hotkeys, detector, drops } = parts;
-        // The settings window goes first: a recording open in it resumes the hotkeys.
+        // The settings window goes first: a shortcut being recorded in it resumes the hotkeys.
         let service = hotkeys.as_ref().map(|hotkeys| hotkeys as &dyn ShortcutService);
         settings_window.shutdown(service, &settings.snapshot.shortcuts);
         self.line("quit: settings window closed");
+        // A screen recording in progress: the UI first (its input gates), then the file is
+        // finished. It is not put on the pile: the app is ending.
+        match self.recording.try_borrow_mut() {
+            Ok(mut recording) => {
+                recording.finish_now(RECORDING_STOP, hook::now());
+            }
+            Err(_) => self.problem("quit: the recording is in use; it stops with the process"),
+        }
+        self.line("quit: recording stopped");
         if let Some(hotkeys) = hotkeys.take()
             && !hotkeys.shutdown()
         {
@@ -1082,11 +1146,14 @@ impl Quit {
     /// Session end: what the user would lose, most important first, within 4.0 s: the
     /// clipboard restore (0.8 s); the notes' pending text, then their window positions (1.2 s,
     /// a notes start or stop in flight included); the clipboard thread, which renders a staged
-    /// screenshot we still own (2 s). Hooks, hotkeys and the other workers are left: Windows
-    /// releases them when the process ends.
+    /// screenshot we still own (2 s). Then a screen recording in progress is finished (5 s,
+    /// [`END_RECORDING`]): only then is there anything to wait for, and while a recording
+    /// runs the tray window holds a shutdown block reason (`ShutdownBlockReasonCreate`, set by
+    /// `RecordingFeature`), so Windows shows "Saving a screen recording" and waits instead of
+    /// ending the process after a few seconds. A file not finished in time stays as its
+    /// `.partial.mp4`. Hooks, hotkeys and the other workers are left: Windows releases them
+    /// when the process ends.
     fn stop_what_matters(&self, mut parts: Parts) -> Rest {
-        // If a step could legitimately take long (a recording being finalized), this is where
-        // `ShutdownBlockReasonCreate` would ask Windows to wait and tell the user why.
         if let Some(drops) = &mut parts.drops {
             drops.restore_clipboard(END_RESTORE);
         }
@@ -1103,6 +1170,13 @@ impl Quit {
             drops.stop_clipboard();
         }
         self.line("quit: clipboard thread stopped");
+        match self.recording.try_borrow_mut() {
+            Ok(mut recording) => {
+                recording.finish_now(END_RECORDING, hook::now());
+            }
+            Err(_) => self.problem("quit: the recording is in use; it stops with the process"),
+        }
+        self.line("quit: recording stopped");
         Rest { parts, summoner }
     }
 
@@ -1142,6 +1216,74 @@ fn menu_text(text: &str) -> String {
     text.replace('&', "&&").replace('\t', " ")
 }
 
+/// The tray menu's recording section (`RecordingCapability.menuItems`): "Record Screen" or
+/// "Stop Recording" with the shortcut in the key column, and while recording the Pen and
+/// Highlighter, the one in hand checked. Nothing while the capability is off.
+fn recording_menu(recording: &RecordingFeature) -> Vec<MenuItem> {
+    if !recording.enabled() {
+        return Vec::new();
+    }
+    let shortcuts = recording.shortcuts();
+    let keyed = |label: &str, action: Action| match shortcuts.get(action) {
+        Some(chord) => format!("{label}\t{}", menu_text(&display_for_layout(&chord))),
+        None => label.to_owned(),
+    };
+    let state = recording.state();
+    let (label, enabled) = rec::menu_label(state);
+    let mut items = vec![MenuItem::Action {
+        id: MENU_RECORD,
+        label: keyed(label, Action::ToggleRecording),
+        enabled,
+        checked: false,
+    }];
+    if state == RecordingState::Recording {
+        for (id, tool, label, action) in [
+            (MENU_PEN, InkTool::Pen, "Pen", Action::Pen),
+            (MENU_HIGHLIGHTER, InkTool::Highlighter, "Highlighter", Action::Highlighter),
+        ] {
+            items.push(MenuItem::Action {
+                id,
+                label: keyed(label, action),
+                enabled: true,
+                checked: recording.tool() == Some(tool),
+            });
+        }
+    }
+    items
+}
+
+/// Once the hotkey thread registered the Pen and Highlighter for this recording: logs the
+/// ones another program holds (they still work from the tray). False while it has not yet.
+fn check_pen_keys(hotkeys: &Hotkeys, recording: &mut RecordingFeature, now: f64) -> bool {
+    let status = hotkeys.status();
+    let pending = status
+        .iter()
+        .any(|(action, state)| action.recording_only() && *state == Registration::WhileRecording);
+    if pending {
+        return false;
+    }
+    for (action, state) in status.iter().filter(|(action, _)| action.recording_only()) {
+        match state {
+            Registration::Active => {}
+            Registration::Taken => recording.log_line(
+                now,
+                &format!("{action:?} shortcut is held by another program; use the tray menu"),
+            ),
+            other => recording.log_line(now, &format!("{action:?} shortcut: {other:?}")),
+        }
+    }
+    true
+}
+
+/// A hint as a notice sentence: capitalized, with a full stop.
+fn sentence(hint: &str) -> String {
+    let mut chars = hint.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}.", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
 /// The overlay's short form of a notes error: the part before the reason, in the hint style.
 fn overlay_hint(message: &str) -> String {
     let short = message.split(':').next().unwrap_or(message).trim().trim_end_matches('.');
@@ -1160,6 +1302,7 @@ fn main() -> windows::core::Result<()> {
     let notes = Rc::new(RefCell::new(NotesFeature::new(
         settings_path.with_file_name("note-windows.json"),
     )));
+    let recording = Rc::new(RefCell::new(RecordingFeature::new(FRAME)));
 
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1194,6 +1337,8 @@ fn main() -> windows::core::Result<()> {
     let action_settings = Rc::clone(&open_settings);
     let menu_notes = Rc::clone(&notes);
     let action_notes = Rc::clone(&notes);
+    let menu_recording = Rc::clone(&recording);
+    let action_recording = Rc::clone(&recording);
     let tray = Tray::new(
         "Igorio",
         Box::new(move || {
@@ -1212,6 +1357,11 @@ fn main() -> windows::core::Result<()> {
                 items.push(MenuItem::Separator);
                 items.extend(section);
             }
+            let section = recording_menu(&menu_recording.borrow());
+            if !section.is_empty() {
+                items.push(MenuItem::Separator);
+                items.extend(section);
+            }
             items.extend([
                 MenuItem::Separator,
                 MenuItem::action(MENU_SETTINGS, "Settings…"),
@@ -1225,9 +1375,16 @@ fn main() -> windows::core::Result<()> {
             MENU_SETTINGS => action_settings.set(true),
             // SAFETY: posts WM_QUIT to this thread's own queue.
             MENU_QUIT => unsafe { PostQuitMessage(0) },
+            // The loop's pass right after this message starts or stops it.
+            MENU_RECORD => action_recording.borrow_mut().request_toggle(),
+            MENU_PEN => action_recording.borrow_mut().tool_shortcut(InkTool::Pen, hook::now()),
+            MENU_HIGHLIGHTER => {
+                action_recording.borrow_mut().tool_shortcut(InkTool::Highlighter, hook::now());
+            }
             id => action_notes.borrow_mut().menu_action(id),
         }),
     )?;
+    recording.borrow_mut().set_window(tray.hwnd());
 
     let mut mouse_hook = MouseHook::start()?;
     let mut events = Vec::new();
@@ -1271,6 +1428,7 @@ fn main() -> windows::core::Result<()> {
             drops,
         }),
         notes: Rc::clone(&notes),
+        recording: Rc::clone(&recording),
         log: RefCell::new(DebugLog::from_env()),
         rest: RefCell::new(None),
     });
@@ -1298,6 +1456,8 @@ fn main() -> windows::core::Result<()> {
     // When the next frame runs; `None` waits for a mouse move or a menu action.
     let mut due = Some(hook::now());
     let mut next_health_check = hook::now() + HEALTH_CHECK;
+    // The Pen and Highlighter registrations of this recording were looked at.
+    let mut pen_keys_checked = false;
 
     while pump_messages() {
         // None once the quit ran inside the window procedure (WM_ENDSESSION).
@@ -1313,6 +1473,9 @@ fn main() -> windows::core::Result<()> {
             match pressed.action {
                 Action::OpenSettings => open_settings.set(true),
                 Action::NewNote => notes.borrow_mut().summon_at_cursor(),
+                Action::ToggleRecording => recording.borrow_mut().request_toggle(),
+                Action::Pen => recording.borrow_mut().tool_shortcut(InkTool::Pen, now),
+                Action::Highlighter => recording.borrow_mut().tool_shortcut(InkTool::Highlighter, now),
                 action => app.borrow_mut().shortcut(action, now),
             }
         }
@@ -1330,7 +1493,7 @@ fn main() -> windows::core::Result<()> {
             app.apply_card_size(settings.card_size, now);
             if !settings.screenshot_detector {
                 detector.stop();
-                if app.state.hidden_for_capture() {
+                if app.state.hidden_by(Hidden::CaptureUi) {
                     app.capture_ui(false, now);
                 }
             }
@@ -1340,15 +1503,48 @@ fn main() -> windows::core::Result<()> {
             .borrow_mut()
             .update(settings.notes, &settings.snapshot, drops.as_mut(), now);
         mouse_hook.drain(&mut events);
-        // Before the capture rule below empties the batch: the gesture keeps its button state.
+        // Before the capture rule below empties the batch: the gesture keeps its button state,
+        // the recording UI its cursor for the next Follow.
         notes.borrow().feed(&events);
+        recording.borrow().feed(&events);
         if let Some(snip) = &detector.active {
             snip.drain(&mut snip_events);
         }
+        let recorded = recording.borrow_mut().pass(settings.recording, &settings.snapshot, now);
+        let recording_due = recorded.due;
+        let facts = {
+            let mut recording = recording.borrow_mut();
+            let pen_keys = recording.pen_keys();
+            if let Some(hotkeys) = &hotkeys {
+                hotkeys.set_recording(pen_keys);
+                if pen_keys && !pen_keys_checked {
+                    pen_keys_checked = check_pen_keys(hotkeys, &mut recording, now);
+                }
+            }
+            pen_keys_checked &= pen_keys;
+            RecordingFacts {
+                enabled: settings.recording,
+                running: recording.state() != RecordingState::Idle,
+                exclusive: recording.exclusive(),
+            }
+        };
         let mut router_due = None;
         {
             let mut app = app.borrow_mut();
             let app = &mut *app;
+            if let Some(finished) = recorded.carry {
+                app.carry_recording(finished, now);
+            }
+            if let Some(hint) = recorded.hint {
+                if app.state.is_holding() {
+                    app.state.flash_hint(&hint, 2.5, now);
+                    app.dirty = true;
+                } else if let Err(error) = tray.notice("Igorio", &sentence(&hint)) {
+                    eprintln!("{hint} ({error})");
+                }
+            }
+            // While a pen is in hand the fairy steps aside, like for the screenshot UI.
+            app.hide(Hidden::Drawing, recording.borrow().drawing(), now);
             // Treat the whole batch as capture input if visibility changed during
             // it. A shown/gone pair can arrive together with the selection clicks.
             if app.screenshots(&mut snip_events, &settings.snapshot) || app.state.hidden_for_capture() {
@@ -1361,7 +1557,7 @@ fn main() -> windows::core::Result<()> {
                 }
                 router_due = drops.next_deadline();
             }
-            if notes.borrow_mut().pass(&mut app.state, drops.as_mut(), now) {
+            if notes.borrow_mut().pass(&mut app.state, drops.as_mut(), facts, now) {
                 app.dirty = true;
                 router_due = drops.as_ref().and_then(Drops::next_deadline);
             }
@@ -1386,7 +1582,7 @@ fn main() -> windows::core::Result<()> {
                 && (!snip.is_alive() || snip.seems_stalled())
             {
                 let mut app = app.borrow_mut();
-                if app.state.hidden_for_capture() {
+                if app.state.hidden_by(Hidden::CaptureUi) {
                     app.capture_ui(false, now);
                     due = Some(now);
                 }
@@ -1399,9 +1595,16 @@ fn main() -> windows::core::Result<()> {
             wakes.push(snip.wake_handle());
         }
         notes.borrow().wakes(&mut wakes);
+        recording.borrow().wakes(&mut wakes);
+        // The tool menu's Record screen: started by the next pass, at once.
+        let record_due = std::mem::take(&mut notes.borrow_mut().record).then(|| {
+            recording.borrow_mut().request_toggle();
+            now
+        });
         let transition_due = (detector.transition.is_some()
             || notes.borrow().transition.is_some())
         .then_some(now + FRAME);
+        let transition_due = earlier(transition_due, earlier(recording_due, record_due));
         let until = earlier(earlier(due, router_due), earlier(transition_due, Some(next_health_check)))
             .unwrap_or(next_health_check);
         let wait = Duration::from_secs_f64((until - hook::now()).max(0.0));
