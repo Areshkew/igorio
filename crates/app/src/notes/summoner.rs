@@ -1,8 +1,10 @@
-//! The gesture that summons a note: hold Alt on its own over empty space (the desktop, a
-//! page margin, a window background) and a small pill rings the cursor; click while it
-//! shows and a note is requested at that point. The click is swallowed, so the app
-//! underneath never sees an Alt+click. From `NoteSummoner.swift` and the summon pill of
-//! `NoteView.swift`.
+//! The tool menu at the cursor: hold Alt on its own over empty space (the desktop, a page
+//! margin, a window background) and a small menu of tools opens under the cursor (New note,
+//! Record screen; [`TOOLS`]). Its first row sits under the cursor, so "hold Alt, click" still
+//! makes a note in one click; moving to another row and clicking runs that tool. The click is
+//! swallowed, so the app underneath never sees an Alt+click. Releasing Alt closes the menu.
+//! It replaces the summon pill of `NoteSummoner.swift` (the gesture is the same; the direct
+//! action is now a menu, `ROADMAP.md` "Tool menu at the cursor").
 //!
 //! # The Alt key on Windows
 //!
@@ -20,7 +22,7 @@
 //!    elevated window came to the front, the hook thread dies between the two, the process
 //!    is killed), Alt stays logically down for the whole session. It also puts `SendInput`
 //!    inside a hook callback.
-//! 3. Inject the mask key while Alt is still held, at the moment the pill appears, and
+//! 3. Inject the mask key while Alt is still held, at the moment the menu opens, and
 //!    swallow no key at all. The release that follows is then not a lone Alt: Windows (and
 //!    apps that track Alt themselves) saw another key between press and release, exactly as
 //!    with Alt+Tab. **Chosen.**
@@ -33,32 +35,36 @@
 //! Exactly what this module swallows and injects:
 //!
 //! - **Keys: nothing is ever swallowed.** The keyboard hook only observes. So no key can be
-//!   left down by this module in any path: not when the pill shows and Alt is released, not
+//!   left down by this module in any path: not when the menu shows and Alt is released, not
 //!   when Alt is released during a click, not on a focus change, not when Windows removes
-//!   the hook, not when the app quits or is killed.
+//!   the hook, not when the app quits or is killed. There is no key navigation in the menu:
+//!   Alt is held, so letters and arrows belong to the foreground app (access keys).
 //! - **Injected: one `0xE8` down and up, in one `SendInput` call** (the system inserts the
 //!   pair as one unit, nothing in between), with [`INJECTED_MARKER`], once per hold, only in
-//!   Alt mode, only when the pill first appears in that hold, and only if right before the
+//!   Alt mode, only when the menu first opens in that hold, and only if right before the
 //!   call Alt is still down, Ctrl, Shift and Win are up, and no key changed since the hold
 //!   began (rule 7). The app's own hooks ignore it by the marker. A quick tap, a hold that
-//!   never shows the pill, Alt+Tab, Alt+F4, Alt+letter and Alt+drag never inject anything.
-//!   If the pill shows over the desktop and the user then presses Tab, Alt+Tab still works:
-//!   Alt is still down.
-//! - **Mouse: one press and its release**, of the primary button, and only while the pill
-//!   shows: the summoner arms `hook::CLICK_GATE` when the pill appears and disarms it when
-//!   the pill goes. The app's single mouse hook decides in its callback from that one atomic
-//!   ([`crate::hook::ClickGate::on_press`]). The keyboard hook disarms the gate on every key
-//!   change, on its own thread, before Windows passes on the next input, so a click right
-//!   after Alt is released is never swallowed even if the summoner thread is late. Pen and
-//!   touch presses, injected presses and other buttons are never taken (they disarm). An
-//!   arm based on an older key state is refused (the gate's epoch).
+//!   never opens the menu (or offers no tool), Alt+Tab, Alt+F4, Alt+letter and Alt+drag
+//!   never inject anything. If the menu shows over the desktop and the user then presses
+//!   Tab, Alt+Tab still works: Alt is still down.
+//! - **Mouse: one press and its release**, of the primary button, and only while the menu
+//!   shows: the summoner arms `hook::CLICK_GATE` when the menu opens and disarms it when it
+//!   closes. The app's single mouse hook decides in its callback from that one atomic
+//!   ([`crate::hook::ClickGate::on_press`]). The gate knows no rectangle, so while it is
+//!   armed it takes the next primary press wherever it lands: on a row it runs that tool,
+//!   anywhere else it only closes the menu (see "Clicks outside the menu" below). The
+//!   keyboard hook disarms the gate on every key change, on its own thread, before Windows
+//!   passes on the next input, so a click right after Alt is released is never swallowed
+//!   even if the summoner thread is late. Pen and touch presses, injected presses and other
+//!   buttons are never taken (they disarm). An arm based on an older key state is refused
+//!   (the gate's epoch).
 //!
-//! The mask is sent at show time, not at release, so when the user lets go without
-//! clicking nothing more happens; the release is an ordinary Alt release. When the pill
-//! never appeared (the hold was over a text field, or shorter than [`HOLD_DELAY`]), the
-//! release is left alone and a lone Alt activates the menu as usual: the user may have meant
-//! that. Holding Alt over a foreground window of an elevated app: Windows does not call our
-//! keyboard hook then, so the gesture simply does not start.
+//! The mask is sent at open time, not at release, so when the user lets go without
+//! clicking nothing more happens; the release is an ordinary Alt release. When the menu
+//! never opened (the hold was over a text field, or shorter than [`HOLD_DELAY`]), the
+//! release is left alone and a lone Alt activates the menu bar as usual: the user may have
+//! meant that. Holding Alt over a foreground window of an elevated app: Windows does not call
+//! our keyboard hook then, so the gesture simply does not start.
 //!
 //! Verdict: plain Alt can be made safe this way, so it stays the default ([`Modifier::Alt`],
 //! as on macOS). Ctrl+Alt ([`Modifier::CtrlAlt`]) is the fallback in the config: a Ctrl+Alt
@@ -69,22 +75,59 @@
 //! happens on the press, before we can know anything); and a hard kill between a swallowed
 //! press and its release lets the release reach the app below without its press.
 //!
-//! # When the pill shows (the rules of `NoteSummoner.swift`)
+//! # When the menu opens (the rules of `NoteSummoner.swift`)
 //!
 //! - The modifier went down on its own: no other key, no mouse button down (an Alt+drag
 //!   already under way), not AltGr. In Ctrl+Alt mode, the hold starts when the second of the
 //!   two goes down.
 //! - It was held for [`HOLD_DELAY`] (0.3 s), so Alt shortcuts and quick taps never flash
-//!   the pill. Any other key or button during the hold uses the hold up ([`Phase::Cancelled`]):
-//!   no pill until the modifier is released and pressed again.
+//!   the menu. Any other key or button during the hold uses the hold up
+//!   ([`Phase::Cancelled`]): no menu until the modifier is released and pressed again.
 //! - The feature is enabled and nothing blocks it ([`Summoner::set_blocked`]: a paste
 //!   delivery, a screenshot capture, a recording, the app paused).
 //! - A UI Automation lookup at the cursor says the spot is empty
 //!   ([`super::context::is_empty_space`]). The lookup runs once the hold delay has passed,
-//!   not on every move. While the pill shows (or the hold waits for an empty spot) and the
-//!   cursor moves, the spot is checked again at most every [`RECHECK_GAP`]; the pill hides
-//!   when the cursor leaves empty space, and comes back when it returns. A lookup that
-//!   times out means no pill.
+//!   not on every move.
+//! - At least one tool is offered ([`offered`], from the [`ToolContext`] the app passes in
+//!   and the kind of spot the lookup found). No tool: the menu does not open, nothing is
+//!   armed or injected, and the hold is used up.
+//!
+//! # While the menu shows
+//!
+//! - It stays where it opened. The pointer over the menu keeps it open: the menu is our own
+//!   window, which the empty-space rule would call "not empty", so no lookup runs while the
+//!   pointer is inside the menu's card. Outside the card the spot is checked again at most
+//!   every [`RECHECK_GAP`]: over empty space the menu stays; over anything else (text, a
+//!   control) the menu closes and the gate is disarmed, so a click there is the app's. Back
+//!   on empty space the menu opens again at the new spot (no second mask key). A lookup
+//!   that times out means "not empty".
+//! - The row under the pointer is highlighted.
+//! - A click on a row runs that tool ([`SummonerEvent::ToolChosen`]); the point given is
+//!   where the menu opened. A click outside every row closes the menu with no tool.
+//! - Releasing the modifier, any other key, a button the gate did not take, being blocked or
+//!   disabled, a hook restart and quitting close it.
+//!
+//! # Clicks outside the menu
+//!
+//! The gate is decided in the mouse hook from one atomic and knows nothing of the menu's
+//! position, so today a primary click anywhere while the menu shows is swallowed; outside the
+//! rows it only closes the menu. To let such a click reach the app, `hook.rs` would need the
+//! armed rectangle: `ClickGate` gets two more `AtomicU64` fields with the menu card's screen
+//! rectangle (left and top packed as two `i32` in one, right and bottom in the other), stored
+//! by a new `arm_in(epoch, button, rect)` before its `state` compare-and-swap; `on_press`
+//! gains the point and, after the compare-and-swap that takes the gate (unchanged, so an
+//! outside press still disarms it), returns false when the point is outside the rectangle;
+//! the hook passes `x, y`. The summoner then sees that press in its feed, where it already
+//! closes the menu (the [`Gesture`]'s mouse rule), and the app gets the click.
+//!
+//! # Opening the menu without the gesture
+//!
+//! [`Summoner::open_menu_at_cursor`] (for a future shortcut) opens the same menu at the
+//! cursor with no modifier held and no mask key. The gate is armed as for the gesture and is
+//! armed again after each key release (a release disarms it in the keyboard hook; the
+//! shortcut's own keys are released after the menu opened). Any key press, any click and
+//! [`MENU_IDLE`] without the pointer over the menu close it. Esc cannot be seen without
+//! focus, which the menu never takes.
 //!
 //! # Threads
 //!
@@ -92,9 +135,11 @@
 //!   [`feed`](Summoner::feed) with the mouse events its own mouse hook delivers (there is
 //!   still exactly one mouse hook in the process), [`set_blocked`](Summoner::set_blocked),
 //!   [`set_enabled`](Summoner::set_enabled), [`apply_config`](Summoner::apply_config),
+//!   [`set_tool_context`](Summoner::set_tool_context),
+//!   [`set_shortcuts`](Summoner::set_shortcuts),
 //!   [`summon_at_cursor`](Summoner::summon_at_cursor) for the NewNote hotkey, and
 //!   [`drain`](Summoner::drain) after [`wake_handle`](Summoner::wake_handle) is signalled.
-//! - The summoner thread owns the pill window and the state machine ([`Gesture`]), and asks
+//! - The summoner thread owns the menu window and the state machine ([`Gesture`]), and asks
 //!   UI Automation through its own lane of the app's one worker (`uia::Requester`). It
 //!   never calls UI Automation itself and never waits on another process.
 //! - The keyboard hook thread (rule 1) only pumps messages. Its callback copies the event,
@@ -103,16 +148,21 @@
 //!   once-a-second check restarts it when it is gone or when the modifier keys Windows
 //!   reports disagree with what it saw, twice in a row.
 //!
-//! # The pill
+//! # The menu window
 //!
-//! A layered, click-through, topmost window excluded from capture (`overlay::Overlay`, the
-//! same window the overlay uses: it never takes focus or input). A plate of
-//! [`PILL_SIZE`] with corner radius [`PILL_RADIUS`], centred on the cursor's hot spot, in
-//! the app's flat style, light or dark with the system's app mode. It grows out of a bead of
-//! [`BEAD`] with a spring ([`SPRING_RESPONSE`], [`SPRING_DAMPING`]) and shrinks back in
-//! [`DISAPPEAR`]. The animation clock ticks only while it changes; with reduced motion
-//! ("Animation effects" off) it appears and goes at once. It follows the cursor while it
-//! shows.
+//! A layered, click-through, topmost, no-activate tool window excluded from capture
+//! (`overlay::Overlay`, the window the overlay uses): it never takes focus or input, so the
+//! foreground app keeps its focus and caret; the click gate, not the window, takes the click.
+//! A rounded card in the style of the settings window and the notes' slash menu (drawn with
+//! the editor's `Surface`, `Canvas`, fonts and palettes, light or dark with the system's app
+//! mode): one row per tool with its icon, its label and its current shortcut as key chips.
+//! Placed by [`menu_layout`]: the first row under the cursor, the card inside the monitor's
+//! work area, opening upward near the bottom edge (the first row is then the bottom one).
+//!
+//! Motion runs on the animation clock only while something changes: it fades in and rises
+//! [`RISE`] DIPs in [`OPEN_MS`], the highlight slides between rows in [`SLIDE_MS`], a chosen
+//! row flashes for [`FLASH_MS`] and the menu then fades out in [`CLOSE_MS`]. With reduced
+//! motion ("Animation effects" off) all of it is instant.
 //!
 //! # Manual test
 //!
@@ -130,12 +180,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use igorio_core::geom::Point;
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, LPARAM, LRESULT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+    COLORREF, CloseHandle, HANDLE, LPARAM, LRESULT, RECT, SIZE, WAIT_FAILED, WAIT_OBJECT_0, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{
+    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, GetTextExtentPoint32W,
+    SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentThreadId, SetEvent, WaitForSingleObject,
 };
@@ -150,17 +203,19 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, HC_ACTION,
     KBDLLHOOKSTRUCT, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_NOREMOVE, PM_REMOVE,
-    PeekMessageW, PostThreadMessageW, QS_ALLINPUT, SM_SWAPBUTTON, SPI_GETCLIENTAREAANIMATION,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowsHookExW, SystemParametersInfoW,
+    PeekMessageW, PostThreadMessageW, QS_ALLINPUT, SM_SWAPBUTTON, SetWindowsHookExW,
     TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
-use windows::core::w;
 
 use super::context::{self, AppNames, facts_at, is_empty_space};
-use super::store::NoteOrigin;
+use super::editor::{
+    GdiFonts, Palette, Surface, Transition, animation_effects, mix, px, rounded_path, system_dark,
+};
+use super::store::{NoteKind, NoteOrigin};
 use crate::hook::{self, Button, CLICK_GATE, MouseEvent};
 use crate::input::INJECTED_MARKER;
 use crate::overlay::{Overlay, monitor_at};
+use crate::shortcuts::{self, Shortcuts};
 use crate::uia::{Lookup, Outcome, RequestId, Requester};
 
 // ---------------------------------------------------------------------------------------
@@ -168,40 +223,60 @@ use crate::uia::{Lookup, Outcome, RequestId, Requester};
 // ---------------------------------------------------------------------------------------
 
 /// The modifier must be held this long first, so shortcuts and quick taps never flash the
-/// pill (`holdDelay`).
+/// menu (`holdDelay`).
 pub const HOLD_DELAY: f64 = 0.3;
 /// While the hold tracks the cursor, the spot is checked again at most this often (`0.12`
 /// in `track()`).
 pub const RECHECK_GAP: f64 = 0.12;
 /// A move shorter than this (physical px) since the last check needs no new check.
 pub const MOVE_SLOP: i32 = 3;
-/// Deadline of one lookup. Longer than a frame, shorter than `uia::DEFAULT_DEADLINE`: a pill
+/// Deadline of one lookup. Longer than a frame, shorter than `uia::DEFAULT_DEADLINE`: a menu
 /// that comes late is worse than none.
 pub const LOOKUP_DEADLINE: Duration = Duration::from_millis(200);
 /// A lookup with no answer after this long is forgotten (the worker always answers by its
 /// deadline; this only guards against a lost answer).
 pub const ASK_GIVE_UP: f64 = 1.0;
-/// After a note is made and the modifier released, a new hold is ignored this long, so a
-/// fumbled double press does not make two notes.
+/// After a tool is chosen and the modifier released, a new hold is ignored this long, so a
+/// fumbled double press does not run a tool twice.
 pub const COOLDOWN: f64 = 0.25;
 /// The NewNote hotkey's lookup: the note is made from the window facts alone if no answer
 /// came after this long.
 pub const HOTKEY_GIVE_UP: f64 = 0.5;
+/// A menu opened by [`Summoner::open_menu_at_cursor`] closes after this long without the
+/// pointer over it, seconds.
+pub const MENU_IDLE: f64 = 4.0;
 
-/// The pill, in DIPs (`NoteLayout.summonSize`, `summonRadius`).
-pub const PILL_SIZE: (f64, f64) = (46.0, 34.0);
-pub const PILL_RADIUS: f64 = 12.0;
-/// It grows out of a bead this wide (the fairy's idle orb).
-pub const BEAD: f64 = 14.0;
-/// Room around the pill for its shadow and the spring's overshoot, DIPs.
-pub const PILL_MARGIN: f64 = 8.0;
-/// The appear spring (`.spring(response: 0.24, dampingFraction: 0.7)`).
-pub const SPRING_RESPONSE: f64 = 0.24;
-pub const SPRING_DAMPING: f64 = 0.7;
-/// The spring is treated as settled after this long.
-pub const APPEAR: f64 = 0.36;
-/// The disappear animation (`.easeOut(duration: 0.12)`).
-pub const DISAPPEAR: f64 = 0.12;
+/// The menu, in DIPs: card width at least, corner radius, padding above and below the rows,
+/// row height, and the room around the card for its shadow.
+pub const MENU_MIN_WIDTH: f64 = 196.0;
+pub const MENU_RADIUS: f64 = 10.0;
+pub const MENU_PAD: f64 = 5.0;
+pub const ROW_HEIGHT: f64 = 32.0;
+pub const MENU_SHADOW: f64 = 12.0;
+/// The cursor's hot spot on the first row, from the card's left edge and the row's top: in the
+/// row's left gutter, so the arrow covers neither the icon nor the label.
+pub const ANCHOR: (f64, f64) = (9.0, 9.0);
+/// Row contents, from the card's left edge: the icon box and the label; the chips end this far
+/// from the right edge.
+const ROW_INSET: f64 = 5.0;
+const ROW_RADIUS: f64 = 6.0;
+const ICON_X: f64 = 26.0;
+const ICON: f64 = 18.0;
+const LABEL_X: f64 = 54.0;
+const LABEL_GAP: f64 = 24.0;
+const CHIPS_RIGHT: f64 = 12.0;
+const CHIP_HEIGHT: f64 = 20.0;
+const CHIP_PAD: f64 = 6.0;
+const CHIP_GAP: f64 = 4.0;
+const CHIP_RADIUS: f64 = 5.0;
+
+/// Motion, milliseconds: open (fade in and rise), the highlight's slide, a chosen row's
+/// flash, and the closing fade. The menu rises [`RISE`] DIPs as it opens.
+pub const OPEN_MS: f64 = 120.0;
+pub const SLIDE_MS: f64 = 120.0;
+pub const FLASH_MS: f64 = 80.0;
+pub const CLOSE_MS: f64 = 80.0;
+pub const RISE: f64 = 4.0;
 
 /// The mask key: an unassigned virtual key.
 pub const MASK_KEY: u16 = 0xE8;
@@ -259,7 +334,7 @@ pub struct SummonConfig {
     pub enabled: bool,
     /// Emit [`SummonerEvent::Log`] lines (`FAIRY_DEBUG=1`).
     pub debug: bool,
-    /// Let screenshots see the pill (`FAIRY_CAPTURABLE=1`, for demos).
+    /// Let screenshots see the menu (`FAIRY_CAPTURABLE=1`, for demos).
     pub capturable: bool,
 }
 
@@ -298,11 +373,150 @@ impl Block {
     }
 }
 
-/// Make a note here.
+// ---------------------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------------------
+
+/// A tool of the menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolId {
+    NewNote,
+    RecordScreen,
+}
+
+impl ToolId {
+    /// Short id for logs and the demo (`note`, `record`).
+    pub fn id(self) -> &'static str {
+        tool(self).id_text
+    }
+
+    pub fn parse(text: &str) -> Option<ToolId> {
+        TOOLS
+            .iter()
+            .find(|t| t.id_text == text.trim())
+            .map(|t| t.id)
+    }
+}
+
+/// The drawn icon of a tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Icon {
+    /// A small note sheet with a folded corner.
+    NoteSheet,
+    /// A record dot.
+    RecordDot,
+}
+
+/// What kind of spot the menu opens over (from the lookup that found it empty).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Spot {
+    /// Not known (the menu opened by a shortcut, or no lookup).
+    #[default]
+    Unknown,
+    Desktop,
+    /// An app window's background.
+    App,
+    /// A web page's margin.
+    Web,
+}
+
+impl Spot {
+    pub fn from_kind(kind: NoteKind) -> Spot {
+        match kind {
+            NoteKind::Desktop => Spot::Desktop,
+            NoteKind::App => Spot::App,
+            NoteKind::Web => Spot::Web,
+        }
+    }
+}
+
+/// What the tools' conditions look at. The app passes it in
+/// ([`Summoner::set_tool_context`]); `spot` is filled in by the summoner from its lookup.
+/// Later context-aware tools add the facts they need here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ToolContext {
+    /// The notes capability is on.
+    pub notes: bool,
+    /// Screen recording is built ([`shortcuts::Action::available`]).
+    pub recording_available: bool,
+    /// Screen recording is switched on in the settings.
+    pub recording_enabled: bool,
+    /// A recording is running now.
+    pub recording: bool,
+    /// The user carries cards.
+    pub cards_held: bool,
+    pub spot: Spot,
+}
+
+/// One entry of the menu.
+#[derive(Debug, Clone, Copy)]
+pub struct Tool {
+    pub id: ToolId,
+    id_text: &'static str,
+    pub label: &'static str,
+    pub icon: Icon,
+    /// The shortcut action of the same thing, for the key chips.
+    pub action: shortcuts::Action,
+    /// Whether the tool is offered now.
+    pub offered: fn(&ToolContext) -> bool,
+}
+
+/// Every tool, in menu order; the first offered one sits under the cursor. Only tools go
+/// here (restore, discard, settings and recent notes stay in the tray menu). This list is
+/// where later, context-aware tools go (an idea for later, not built: a grammar check offered
+/// while the user types in a text field): an entry whose `offered` reads the facts it needs
+/// from [`ToolContext`], with those facts added there.
+pub const TOOLS: &[Tool] = &[
+    Tool {
+        id: ToolId::NewNote,
+        id_text: "note",
+        label: "New note",
+        icon: Icon::NoteSheet,
+        action: shortcuts::Action::NewNote,
+        offered: |c| c.notes,
+    },
+    Tool {
+        id: ToolId::RecordScreen,
+        id_text: "record",
+        label: "Record screen",
+        icon: Icon::RecordDot,
+        action: shortcuts::Action::ToggleRecording,
+        offered: |c| c.recording_available && c.recording_enabled && !c.recording,
+    },
+];
+
+pub fn tool(id: ToolId) -> &'static Tool {
+    TOOLS
+        .iter()
+        .find(|t| t.id == id)
+        .expect("every ToolId is in TOOLS")
+}
+
+/// The tools offered in this context, in menu order.
+pub fn offered(context: &ToolContext) -> Vec<ToolId> {
+    TOOLS
+        .iter()
+        .filter(|t| (t.offered)(context))
+        .map(|t| t.id)
+        .collect()
+}
+
+/// The key chips of a tool's current shortcut (none when it has none).
+pub fn tool_chips(id: ToolId, shortcuts: &Shortcuts) -> Vec<String> {
+    shortcuts
+        .get(tool(id).action)
+        .map(|chord| chord.chips())
+        .unwrap_or_default()
+}
+
+/// A tool was chosen in the menu (or the NewNote hotkey asked for a note).
 #[derive(Debug, Clone, PartialEq)]
-pub struct Summon {
-    /// Physical pixels, virtual-screen coordinates: the click (or the cursor for the hotkey).
+pub struct ToolChosen {
+    pub tool: ToolId,
+    /// Physical pixels, virtual-screen coordinates: where the menu opened (or the cursor for
+    /// the hotkey). For a note, its place.
     pub point: (i32, i32),
+    /// What the spot belongs to, for a note.
     pub origin: NoteOrigin,
     /// The clock of `hook::now`.
     pub time: f64,
@@ -310,9 +524,143 @@ pub struct Summon {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SummonerEvent {
-    Summon(Summon),
+    ToolChosen(ToolChosen),
     /// A debug line (only with `SummonConfig::debug`).
     Log(String),
+}
+
+// ---------------------------------------------------------------------------------------
+// Where the menu goes (pure)
+// ---------------------------------------------------------------------------------------
+
+/// A rectangle in physical pixels, right and bottom exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Bounds {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl Bounds {
+    pub fn contains(&self, (x, y): (i32, i32)) -> bool {
+        x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
+
+    pub fn width(&self) -> i32 {
+        self.right - self.left
+    }
+
+    pub fn height(&self) -> i32 {
+        self.bottom - self.top
+    }
+
+    pub fn inside(&self, outer: &Bounds) -> bool {
+        self.left >= outer.left
+            && self.top >= outer.top
+            && self.right <= outer.right
+            && self.bottom <= outer.bottom
+    }
+}
+
+/// Where the menu is, in physical pixels on the virtual screen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MenuLayout {
+    /// The card (the rows and their padding).
+    pub card: Bounds,
+    /// The window: the card and room for its shadow.
+    pub window: Bounds,
+    pub rows: usize,
+    pub row_height: i32,
+    pub pad: i32,
+    /// Opened upward (near the bottom edge): the first tool is the bottom row.
+    pub upward: bool,
+    pub scale: f64,
+}
+
+impl MenuLayout {
+    /// Top to bottom position of tool `index`.
+    fn visual(&self, index: usize) -> usize {
+        if self.upward {
+            self.rows - 1 - index
+        } else {
+            index
+        }
+    }
+
+    /// The rectangle of tool `index`'s row (full card width).
+    pub fn row(&self, index: usize) -> Bounds {
+        let top = self.card.top + self.pad + self.visual(index) as i32 * self.row_height;
+        Bounds {
+            left: self.card.left,
+            top,
+            right: self.card.right,
+            bottom: top + self.row_height,
+        }
+    }
+
+    /// The tool under a point: anywhere on the card counts, the padding above and below
+    /// belongs to the nearest row.
+    pub fn row_at(&self, point: (i32, i32)) -> Option<usize> {
+        if self.rows == 0 || !self.card.contains(point) {
+            return None;
+        }
+        let visual = ((point.1 - self.card.top - self.pad).div_euclid(self.row_height.max(1)))
+            .clamp(0, self.rows as i32 - 1) as usize;
+        Some(self.visual(visual))
+    }
+
+    pub fn contains(&self, point: (i32, i32)) -> bool {
+        self.card.contains(point)
+    }
+}
+
+/// Places a menu of `rows` rows and `width` DIPs at `cursor` on a monitor with this work area
+/// and DPI scale: the first row under the cursor (the hot spot at [`ANCHOR`] on it), the card
+/// inside the work area. When it does not fit below, it opens upward: the first tool is then
+/// the bottom row, still under the cursor. Pushed back from an edge, the card still covers
+/// the cursor (the padding counts as the first row).
+pub fn menu_layout(
+    cursor: (i32, i32),
+    rows: usize,
+    width: f64,
+    work: Bounds,
+    scale: f64,
+) -> MenuLayout {
+    let dpi = (scale * 96.0).round() as u32;
+    let row_height = px(ROW_HEIGHT, dpi).max(1);
+    let pad = px(MENU_PAD, dpi);
+    let shadow = px(MENU_SHADOW, dpi);
+    let card_w = px(width.max(MENU_MIN_WIDTH), dpi);
+    let card_h = 2 * pad + row_height * rows.max(1) as i32;
+    let (ax, ay) = (px(ANCHOR.0, dpi), px(ANCHOR.1, dpi));
+    let mut top = cursor.1 - ay - pad;
+    let upward = top + card_h > work.bottom;
+    if upward {
+        top = cursor.1 - ay - pad - row_height * (rows.max(1) as i32 - 1);
+    }
+    let top = top.min(work.bottom - card_h).max(work.top);
+    let left = (cursor.0 - ax).min(work.right - card_w).max(work.left);
+    let card = Bounds {
+        left,
+        top,
+        right: left + card_w,
+        bottom: top + card_h,
+    };
+    MenuLayout {
+        card,
+        window: Bounds {
+            left: card.left - shadow,
+            top: card.top - shadow,
+            right: card.right + shadow,
+            bottom: card.bottom + shadow,
+        },
+        rows,
+        row_height,
+        pad,
+        upward,
+        scale,
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -478,15 +826,16 @@ pub enum Phase {
     Idle,
     /// The modifier is held alone; waiting for [`HOLD_DELAY`].
     Held,
-    /// The delay passed; waiting for a lookup to say the spot is empty (no pill).
+    /// The delay passed; waiting for a lookup to say the spot is empty (no menu).
     Looking,
-    /// The pill shows; the click gate is armed.
+    /// The menu shows; the click gate is armed.
     Showing,
-    /// A note was made; this hold is used up until the modifier is released.
+    /// A tool was chosen; this hold is used up until the modifier is released.
     Clicked,
-    /// This hold is used up (another key, a button, blocked); waiting for the release.
+    /// This hold is used up (another key, a button, blocked, no tool, a click outside the
+    /// rows); waiting for the release.
     Cancelled,
-    /// A note was made and the modifier released; a new hold waits [`COOLDOWN`].
+    /// A tool was chosen and the modifier released; a new hold waits [`COOLDOWN`].
     Cooldown,
 }
 
@@ -497,10 +846,11 @@ pub enum Input {
     /// The mouse buttons down now (`GetAsyncKeyState`), read before a hold may start, so a
     /// lost release in the feed cannot block the gesture for good.
     Buttons(u8),
-    /// The answer to [`Action::Ask`]: is the spot empty?
+    /// The answer to [`Action::Ask`]: is the spot empty, and what kind of spot it is.
     Answer {
         ask: u64,
         empty: bool,
+        spot: Spot,
     },
     /// The click gate swallowed a press here.
     ClickTaken {
@@ -510,6 +860,16 @@ pub enum Input {
     Blocked(bool),
     Enabled(bool),
     Modifier(Modifier),
+    /// What the tools' conditions look at (`spot` is ignored: the lookup fills it).
+    Context(ToolContext),
+    /// The driver placed the menu that [`Action::Open`] asked for.
+    Placed(MenuLayout),
+    /// Open the menu at `point` without the gesture ([`Summoner::open_menu_at_cursor`]);
+    /// `epoch` is the gate's epoch now.
+    OpenMenu {
+        point: (i32, i32),
+        epoch: u64,
+    },
     /// The gate refused [`Action::Arm`]: a key changed meanwhile.
     ArmFailed,
     /// The keyboard hook was restarted: these keys are down now.
@@ -526,7 +886,7 @@ pub enum Action {
         ask: u64,
         point: (i32, i32),
     },
-    /// Arm the click gate for the primary button, with this hold's epoch.
+    /// Arm the click gate for the primary button, with this epoch.
     Arm {
         epoch: u64,
     },
@@ -534,19 +894,36 @@ pub enum Action {
     Mask {
         epoch: u64,
     },
-    Show {
+    /// Open the menu at `point` with [`Gesture::tools`]; answer with [`Input::Placed`].
+    Open {
         point: (i32, i32),
     },
     /// Disarm the click gate (keeping its epoch, so the same hold may arm it again).
     Disarm,
-    Hide {
+    Close {
         animate: bool,
     },
-    /// Make a note at `point`; `ask` is the lookup that found the spot empty.
-    Summon {
+    /// Run `tool` (the menu's row `row`) for the spot at `point`; `ask` is the lookup that
+    /// found the spot.
+    Choose {
+        tool: ToolId,
+        row: usize,
         point: (i32, i32),
         ask: Option<u64>,
     },
+}
+
+/// The menu as the gesture knows it.
+#[derive(Debug, Clone, PartialEq)]
+struct Menu {
+    tools: Vec<ToolId>,
+    /// Where it opened (the cursor then).
+    anchor: (i32, i32),
+    layout: Option<MenuLayout>,
+    /// Opened by [`Input::OpenMenu`], not by a hold.
+    free: bool,
+    /// A free menu: when the pointer was last over it (or it opened).
+    seen: f64,
 }
 
 /// The gesture's rules, driven by timed inputs. No Win32 calls.
@@ -558,6 +935,7 @@ pub struct Gesture {
     buttons: u8,
     blocked: bool,
     enabled: bool,
+    context: ToolContext,
     /// This hold's gate epoch (from the key event that started it).
     epoch: u64,
     /// When the hold started, or when the cooldown ends.
@@ -570,10 +948,13 @@ pub struct Gesture {
     asked_point: (i32, i32),
     /// The cursor moved since the spot was last asked about.
     dirty: bool,
-    /// The latest lookup that found the spot empty.
+    /// The latest lookup that found the spot empty (any answer for a free menu).
     empty_ask: Option<u64>,
     /// The mask key was requested in this hold.
     masked: bool,
+    /// The menu that shows, or showed last (a click the gate took just before the menu
+    /// closed still lands on it).
+    menu: Option<Menu>,
 }
 
 impl Gesture {
@@ -585,6 +966,7 @@ impl Gesture {
             buttons: 0,
             blocked: false,
             enabled: true,
+            context: ToolContext::default(),
             epoch: 0,
             since: 0.0,
             until: 0.0,
@@ -596,6 +978,7 @@ impl Gesture {
             dirty: false,
             empty_ask: None,
             masked: false,
+            menu: None,
         }
     }
 
@@ -611,6 +994,16 @@ impl Gesture {
         self.keys
     }
 
+    /// The tools of the menu that shows (or showed last).
+    pub fn tools(&self) -> &[ToolId] {
+        self.menu.as_ref().map_or(&[], |menu| &menu.tools)
+    }
+
+    /// The menu shows and was opened without the gesture.
+    pub fn is_free(&self) -> bool {
+        self.phase == Phase::Showing && self.menu.as_ref().is_some_and(|menu| menu.free)
+    }
+
     /// Whether mouse moves matter now (the hold tracks the cursor).
     pub fn wants_moves(&self) -> bool {
         matches!(self.phase, Phase::Held | Phase::Looking | Phase::Showing)
@@ -620,6 +1013,7 @@ impl Gesture {
     pub fn next_deadline(&self) -> Option<f64> {
         match self.phase {
             Phase::Held => Some(self.since + HOLD_DELAY),
+            Phase::Showing if self.is_free() => self.menu.as_ref().map(|m| m.seen + MENU_IDLE),
             Phase::Looking | Phase::Showing => match self.pending {
                 Some(_) => Some(self.asked_at + ASK_GIVE_UP),
                 None if self.dirty => Some(self.asked_at + RECHECK_GAP),
@@ -636,21 +1030,8 @@ impl Gesture {
             Input::Key(key) => self.key(key, now, &mut out),
             Input::Mouse(event) => self.mouse(event, now, &mut out),
             Input::Buttons(bits) => self.buttons = bits,
-            Input::Answer { ask, empty } => self.answer(ask, empty, now, &mut out),
-            Input::ClickTaken { x, y } => {
-                // The gate took a press while the pill showed: always make the note, the
-                // click is gone either way.
-                if self.phase == Phase::Showing {
-                    out.push(Action::Hide { animate: false });
-                }
-                out.push(Action::Summon {
-                    point: (x, y),
-                    ask: self.empty_ask,
-                });
-                self.pending = None;
-                self.phase = Phase::Clicked;
-                self.after_hold(now);
-            }
+            Input::Answer { ask, empty, spot } => self.answer(ask, empty, spot, now, &mut out),
+            Input::ClickTaken { x, y } => self.click_taken((x, y), now, &mut out),
             Input::Blocked(blocked) => {
                 self.blocked = blocked;
                 if blocked {
@@ -669,10 +1050,17 @@ impl Gesture {
                     self.spoil(&mut out, false);
                 }
             }
+            Input::Context(context) => self.context = context,
+            Input::Placed(layout) => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.layout = Some(layout);
+                }
+            }
+            Input::OpenMenu { point, epoch } => self.open_free(point, epoch, now, &mut out),
             Input::ArmFailed => {
                 if self.phase == Phase::Showing {
                     self.phase = Phase::Cancelled;
-                    out.push(Action::Hide { animate: false });
+                    out.push(Action::Close { animate: false });
                     self.after_hold(now);
                 }
             }
@@ -685,7 +1073,7 @@ impl Gesture {
             Input::Shutdown => {
                 out.push(Action::Disarm);
                 if self.phase == Phase::Showing {
-                    out.push(Action::Hide { animate: false });
+                    out.push(Action::Close { animate: false });
                 }
                 self.phase = Phase::Idle;
                 self.pending = None;
@@ -698,14 +1086,24 @@ impl Gesture {
         matches!(self.phase, Phase::Held | Phase::Looking | Phase::Showing)
     }
 
-    /// Ends a hold that is used up: hides the pill and disarms; then waits for the release.
+    /// The pointer is over the menu's card.
+    fn inside(&self) -> bool {
+        self.phase == Phase::Showing
+            && self
+                .menu
+                .as_ref()
+                .and_then(|menu| menu.layout)
+                .is_some_and(|layout| layout.contains(self.cursor))
+    }
+
+    /// Ends a hold that is used up: closes the menu and disarms; then waits for the release.
     fn spoil(&mut self, out: &mut Vec<Action>, animate: bool) {
         if !self.in_hold() {
             return;
         }
         if self.phase == Phase::Showing {
             out.push(Action::Disarm);
-            out.push(Action::Hide { animate });
+            out.push(Action::Close { animate });
         }
         self.pending = None;
         self.phase = Phase::Cancelled;
@@ -758,6 +1156,12 @@ impl Gesture {
                     self.phase = Phase::Cancelled;
                 }
             }
+            Phase::Showing if self.is_free() && !key.down => {
+                // A free menu stays through releases (the shortcut's own keys); the release
+                // disarmed the gate in the hook, so arm it again with the new epoch.
+                self.epoch = key.epoch;
+                out.push(Action::Arm { epoch: key.epoch });
+            }
             Phase::Held | Phase::Looking | Phase::Showing => {
                 // Any key change ends the hold: the release of the modifier, or another key
                 // (Alt+Tab, Alt+F4, an access key), which uses it up.
@@ -772,7 +1176,16 @@ impl Gesture {
         match event {
             MouseEvent::Move { x, y, .. } => {
                 self.cursor = (x, y);
-                if matches!(self.phase, Phase::Looking | Phase::Showing) {
+                if self.is_free() {
+                    if self.inside()
+                        && let Some(menu) = self.menu.as_mut()
+                    {
+                        menu.seen = now;
+                    }
+                } else if self.inside() {
+                    // Over the menu: our own window, never "empty"; no lookup.
+                    self.dirty = false;
+                } else if matches!(self.phase, Phase::Looking | Phase::Showing) {
                     let (ax, ay) = self.asked_point;
                     if (x - ax).abs() > MOVE_SLOP || (y - ay).abs() > MOVE_SLOP {
                         self.dirty = true;
@@ -788,7 +1201,7 @@ impl Gesture {
                 ..
             } => {
                 // A press that reached us was not taken by the gate: the hold is used up
-                // (an Alt+click, a pen or touch press, a click after the pill went).
+                // (an Alt+click, a pen or touch press, a click after the menu closed).
                 self.buttons |= button_bit(button);
                 self.cursor = (x, y);
                 self.spoil(out, true);
@@ -802,32 +1215,114 @@ impl Gesture {
         }
     }
 
-    fn answer(&mut self, ask: u64, empty: bool, now: f64, out: &mut Vec<Action>) {
+    fn click_taken(&mut self, point: (i32, i32), now: f64, out: &mut Vec<Action>) {
+        // The gate took a press while the menu showed: the click is gone either way. On a
+        // row it runs that tool; anywhere else it only closes the menu.
+        let showing = self.phase == Phase::Showing;
+        let chosen = self.menu.as_ref().and_then(|menu| {
+            let row = menu.layout?.row_at(point)?;
+            Some((*menu.tools.get(row)?, row, menu.anchor))
+        });
+        if let Some((tool, row, anchor)) = chosen {
+            out.push(Action::Choose {
+                tool,
+                row,
+                point: anchor,
+                ask: self.empty_ask,
+            });
+        }
+        if showing {
+            out.push(Action::Close { animate: true });
+        }
+        self.pending = None;
+        self.phase = if chosen.is_some() {
+            Phase::Clicked
+        } else {
+            Phase::Cancelled
+        };
+        self.after_hold(now);
+    }
+
+    fn answer(&mut self, ask: u64, empty: bool, spot: Spot, now: f64, out: &mut Vec<Action>) {
         if self.pending != Some(ask) {
             return;
         }
         self.pending = None;
+        if self.is_free() {
+            // A free menu asked only for the origin of a note.
+            self.empty_ask = Some(ask);
+            return;
+        }
         match self.phase {
-            Phase::Looking if empty => {
-                self.empty_ask = Some(ask);
-                out.push(Action::Arm { epoch: self.epoch });
-                if self.modifier == Modifier::Alt && !self.masked {
-                    self.masked = true;
-                    out.push(Action::Mask { epoch: self.epoch });
-                }
-                out.push(Action::Show { point: self.cursor });
-                self.phase = Phase::Showing;
-            }
+            Phase::Looking if empty => self.open(ask, spot, now, out),
             Phase::Showing if empty => self.empty_ask = Some(ask),
+            Phase::Showing if self.inside() => {}
             Phase::Showing => {
-                // The cursor left empty space: the pill goes, and a click now is the app's.
+                // The cursor left empty space: the menu closes, and a click now is the app's.
                 out.push(Action::Disarm);
-                out.push(Action::Hide { animate: true });
+                out.push(Action::Close { animate: true });
                 self.phase = Phase::Looking;
             }
             _ => {}
         }
-        self.maybe_ask(now, out);
+        if matches!(self.phase, Phase::Looking | Phase::Showing) {
+            self.maybe_ask(now, out);
+        }
+    }
+
+    /// The spot is empty: open the menu with the tools offered here, or use the hold up when
+    /// there is none.
+    fn open(&mut self, ask: u64, spot: Spot, now: f64, out: &mut Vec<Action>) {
+        let tools = offered(&ToolContext {
+            spot,
+            ..self.context
+        });
+        if tools.is_empty() {
+            self.phase = Phase::Cancelled;
+            self.after_hold(now);
+            return;
+        }
+        self.empty_ask = Some(ask);
+        out.push(Action::Arm { epoch: self.epoch });
+        if self.modifier == Modifier::Alt && !self.masked {
+            self.masked = true;
+            out.push(Action::Mask { epoch: self.epoch });
+        }
+        out.push(Action::Open { point: self.cursor });
+        self.menu = Some(Menu {
+            tools,
+            anchor: self.cursor,
+            layout: None,
+            free: false,
+            seen: now,
+        });
+        self.phase = Phase::Showing;
+    }
+
+    fn open_free(&mut self, point: (i32, i32), epoch: u64, now: f64, out: &mut Vec<Action>) {
+        if self.in_hold() || self.blocked || !self.enabled {
+            return;
+        }
+        let tools = offered(&self.context);
+        if tools.is_empty() {
+            return;
+        }
+        self.cursor = point;
+        self.epoch = epoch;
+        self.masked = true; // no modifier is held: never a mask key
+        self.empty_ask = None;
+        out.push(Action::Arm { epoch });
+        out.push(Action::Open { point });
+        self.menu = Some(Menu {
+            tools,
+            anchor: point,
+            layout: None,
+            free: true,
+            seen: now,
+        });
+        self.phase = Phase::Showing;
+        // For the origin of a note only.
+        self.ask(now, out);
     }
 
     fn tick(&mut self, now: f64, out: &mut Vec<Action>) {
@@ -838,6 +1333,16 @@ impl Gesture {
                 } else {
                     self.phase = Phase::Looking;
                     self.ask(now, out);
+                }
+            }
+            Phase::Showing if self.is_free() => {
+                if self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|m| now >= m.seen + MENU_IDLE)
+                {
+                    self.spoil(out, true);
+                    self.after_hold(now);
                 }
             }
             Phase::Looking | Phase::Showing => self.maybe_ask(now, out),
@@ -869,199 +1374,490 @@ impl Gesture {
 }
 
 // ---------------------------------------------------------------------------------------
-// The pill: drawing and animation (pure)
+// The menu: motion (pure) and drawing
 // ---------------------------------------------------------------------------------------
 
-/// The pill window's size in physical pixels at `scale`.
-pub fn pill_window_size(scale: f64) -> (u32, u32) {
-    let w = ((PILL_SIZE.0 + 2.0 * PILL_MARGIN) * scale).ceil() as u32;
-    let h = ((PILL_SIZE.1 + 2.0 * PILL_MARGIN) * scale).ceil() as u32;
-    // Even sizes keep the hot spot on the centre pixel boundary.
-    (w + w % 2, h + h % 2)
+/// The menu's animated values at one moment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionFrame {
+    /// Opacity of the whole menu, 0 to 1.
+    pub alpha: f64,
+    /// How far below its place the menu still is, DIPs (only while opening).
+    pub rise: f64,
+    /// The highlight's position as a tool index (fractional while it slides).
+    pub highlight: f64,
+    /// The highlight's opacity (0 when the pointer is over no row).
+    pub lit: f64,
+    /// The chosen row's flash, 1 at the click down to 0.
+    pub flash: f64,
+    /// Something still changes: keep the clock running.
+    pub moving: bool,
+    /// Closed and faded out: hide the window.
+    pub gone: bool,
 }
 
-/// The appear spring at `t` seconds: 0 at the start, 1 at rest, overshooting slightly.
-pub fn spring(t: f64) -> f64 {
-    if t <= 0.0 {
-        return 0.0;
+/// The menu's motion on a millisecond clock ([`OPEN_MS`], [`SLIDE_MS`], [`FLASH_MS`],
+/// [`CLOSE_MS`]). With `animate` false (reduced motion) every change is instant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MenuMotion {
+    animate: bool,
+    intro: Transition,
+    opening: bool,
+    closing: bool,
+    highlight: Transition,
+    lit: Transition,
+    hovered: Option<usize>,
+    /// When the chosen row's flash started.
+    flash: Option<f64>,
+}
+
+impl MenuMotion {
+    pub fn hidden() -> MenuMotion {
+        MenuMotion {
+            animate: false,
+            intro: Transition::at(0.0),
+            opening: false,
+            closing: true,
+            highlight: Transition::at(0.0),
+            lit: Transition::at(0.0),
+            hovered: None,
+            flash: None,
+        }
     }
-    if t >= APPEAR {
-        return 1.0;
+
+    fn ms(&self, ms: f64) -> f64 {
+        if self.animate { ms } else { 0.0 }
     }
-    let omega = std::f64::consts::TAU / SPRING_RESPONSE;
-    let zeta = SPRING_DAMPING;
-    let damped = omega * (1.0 - zeta * zeta).sqrt();
-    let decay = (-zeta * omega * t).exp();
-    1.0 - decay * ((damped * t).cos() + zeta * omega / damped * (damped * t).sin())
+
+    /// Opens with `hovered` lit at once (no slide in from nowhere).
+    pub fn open(&mut self, hovered: Option<usize>, now: f64, animate: bool) {
+        self.animate = animate;
+        self.intro = Transition::at(0.0);
+        self.intro.retarget(1.0, now, self.ms(OPEN_MS));
+        self.opening = true;
+        self.closing = false;
+        self.highlight = Transition::at(hovered.unwrap_or(0) as f64);
+        self.lit = Transition::at(if hovered.is_some() { 1.0 } else { 0.0 });
+        self.hovered = hovered;
+        self.flash = None;
+    }
+
+    /// The pointer is over this row (or none): the highlight slides there.
+    pub fn hover(&mut self, row: Option<usize>, now: f64) {
+        if self.closing || row == self.hovered {
+            return;
+        }
+        self.hovered = row;
+        if let Some(row) = row {
+            if self.lit.value(now) <= 0.0 {
+                // Lighting up from nothing: appear on the row, do not slide from elsewhere.
+                self.highlight = Transition::at(row as f64);
+            } else {
+                self.highlight.retarget(row as f64, now, self.ms(SLIDE_MS));
+            }
+        }
+        let lit = if row.is_some() { 1.0 } else { 0.0 };
+        self.lit.retarget(lit, now, self.ms(SLIDE_MS));
+    }
+
+    /// A row was chosen: it is lit at once and flashes.
+    pub fn choose(&mut self, row: usize, now: f64) {
+        self.hovered = Some(row);
+        self.highlight = Transition::at(row as f64);
+        self.lit = Transition::at(1.0);
+        self.flash = self.animate.then_some(now);
+    }
+
+    /// Fades out, after the flash of a chosen row.
+    pub fn close(&mut self, now: f64, animate: bool) {
+        if self.closing {
+            return;
+        }
+        self.closing = true;
+        self.opening = false;
+        let from = self.intro.value(now);
+        if animate && self.animate && from > 0.0 {
+            let start = self.flash.map_or(now, |at| (at + FLASH_MS).max(now));
+            self.intro = Transition {
+                from,
+                to: 0.0,
+                start,
+                duration: CLOSE_MS,
+            };
+        } else {
+            self.intro = Transition::at(0.0);
+            self.flash = None;
+        }
+    }
+
+    pub fn closing(&self) -> bool {
+        self.closing
+    }
+
+    pub fn frame(&self, now: f64) -> MotionFrame {
+        let alpha = self.intro.value(now).clamp(0.0, 1.0);
+        let flash = self
+            .flash
+            .map_or(0.0, |at| (1.0 - (now - at) / FLASH_MS).clamp(0.0, 1.0));
+        let flashing = self.flash.is_some_and(|at| now < at + FLASH_MS);
+        MotionFrame {
+            alpha,
+            rise: if self.opening {
+                (1.0 - alpha) * RISE
+            } else {
+                0.0
+            },
+            highlight: self.highlight.value(now),
+            lit: self.lit.value(now).clamp(0.0, 1.0),
+            flash,
+            moving: self.intro.active(now)
+                || self.highlight.active(now)
+                || self.lit.active(now)
+                || flashing,
+            gone: self.closing && !self.intro.active(now) && alpha <= 0.0,
+        }
+    }
 }
 
-fn ease_out(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    1.0 - (1.0 - t) * (1.0 - t)
+/// What one picture of the menu shows.
+#[derive(Debug, Clone)]
+pub struct MenuPicture<'a> {
+    /// The tools in menu order, each with its key chips.
+    pub rows: &'a [(ToolId, Vec<String>)],
+    pub layout: &'a MenuLayout,
+    pub dark: bool,
+    pub highlight: f64,
+    pub lit: f64,
+    pub flash: f64,
 }
 
-/// Draws the pill at animation `value` (0: a hidden bead, 1: full size; may overshoot)
-/// into `pixmap` (cleared first), centred.
-pub fn render_pill(pixmap: &mut Pixmap, value: f64, scale: f64, dark: bool) {
-    pixmap.fill(Color::TRANSPARENT);
-    let alpha = value.clamp(0.0, 1.0) as f32;
-    if alpha <= 0.0 {
+thread_local! {
+    /// GDI fonts per DPI, kept for the thread's life (as the editor keeps its own).
+    static FONTS: RefCell<Vec<(u32, GdiFonts)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn fonts(dpi: u32) -> GdiFonts {
+    FONTS.with(|fonts| {
+        let mut fonts = fonts.borrow_mut();
+        if let Some((_, f)) = fonts.iter().find(|(d, _)| *d == dpi) {
+            return *f;
+        }
+        let made = GdiFonts::new(dpi);
+        fonts.push((dpi, made));
+        made
+    })
+}
+
+fn dpi_of(scale: f64) -> u32 {
+    (scale * 96.0).round() as u32
+}
+
+/// Width of `text` in `font`, physical px.
+fn text_width(surface: &Surface, font: windows::Win32::Graphics::Gdi::HFONT, text: &str) -> i32 {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE::default();
+    // SAFETY: the surface's own memory DC and a live font; `units` and `size` are locals.
+    // The previous font is selected back before returning.
+    unsafe {
+        let old = SelectObject(surface.dc, font.into());
+        let _ = GetTextExtentPoint32W(surface.dc, &units, &mut size);
+        SelectObject(surface.dc, old);
+    }
+    size.cx
+}
+
+fn chips_width(surface: &Surface, fonts: &GdiFonts, chips: &[String], dpi: u32) -> i32 {
+    let widths: i32 = chips
+        .iter()
+        .map(|chip| text_width(surface, fonts.small, chip) + 2 * px(CHIP_PAD, dpi))
+        .sum();
+    widths + px(CHIP_GAP, dpi) * (chips.len() as i32 - 1).max(0)
+}
+
+/// The card width these rows need at `scale`, DIPs (at least [`MENU_MIN_WIDTH`]).
+pub fn menu_width(rows: &[(ToolId, Vec<String>)], scale: f64) -> f64 {
+    let dpi = dpi_of(scale);
+    let fonts = fonts(dpi);
+    let Ok(surface) = Surface::new(1, 1) else {
+        return MENU_MIN_WIDTH;
+    };
+    let widest = rows
+        .iter()
+        .map(|(id, chips)| {
+            let label = text_width(&surface, fonts.body, tool(*id).label);
+            let chips = if chips.is_empty() {
+                0
+            } else {
+                px(LABEL_GAP, dpi) + chips_width(&surface, &fonts, chips, dpi)
+            };
+            px(LABEL_X, dpi) + label + chips + px(CHIPS_RIGHT, dpi)
+        })
+        .max()
+        .unwrap_or(0);
+    (f64::from(widest) / scale).ceil().max(MENU_MIN_WIDTH)
+}
+
+fn local(b: Bounds, origin: Bounds) -> RECT {
+    RECT {
+        left: b.left - origin.left,
+        top: b.top - origin.top,
+        right: b.right - origin.left,
+        bottom: b.bottom - origin.top,
+    }
+}
+
+/// Draws the menu at full opacity into a pixmap of the layout's window size (premultiplied
+/// RGBA). Shapes with tiny-skia and labels with GDI, as the slash menu draws.
+pub fn render_menu(picture: &MenuPicture) -> Option<Pixmap> {
+    let layout = picture.layout;
+    let dpi = dpi_of(layout.scale);
+    let palette = Palette::for_theme(picture.dark);
+    let fonts = fonts(dpi);
+    let (w, h) = (
+        layout.window.width().max(1) as u32,
+        layout.window.height().max(1) as u32,
+    );
+    let mut surface = Surface::new(w, h).ok()?;
+    let card = local(layout.card, layout.window);
+    let radius = px(MENU_RADIUS, dpi) as f32;
+    // Measured before the canvas borrows the surface.
+    let chip_widths: Vec<Vec<i32>> = picture
+        .rows
+        .iter()
+        .map(|(_, chips)| {
+            chips
+                .iter()
+                .map(|c| text_width(&surface, fonts.small, c) + 2 * px(CHIP_PAD, dpi))
+                .collect()
+        })
+        .collect();
+    let icons: Vec<Pixmap> = picture
+        .rows
+        .iter()
+        .filter_map(|(id, _)| icon_pixmap(tool(*id).icon, layout.scale, &palette))
+        .collect();
+    {
+        let mut canvas = surface.canvas();
+        canvas.clear();
+        canvas.shadow(card, radius, px(9.0, dpi), picture.dark);
+        canvas.fill(card, radius, palette.paper, 1.0);
+        canvas.stroke(card, radius, palette.hairline);
+        // The highlight, at its (sliding) position.
+        if picture.lit > 0.0 && layout.rows > 0 {
+            let position = if layout.upward {
+                (layout.rows - 1) as f64 - picture.highlight
+            } else {
+                picture.highlight
+            };
+            let top =
+                card.top + layout.pad + (position * f64::from(layout.row_height)).round() as i32;
+            let inset = px(ROW_INSET, dpi);
+            let lit = RECT {
+                left: card.left + inset,
+                top,
+                right: card.right - inset,
+                bottom: top + layout.row_height,
+            };
+            let color = mix(palette.selected, palette.accent, 0.3 * picture.flash);
+            canvas.fill(lit, px(ROW_RADIUS, dpi) as f32, color, picture.lit);
+        }
+        for (index, (id, chips)) in picture.rows.iter().enumerate() {
+            let row = local(layout.row(index), layout.window);
+            let cy = (row.top + row.bottom) / 2;
+            let icon = px(ICON, dpi);
+            let icon_rect = RECT {
+                left: card.left + px(ICON_X, dpi),
+                top: cy - icon / 2,
+                right: card.left + px(ICON_X, dpi) + icon,
+                bottom: cy - icon / 2 + icon,
+            };
+            if let Some(pixmap) = icons.get(index) {
+                canvas.image(pixmap, icon_rect, 0.0, 1.0);
+            }
+            let mut right = card.right - px(CHIPS_RIGHT, dpi);
+            let chip_h = px(CHIP_HEIGHT, dpi);
+            for (chip, width) in chips.iter().zip(&chip_widths[index]).rev() {
+                let rect = RECT {
+                    left: right - width,
+                    top: cy - chip_h / 2,
+                    right,
+                    bottom: cy - chip_h / 2 + chip_h,
+                };
+                canvas.fill(rect, px(CHIP_RADIUS, dpi) as f32, palette.chip, 1.0);
+                canvas.label(
+                    rect,
+                    chip,
+                    palette.muted,
+                    fonts.small,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+                );
+                right = rect.left - px(CHIP_GAP, dpi);
+            }
+            let label_right = if chips.is_empty() {
+                card.right - px(CHIPS_RIGHT, dpi)
+            } else {
+                right + px(CHIP_GAP, dpi) - px(LABEL_GAP, dpi)
+            };
+            canvas.label(
+                RECT {
+                    left: card.left + px(LABEL_X, dpi),
+                    top: row.top,
+                    right: label_right,
+                    bottom: row.bottom,
+                },
+                tool(*id).label,
+                palette.text,
+                fonts.body,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        }
+        canvas.finish_labels();
+    }
+    // The DIB is BGRA (the canvas fed colours with red and blue swapped): back to RGBA.
+    let mut pixels = surface.pixels();
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    let size = tiny_skia::IntSize::from_wh(w, h)?;
+    let mut pixmap = Pixmap::from_vec(pixels, size)?;
+    opaque_inside(&mut pixmap, card, radius);
+    Some(pixmap)
+}
+
+/// GDI leaves alpha at 0 where it drew text; everything fully inside the card is opaque, so
+/// those pixels get alpha 255 back. The card's antialiased edge is left as tiny-skia drew
+/// it (the editor's `Canvas::opaque_inside` scales edge pixels by their coverage a second
+/// time, which darkens the rim of a white card).
+fn opaque_inside(pixmap: &mut Pixmap, card: RECT, radius: f32) {
+    let Some(path) = rounded_path(card, radius) else {
+        return;
+    };
+    let Some(mut mask) = tiny_skia::Mask::new(pixmap.width(), pixmap.height()) else {
+        return;
+    };
+    mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
+    for (pixel, cover) in pixmap
+        .data_mut()
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(mask.data())
+    {
+        if *cover == 255 {
+            pixel[3] = 255;
+        }
+    }
+}
+
+/// Multiplies a premultiplied pixmap by `alpha`.
+pub fn apply_alpha(pixmap: &mut Pixmap, alpha: f64) {
+    if alpha >= 1.0 {
         return;
     }
-    let grow = value.max(0.0);
-    let w = (BEAD + (PILL_SIZE.0 - BEAD) * grow) * scale;
-    let h = (BEAD + (PILL_SIZE.1 - BEAD) * grow) * scale;
-    let r = ((BEAD / 2.0 + (PILL_RADIUS - BEAD / 2.0) * grow) * scale).min(w.min(h) / 2.0);
-    let (cx, cy) = (
-        f64::from(pixmap.width()) / 2.0,
-        f64::from(pixmap.height()) / 2.0,
-    );
-    let (fill, line, shadow): ([u8; 4], [u8; 4], [u8; 4]) = if dark {
-        ([0x22, 0x27, 0x33, 240], [255, 255, 255, 40], [0, 0, 0, 90])
-    } else {
-        ([0xff, 0xff, 0xff, 245], [28, 38, 58, 64], [28, 38, 58, 44])
-    };
-    let s = scale as f32;
-    // A soft shadow: rings that grow and fade, a little below the plate.
-    for i in (1..=4).rev() {
-        let spread = f64::from(i) * 1.2 * scale;
-        let Some(path) = rounded(
-            cx - w / 2.0 - spread,
-            cy - h / 2.0 - spread + 1.0 * scale,
-            w + 2.0 * spread,
-            h + 2.0 * spread,
-            r + spread,
-        ) else {
-            continue;
-        };
-        let a = f32::from(shadow[3]) / 255.0 * alpha * (0.35 - 0.07 * i as f32);
-        fill_path(pixmap, &path, [shadow[0], shadow[1], shadow[2]], a);
-    }
-    let Some(plate) = rounded(cx - w / 2.0, cy - h / 2.0, w, h, r) else {
-        return;
-    };
-    fill_path(
-        pixmap,
-        &plate,
-        [fill[0], fill[1], fill[2]],
-        f32::from(fill[3]) / 255.0 * alpha,
-    );
-    let inset = 0.5 * f64::from(s);
-    if let Some(border) = rounded(
-        cx - w / 2.0 + inset,
-        cy - h / 2.0 + inset,
-        w - 2.0 * inset,
-        h - 2.0 * inset,
-        (r - inset).max(0.0),
-    ) {
-        let mut paint = Paint::default();
-        paint.set_color_rgba8(
-            line[0],
-            line[1],
-            line[2],
-            (f32::from(line[3]) * alpha) as u8,
-        );
-        paint.anti_alias = true;
-        let stroke = Stroke {
-            width: s,
-            ..Stroke::default()
-        };
-        pixmap.stroke_path(&border, &paint, &stroke, Transform::identity(), None);
+    let a = (alpha.clamp(0.0, 1.0) * 256.0).round() as u32;
+    for byte in pixmap.data_mut() {
+        *byte = ((u32::from(*byte) * a) >> 8) as u8;
     }
 }
 
-fn fill_path(pixmap: &mut Pixmap, path: &tiny_skia::Path, rgb: [u8; 3], alpha: f32) {
+/// A paint in the canvas's channel order (blue in tiny-skia's red slot, as the DIB is BGRA).
+fn bgr_paint(color: COLORREF) -> Paint<'static> {
     let mut paint = Paint::default();
     paint.set_color_rgba8(
-        rgb[0],
-        rgb[1],
-        rgb[2],
-        (alpha.clamp(0.0, 1.0) * 255.0) as u8,
+        (color.0 >> 16) as u8,
+        (color.0 >> 8) as u8,
+        color.0 as u8,
+        255,
     );
     paint.anti_alias = true;
-    pixmap.fill_path(path, &paint, FillRule::Winding, Transform::identity(), None);
+    paint
 }
 
-fn rounded(x: f64, y: f64, w: f64, h: f64, r: f64) -> Option<tiny_skia::Path> {
-    let (x, y, w, h) = (x as f32, y as f32, w as f32, h as f32);
-    if w <= 0.0 || h <= 0.0 {
-        return None;
-    }
-    let r = (r as f32).clamp(0.0, w.min(h) / 2.0);
-    let k = r * 0.552_284_8;
-    let (l, t, rt, b) = (x, y, x + w, y + h);
-    let mut p = PathBuilder::new();
-    p.move_to(l + r, t);
-    p.line_to(rt - r, t);
-    p.cubic_to(rt - r + k, t, rt, t + r - k, rt, t + r);
-    p.line_to(rt, b - r);
-    p.cubic_to(rt, b - r + k, rt - r + k, b, rt - r, b);
-    p.line_to(l + r, b);
-    p.cubic_to(l + r - k, b, l, b - r + k, l, b - r);
-    p.line_to(l, t + r);
-    p.cubic_to(l, t + r - k, l + r - k, t, l + r, t);
-    p.close();
-    p.finish()
+const fn rgb(hex: u32) -> COLORREF {
+    COLORREF(((hex & 0xff) << 16) | (hex & 0xff00) | ((hex >> 16) & 0xff))
 }
 
-/// The pill's animation value over time.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PillMotion {
-    from: f64,
-    start: f64,
-    appearing: bool,
-    /// False: jumps (reduced motion).
-    animate: bool,
-}
-
-impl PillMotion {
-    pub fn hidden() -> PillMotion {
-        PillMotion {
-            from: 0.0,
-            start: 0.0,
-            appearing: false,
-            animate: false,
+/// A tool's icon in an [`ICON`]-DIP square, in the canvas's channel order.
+fn icon_pixmap(icon: Icon, scale: f64, palette: &Palette) -> Option<Pixmap> {
+    let size = px(ICON, dpi_of(scale)).max(1) as u32;
+    let mut pixmap = Pixmap::new(size, size)?;
+    let s = scale as f32;
+    let at = |x: f32, y: f32| (x * s, y * s);
+    let stroke = |width: f32| Stroke {
+        width: width * s,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Stroke::default()
+    };
+    let ink = bgr_paint(palette.muted);
+    match icon {
+        Icon::NoteSheet => {
+            // A sheet with its top-right corner folded, and two lines of text.
+            let mut sheet = PathBuilder::new();
+            let points = [
+                (4.0, 2.0),
+                (11.0, 2.0),
+                (15.0, 6.0),
+                (15.0, 16.0),
+                (4.0, 16.0),
+            ];
+            let (x, y) = at(points[0].0, points[0].1);
+            sheet.move_to(x, y);
+            for (px_, py) in &points[1..] {
+                let (x, y) = at(*px_, *py);
+                sheet.line_to(x, y);
+            }
+            sheet.close();
+            let mut fold = PathBuilder::new();
+            let (x, y) = at(11.0, 2.0);
+            fold.move_to(x, y);
+            let (x, y) = at(11.0, 6.0);
+            fold.line_to(x, y);
+            let (x, y) = at(15.0, 6.0);
+            fold.line_to(x, y);
+            let mut lines = PathBuilder::new();
+            for (y, end) in [(9.5, 12.5), (12.5, 10.5)] {
+                let (x0, y0) = at(6.75, y);
+                let (x1, _) = at(end, y);
+                lines.move_to(x0, y0);
+                lines.line_to(x1, y0);
+            }
+            if let Some(path) = sheet.finish() {
+                pixmap.fill_path(
+                    &path,
+                    &bgr_paint(palette.paper),
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+                pixmap.stroke_path(&path, &ink, &stroke(1.4), Transform::identity(), None);
+            }
+            for path in [fold.finish(), lines.finish()].into_iter().flatten() {
+                pixmap.stroke_path(&path, &ink, &stroke(1.3), Transform::identity(), None);
+            }
+        }
+        Icon::RecordDot => {
+            let (cx, cy) = at(9.0, 9.0);
+            if let Some(ring) = PathBuilder::from_circle(cx, cy, 6.6 * s) {
+                pixmap.stroke_path(&ring, &ink, &stroke(1.4), Transform::identity(), None);
+            }
+            let red = if palette.dark {
+                rgb(0xff6b6b)
+            } else {
+                rgb(0xe5484d)
+            };
+            if let Some(dot) = PathBuilder::from_circle(cx, cy, 3.7 * s) {
+                pixmap.fill_path(
+                    &dot,
+                    &bgr_paint(red),
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+            }
         }
     }
-
-    pub fn value(&self, now: f64) -> f64 {
-        let t = now - self.start;
-        match (self.appearing, self.animate) {
-            (true, false) => 1.0,
-            (false, false) => 0.0,
-            (true, true) => self.from + (1.0 - self.from) * spring(t),
-            (false, true) => self.from * (1.0 - ease_out(t / DISAPPEAR)),
-        }
-    }
-
-    /// Still changing at `now`.
-    pub fn moving(&self, now: f64) -> bool {
-        self.animate && now - self.start < if self.appearing { APPEAR } else { DISAPPEAR }
-    }
-
-    pub fn appear(&mut self, now: f64, animate: bool) {
-        let from = self.value(now).clamp(0.0, 1.0);
-        *self = PillMotion {
-            from: if animate { from } else { 1.0 },
-            start: now,
-            appearing: true,
-            animate,
-        };
-    }
-
-    pub fn disappear(&mut self, now: f64, animate: bool) {
-        let from = self.value(now).clamp(0.0, 1.0);
-        *self = PillMotion {
-            from,
-            start: now,
-            appearing: false,
-            animate: animate && from > 0.0,
-        };
-    }
-
-    pub fn is_shown(&self) -> bool {
-        self.appearing
-    }
+    Some(pixmap)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1100,11 +1896,14 @@ enum Command {
     Blocked(bool),
     Enabled(bool),
     Config(SummonConfig),
+    Context(ToolContext),
+    Shortcuts(Shortcuts),
     SummonAtCursor,
+    OpenMenu,
     RestartHook,
-    /// For the self-test: show (or hide) the pill at the cursor without the gesture and
-    /// without arming the gate.
-    TestPill(bool),
+    /// For the self-test: show (or hide) the menu with these tools at the cursor, without
+    /// the gesture and without arming the gate.
+    TestMenu(Option<Vec<ToolId>>),
     Shutdown,
 }
 
@@ -1120,7 +1919,9 @@ struct Shared {
     hook_installed: AtomicBool,
     key_callbacks: AtomicU64,
     key_max_ns: AtomicU64,
-    pill_hwnd: AtomicIsize,
+    menu_hwnd: AtomicIsize,
+    /// Where the menu is while it shows.
+    menu_layout: Mutex<Option<MenuLayout>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1141,7 +1942,8 @@ impl Shared {
             hook_installed: AtomicBool::new(false),
             key_callbacks: AtomicU64::new(0),
             key_max_ns: AtomicU64::new(0),
-            pill_hwnd: AtomicIsize::new(0),
+            menu_hwnd: AtomicIsize::new(0),
+            menu_layout: Mutex::new(None),
         })
     }
 
@@ -1332,10 +2134,12 @@ impl Drop for KeyHook {
 // ---------------------------------------------------------------------------------------
 
 /// What the thread starts with (kept by the owner for restarts).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Start {
     config: SummonConfig,
     blocked: bool,
+    context: ToolContext,
+    shortcuts: Shortcuts,
 }
 
 /// Disarms the gate however the thread ends, panics included.
@@ -1352,75 +2156,102 @@ enum Purpose {
     Hotkey { point: (i32, i32), time: f64 },
 }
 
-struct Pill {
+/// The menu window and its motion.
+struct MenuView {
     window: Overlay,
-    motion: PillMotion,
-    pixmap: Option<Pixmap>,
-    scale: f64,
+    motion: MenuMotion,
+    rows: Vec<(ToolId, Vec<String>)>,
+    layout: Option<MenuLayout>,
     dark: bool,
     visible: bool,
-    /// Rendered value last presented.
-    drawn: f64,
+    /// The picture at full opacity, and the values it was drawn for.
+    picture: Option<Pixmap>,
+    pictured: Option<(f64, f64, f64)>,
+    /// Opacity and rise last presented.
+    presented: Option<(f64, i32)>,
 }
 
-impl Pill {
-    fn new(capturable: bool) -> windows::core::Result<Pill> {
+impl MenuView {
+    fn new(capturable: bool) -> windows::core::Result<MenuView> {
         let mut window = Overlay::new()?;
         window.set_capturable(capturable)?;
-        Ok(Pill {
+        Ok(MenuView {
             window,
-            motion: PillMotion::hidden(),
-            pixmap: None,
-            scale: 0.0,
+            motion: MenuMotion::hidden(),
+            rows: Vec::new(),
+            layout: None,
             dark: false,
             visible: false,
-            drawn: -1.0,
+            picture: None,
+            pictured: None,
+            presented: None,
         })
     }
 
-    fn show(&mut self, now: f64) {
+    fn open(&mut self, rows: Vec<(ToolId, Vec<String>)>, layout: MenuLayout, now: f64) {
         self.dark = system_dark();
-        self.motion.appear(now, animation_effects());
-        self.drawn = -1.0;
+        self.rows = rows;
+        self.layout = Some(layout);
+        self.motion
+            .open(layout.row_at(cursor()), now * 1000.0, animation_effects());
+        self.picture = None;
+        self.pictured = None;
+        self.presented = None;
     }
 
-    fn hide(&mut self, now: f64, animate: bool) {
-        self.motion.disappear(now, animate && animation_effects());
-        self.drawn = -1.0;
+    fn choose(&mut self, row: usize, now: f64) {
+        self.motion.choose(row, now * 1000.0);
     }
 
-    /// Presents the current frame at the cursor. Returns whether it still moves.
+    fn close(&mut self, now: f64, animate: bool) {
+        self.motion.close(now * 1000.0, animate);
+    }
+
+    /// Presents the current frame. Returns whether it still moves.
     fn frame(&mut self, now: f64) -> bool {
-        let value = self.motion.value(now);
-        let moving = self.motion.moving(now);
-        if !self.motion.is_shown() && !moving {
+        let Some(layout) = self.layout else {
+            return false;
+        };
+        let ms = now * 1000.0;
+        if !self.motion.closing() {
+            self.motion.hover(layout.row_at(cursor()), ms);
+        }
+        let frame = self.motion.frame(ms);
+        if frame.gone {
             if self.visible {
                 self.window.hide();
                 self.visible = false;
             }
+            self.layout = None;
+            self.picture = None;
             return false;
         }
-        let cursor = cursor();
-        let scale = monitor_at(Point::new(f64::from(cursor.0), f64::from(cursor.1))).scale;
-        if scale != self.scale || self.pixmap.is_none() {
-            let (w, h) = pill_window_size(scale);
-            self.pixmap = Pixmap::new(w, h);
-            self.scale = scale;
-            self.drawn = -1.0;
+        let look = (frame.highlight, frame.lit, frame.flash);
+        if self.pictured != Some(look) {
+            self.picture = render_menu(&MenuPicture {
+                rows: &self.rows,
+                layout: &layout,
+                dark: self.dark,
+                highlight: frame.highlight,
+                lit: frame.lit,
+                flash: frame.flash,
+            });
+            self.pictured = Some(look);
+            self.presented = None;
         }
-        let Some(pixmap) = self.pixmap.as_mut() else {
-            return false;
-        };
-        let origin = (
-            cursor.0 - pixmap.width() as i32 / 2,
-            cursor.1 - pixmap.height() as i32 / 2,
-        );
-        if (value - self.drawn).abs() > 1e-4 {
-            render_pill(pixmap, value, scale, self.dark);
-            self.drawn = value;
-            let _ = self.window.present(pixmap, origin);
-        } else {
-            let _ = self.window.move_to(origin);
+        let rise = px(frame.rise, dpi_of(layout.scale));
+        if self.presented != Some((frame.alpha, rise))
+            && let Some(picture) = &self.picture
+        {
+            let origin = (layout.window.left, layout.window.top + rise);
+            if frame.alpha >= 1.0 {
+                let _ = self.window.present(picture, origin);
+            } else {
+                let mut faded = picture.clone();
+                apply_alpha(&mut faded, frame.alpha);
+                let _ = self.window.present(&faded, origin);
+            }
+            self.presented = Some((frame.alpha, rise));
         }
         if !self.visible {
             self.window.show();
@@ -1429,7 +2260,7 @@ impl Pill {
         if self.window.take_display_changed() {
             self.window.reassert();
         }
-        moving
+        frame.moving
     }
 }
 
@@ -1438,10 +2269,12 @@ struct Driver {
     requester: Arc<Mutex<Requester>>,
     gesture: Gesture,
     config: SummonConfig,
-    pill: Pill,
+    shortcuts: Shortcuts,
+    view: MenuView,
     hook: Option<KeyHook>,
     asks: HashMap<RequestId, Purpose>,
-    /// The latest lookup that found the spot empty, for the origin of a click.
+    /// The latest lookup that found the spot empty (or any, for a free menu), for the origin
+    /// of a chosen tool.
     empty: Option<(u64, Outcome)>,
     names: AppNames,
     taken_seen: u64,
@@ -1457,23 +2290,23 @@ fn run(
 ) {
     let _disarm = DisarmOnExit;
     let mut msg = MSG::default();
-    // SAFETY: plain calls on this thread. Physical pixels for the pill and the cursor; the
+    // SAFETY: plain calls on this thread. Physical pixels for the menu and the cursor; the
     // message queue exists before anyone waits on us.
     unsafe {
         SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
     }
     let gate_wake = CLICK_GATE.wake_handle();
-    let pill = match Pill::new(start.config.capturable) {
-        Ok(pill) => pill,
+    let view = match MenuView::new(start.config.capturable) {
+        Ok(view) => view,
         Err(e) => {
-            let _ = ready.send(Err(format!("pill window: {e}")));
+            let _ = ready.send(Err(format!("menu window: {e}")));
             return;
         }
     };
     shared
-        .pill_hwnd
-        .store(pill.window.hwnd().0 as isize, Relaxed);
+        .menu_hwnd
+        .store(view.window.hwnd().0 as isize, Relaxed);
     let hook = match KeyHook::start(shared.clone()) {
         Ok(hook) => hook,
         Err(e) => {
@@ -1485,6 +2318,7 @@ fn run(
     let now = hook::now();
     gesture.step(Input::Enabled(start.config.enabled), now);
     gesture.step(Input::Blocked(start.blocked), now);
+    gesture.step(Input::Context(start.context), now);
     // Keys already down when we start count as a used-up hold.
     gesture.step(Input::KeysReset(Keys::now()), now);
     let mut driver = Driver {
@@ -1492,7 +2326,8 @@ fn run(
         requester,
         gesture,
         config: start.config,
-        pill,
+        shortcuts: start.shortcuts,
+        view,
         hook: Some(hook),
         asks: HashMap::new(),
         empty: None,
@@ -1559,13 +2394,13 @@ impl Driver {
             if !self.turn() {
                 break;
             }
-            animating = self.pill.frame(hook::now());
+            animating = self.view.frame(hook::now());
         }
         // Shutdown: nothing armed, nothing shown, the hook removed.
         let actions = self.gesture.step(Input::Shutdown, hook::now());
         self.execute(actions);
-        self.pill.motion = PillMotion::hidden();
-        self.pill.frame(hook::now());
+        self.view.close(hook::now(), false);
+        self.view.frame(hook::now());
         self.hook = None;
         self.log("stopped");
     }
@@ -1590,20 +2425,37 @@ impl Driver {
                     let capturable = config.capturable != self.config.capturable;
                     self.config = config;
                     if capturable {
-                        let _ = self.pill.window.set_capturable(config.capturable);
+                        let _ = self.view.window.set_capturable(config.capturable);
                     }
                     self.step(Input::Modifier(config.modifier));
                     self.step(Input::Enabled(config.enabled));
                     self.log(&format!("config: modifier {}", config.modifier.label()));
                 }
+                Command::Context(context) => {
+                    self.log(&format!("tool context {context:?}"));
+                    self.step(Input::Context(context));
+                }
+                Command::Shortcuts(shortcuts) => self.shortcuts = shortcuts,
                 Command::SummonAtCursor => self.summon_at_cursor(),
+                Command::OpenMenu => {
+                    let (point, epoch) = (cursor(), CLICK_GATE.epoch());
+                    self.log(&format!(
+                        "open the menu at {},{} (no gesture)",
+                        point.0, point.1
+                    ));
+                    self.step(Input::OpenMenu { point, epoch });
+                }
                 Command::RestartHook => self.restart_hook("asked"),
-                Command::TestPill(on) => {
+                Command::TestMenu(tools) => {
                     let now = hook::now();
-                    if on {
-                        self.pill.show(now);
-                    } else {
-                        self.pill.hide(now, false);
+                    match tools {
+                        Some(tools) => {
+                            self.open_view(&tools, cursor(), now);
+                        }
+                        None => {
+                            *lock(&self.shared.menu_layout) = None;
+                            self.view.close(now, false);
+                        }
                     }
                 }
                 Command::Shutdown => return false,
@@ -1668,6 +2520,27 @@ impl Driver {
         self.execute(actions);
     }
 
+    /// Places the menu for these tools at `point` and shows it. Returns its layout.
+    fn open_view(&mut self, tools: &[ToolId], point: (i32, i32), now: f64) -> MenuLayout {
+        let rows: Vec<(ToolId, Vec<String>)> = tools
+            .iter()
+            .map(|&id| (id, tool_chips(id, &self.shortcuts)))
+            .collect();
+        let monitor = monitor_at(Point::new(f64::from(point.0), f64::from(point.1)));
+        let area = monitor.work_area;
+        let work = Bounds {
+            left: area.x.round() as i32,
+            top: area.y.round() as i32,
+            right: (area.x + area.width).round() as i32,
+            bottom: (area.y + area.height).round() as i32,
+        };
+        let width = menu_width(&rows, monitor.scale);
+        let layout = menu_layout(point, rows.len(), width, work, monitor.scale);
+        *lock(&self.shared.menu_layout) = Some(layout);
+        self.view.open(rows, layout, now);
+        layout
+    }
+
     fn execute(&mut self, actions: Vec<Action>) {
         let now = hook::now();
         for action in actions {
@@ -1686,7 +2559,7 @@ impl Driver {
                     if CLICK_GATE.arm(epoch, button) {
                         self.log(&format!("gate armed for {button:?} (epoch {epoch})"));
                     } else {
-                        self.log("gate refused (a key changed): no pill");
+                        self.log("gate refused (a key changed): no menu");
                         let more = self.gesture.step(Input::ArmFailed, now);
                         self.execute(more);
                         return;
@@ -1698,19 +2571,36 @@ impl Driver {
                     )),
                     Err(why) => self.log(&format!("mask key not sent: {why}")),
                 },
-                Action::Show { point } => {
-                    self.log(&format!("pill shown at {},{}", point.0, point.1));
-                    self.pill.show(now);
+                Action::Open { point } => {
+                    let tools = self.gesture.tools().to_vec();
+                    let layout = self.open_view(&tools, point, now);
+                    let names: Vec<&str> = tools.iter().map(|t| t.id()).collect();
+                    self.log(&format!(
+                        "menu open at {},{} with [{}]{}",
+                        point.0,
+                        point.1,
+                        names.join(", "),
+                        if layout.upward { ", upward" } else { "" }
+                    ));
+                    let more = self.gesture.step(Input::Placed(layout), now);
+                    self.execute(more);
                 }
                 Action::Disarm => {
                     CLICK_GATE.withdraw();
                     self.log("gate disarmed");
                 }
-                Action::Hide { animate } => {
-                    self.log("pill hidden");
-                    self.pill.hide(now, animate);
+                Action::Close { animate } => {
+                    self.log("menu closed");
+                    *lock(&self.shared.menu_layout) = None;
+                    self.view.close(now, animate);
                 }
-                Action::Summon { point, ask } => {
+                Action::Choose {
+                    tool,
+                    row,
+                    point,
+                    ask,
+                } => {
+                    self.view.choose(row, now);
                     let empty = self.empty.take();
                     let none = Outcome::Failed("no lookup".into());
                     let outcome = match (&empty, ask) {
@@ -1719,7 +2609,7 @@ impl Driver {
                     };
                     let origin = self.origin_at(point, outcome);
                     self.empty = empty;
-                    self.emit_summon(point, origin, now);
+                    self.emit_chosen(tool, point, origin, now);
                 }
             }
         }
@@ -1734,15 +2624,17 @@ impl Driver {
         context::origin(outcome, &facts)
     }
 
-    fn emit_summon(&self, point: (i32, i32), origin: NoteOrigin, time: f64) {
+    fn emit_chosen(&self, tool: ToolId, point: (i32, i32), origin: NoteOrigin, time: f64) {
         self.log(&format!(
-            "summon at {},{}: {} | {}",
+            "tool {} at {},{}: {} | {}",
+            tool.id(),
             point.0,
             point.1,
             origin.label(),
             origin.detail().replace('\n', " | ")
         ));
-        self.shared.emit(SummonerEvent::Summon(Summon {
+        self.shared.emit(SummonerEvent::ToolChosen(ToolChosen {
+            tool,
             point,
             origin,
             time,
@@ -1762,26 +2654,28 @@ impl Driver {
                         "lookup {ask}: {} -> empty {empty}",
                         describe(&outcome)
                     ));
-                    if empty {
+                    let mut spot = Spot::Unknown;
+                    if empty || self.gesture.is_free() {
                         // Read the window facts now (the exe's name is cached), so the
-                        // click finds them ready.
+                        // click finds them ready; they also name the kind of spot.
                         if let Outcome::Found(s) = &outcome {
-                            let _ = facts_at(s.point, Some(s.hit.element().pid), &mut self.names);
+                            let point = s.point;
+                            spot = Spot::from_kind(self.origin_at(point, &outcome).kind);
                         }
                         self.empty = Some((ask, outcome));
                     }
-                    self.step(Input::Answer { ask, empty });
+                    self.step(Input::Answer { ask, empty, spot });
                 }
                 Some(Purpose::Hotkey { point, time }) => {
                     let origin = self.origin_at(point, &outcome);
-                    self.emit_summon(point, origin, time);
+                    self.emit_chosen(ToolId::NewNote, point, origin, time);
                 }
                 None => {}
             }
         }
     }
 
-    /// The NewNote hotkey: a note at the cursor, no gesture, nothing swallowed.
+    /// The NewNote hotkey: a note at the cursor, no menu, nothing swallowed.
     fn summon_at_cursor(&mut self) {
         let point = cursor();
         let time = hook::now();
@@ -1810,7 +2704,7 @@ impl Driver {
         for id in late {
             if let Some(Purpose::Hotkey { point, time }) = self.asks.remove(&id) {
                 let origin = self.origin_at(point, &Outcome::Failed("no answer".into()));
-                self.emit_summon(point, origin, time);
+                self.emit_chosen(ToolId::NewNote, point, origin, time);
             }
         }
         // Gesture lookups replaced before they ran never get an answer: forget old ones.
@@ -1888,7 +2782,7 @@ fn describe(outcome: &Outcome) -> String {
 
 fn pump_messages() {
     let mut msg = MSG::default();
-    // SAFETY: `msg` is a valid MSG for the calls to fill and read; the pill's window
+    // SAFETY: `msg` is a valid MSG for the calls to fill and read; the menu's window
     // procedure is the overlay's, which touches no Rust state.
     unsafe {
         while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -1955,45 +2849,11 @@ fn send_mask(epoch: u64) -> Result<(), &'static str> {
     }
 }
 
-fn system_dark() -> bool {
-    let mut light: u32 = 1;
-    let mut size = size_of::<u32>() as u32;
-    // SAFETY: the value is restricted to a DWORD and both out buffers are locals.
-    let result = unsafe {
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"),
-            w!("AppsUseLightTheme"),
-            RRF_RT_REG_DWORD,
-            None,
-            Some((&mut light as *mut u32).cast()),
-            Some(&mut size),
-        )
-    };
-    result.is_ok() && light == 0
-}
-
-/// False when the user turned off "Animation effects" (reduced motion).
-fn animation_effects() -> bool {
-    let mut enabled = windows::core::BOOL(0);
-    // SAFETY: SPI_GETCLIENTAREAANIMATION writes exactly one BOOL into a local.
-    unsafe {
-        SystemParametersInfoW(
-            SPI_GETCLIENTAREAANIMATION,
-            0,
-            Some((&mut enabled as *mut windows::core::BOOL).cast()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        )
-    }
-    .is_ok()
-        && enabled.as_bool()
-}
-
 // ---------------------------------------------------------------------------------------
 // Public API (the UI thread)
 // ---------------------------------------------------------------------------------------
 
-/// The note gesture. Owned by the UI thread; every call returns at once.
+/// The tool menu gesture. Owned by the UI thread; every call returns at once.
 pub struct Summoner {
     shared: Arc<Shared>,
     requester: Arc<Mutex<Requester>>,
@@ -2003,8 +2863,9 @@ pub struct Summoner {
 }
 
 impl Summoner {
-    /// Starts the summoner thread (pill window, keyboard hook). `requester` is a lane of the
-    /// app's UI Automation worker (`Uia::requester`).
+    /// Starts the summoner thread (menu window, keyboard hook). `requester` is a lane of the
+    /// app's UI Automation worker (`Uia::requester`). No tool is offered until
+    /// [`set_tool_context`](Self::set_tool_context) says what can run.
     pub fn start(config: SummonConfig, requester: Requester) -> Result<Summoner, String> {
         hook::now();
         let shared = Arc::new(Shared::new().map_err(|e| format!("events: {e}"))?);
@@ -2012,8 +2873,10 @@ impl Summoner {
         let start = Start {
             config,
             blocked: false,
+            context: ToolContext::default(),
+            shortcuts: Shortcuts::none(),
         };
-        let thread = spawn(&shared, &requester, start)?;
+        let thread = spawn(&shared, &requester, start.clone())?;
         Ok(Summoner {
             shared,
             requester,
@@ -2055,7 +2918,7 @@ impl Summoner {
     }
 
     /// Something holds the screen (or no longer does). The gesture is blocked while any
-    /// reason is set; a pill that shows goes at once.
+    /// reason is set; a menu that shows closes at once.
     pub fn set_blocked(&mut self, reason: Block, blocked: bool) {
         let before = self.blocks != 0;
         if blocked {
@@ -2081,10 +2944,38 @@ impl Summoner {
         self.shared.send(Command::Config(config));
     }
 
-    /// The NewNote hotkey: looks up the origin at the cursor and emits a [`Summon`], with no
-    /// gesture and nothing swallowed.
+    /// What the tools' conditions look at; sent on only when it changed. Read when the menu
+    /// opens.
+    pub fn set_tool_context(&mut self, context: ToolContext) {
+        if context != self.start.context {
+            self.start.context = context;
+            self.shared.send(Command::Context(context));
+        }
+    }
+
+    /// The shortcuts the rows show as key chips; sent on only when they changed. Read when
+    /// the menu opens.
+    pub fn set_shortcuts(&mut self, shortcuts: &Shortcuts) {
+        if *shortcuts != self.start.shortcuts {
+            self.start.shortcuts = shortcuts.clone();
+            self.shared.send(Command::Shortcuts(shortcuts.clone()));
+        }
+    }
+
+    /// The NewNote hotkey: looks up the origin at the cursor and emits
+    /// [`SummonerEvent::ToolChosen`] for [`ToolId::NewNote`], with no menu and nothing
+    /// swallowed.
     pub fn summon_at_cursor(&self) {
         self.shared.send(Command::SummonAtCursor);
+    }
+
+    /// Opens the menu at the cursor without the gesture (for a shortcut; none is bound yet).
+    /// The click gate is armed while it shows: a click on a row runs that tool, any other
+    /// click closes it, as does any key press or [`MENU_IDLE`] seconds without the pointer
+    /// over it. Does nothing while a hold is under way, when blocked or disabled, or when no
+    /// tool is offered.
+    pub fn open_menu_at_cursor(&self) {
+        self.shared.send(Command::OpenMenu);
     }
 
     /// Appends every event since the last call.
@@ -2114,7 +3005,7 @@ impl Summoner {
             let _ = thread.join();
         }
         CLICK_GATE.disarm();
-        self.thread = Some(spawn(&self.shared, &self.requester, self.start)?);
+        self.thread = Some(spawn(&self.shared, &self.requester, self.start.clone())?);
         Ok(())
     }
 
@@ -2126,18 +3017,23 @@ impl Summoner {
         )
     }
 
-    /// The pill window, for tests.
-    pub fn pill_window(&self) -> isize {
-        self.shared.pill_hwnd.load(Relaxed)
+    /// The menu window, for tests.
+    pub fn menu_window(&self) -> isize {
+        self.shared.menu_hwnd.load(Relaxed)
     }
 
-    /// For the self-test only: shows the pill at the cursor (following it) without the
-    /// gesture and without arming the gate, or hides it.
-    pub fn test_pill(&self, show: bool) {
-        self.shared.send(Command::TestPill(show));
+    /// Where the menu is while it shows, for tests.
+    pub fn menu_layout(&self) -> Option<MenuLayout> {
+        *lock(&self.shared.menu_layout)
     }
 
-    /// Stops the thread: disarms the gate, hides the pill, removes the keyboard hook. True
+    /// For the self-test only: shows the menu with these tools at the cursor without the
+    /// gesture and without arming the gate (`None` hides it).
+    pub fn test_menu(&self, tools: Option<Vec<ToolId>>) {
+        self.shared.send(Command::TestMenu(tools));
+    }
+
+    /// Stops the thread: disarms the gate, hides the menu, removes the keyboard hook. True
     /// when the thread ended within a second.
     pub fn shutdown(mut self) -> bool {
         self.stop()
@@ -2192,6 +3088,7 @@ fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shortcuts::{Action as Shortcut, Chord};
 
     const LALT: u32 = 0xA4;
     const RALT: u32 = 0xA5;
@@ -2199,8 +3096,33 @@ mod tests {
     const TAB: u32 = 0x09;
     const F4: u32 = 0x73;
     const KEY_F: u32 = 0x46;
+    const WORK: Bounds = Bounds {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1040,
+    };
+    /// Where the scripted hold opens the menu.
+    const AT: (i32, i32) = (100, 100);
 
-    /// A scripted run: inputs at times, every action recorded.
+    fn notes_only() -> ToolContext {
+        ToolContext {
+            notes: true,
+            ..ToolContext::default()
+        }
+    }
+
+    fn both() -> ToolContext {
+        ToolContext {
+            notes: true,
+            recording_available: true,
+            recording_enabled: true,
+            ..ToolContext::default()
+        }
+    }
+
+    /// A scripted run: inputs at times, every action recorded. An `Open` is placed at once,
+    /// as the driver does.
     struct Script {
         g: Gesture,
         actions: Vec<(f64, Action)>,
@@ -2209,10 +3131,27 @@ mod tests {
 
     impl Script {
         fn new(modifier: Modifier) -> Script {
+            Script::with(modifier, notes_only())
+        }
+
+        fn with(modifier: Modifier, context: ToolContext) -> Script {
+            let mut g = Gesture::new(modifier);
+            g.step(Input::Context(context), 0.0);
             Script {
-                g: Gesture::new(modifier),
+                g,
                 actions: Vec::new(),
                 epoch: 0,
+            }
+        }
+
+        fn record(&mut self, t: f64, actions: Vec<Action>) {
+            for action in actions {
+                self.actions.push((t, action));
+                if let Action::Open { point } = action {
+                    let layout = menu_layout(point, self.g.tools().len(), 200.0, WORK, 1.0);
+                    let more = self.g.step(Input::Placed(layout), t);
+                    self.record(t, more);
+                }
             }
         }
 
@@ -2220,7 +3159,7 @@ mod tests {
             // Time passes up to `t` first, as the driver's ticks would make it.
             self.tick_to(t);
             let actions = self.g.step(input, t);
-            self.actions.extend(actions.into_iter().map(|a| (t, a)));
+            self.record(t, actions);
             self
         }
 
@@ -2230,7 +3169,7 @@ mod tests {
                     break;
                 }
                 let actions = self.g.step(Input::Tick, due);
-                self.actions.extend(actions.into_iter().map(|a| (due, a)));
+                self.record(due, actions);
                 if self.g.next_deadline() == Some(due) {
                     break;
                 }
@@ -2311,7 +3250,14 @@ mod tests {
         /// Answers the newest ask.
         fn answer(&mut self, t: f64, empty: bool) -> &mut Script {
             let ask = self.last_ask().expect("an ask to answer");
-            self.at(t, Input::Answer { ask, empty })
+            self.at(
+                t,
+                Input::Answer {
+                    ask,
+                    empty,
+                    spot: Spot::Desktop,
+                },
+            )
         }
 
         fn last_ask(&self) -> Option<u64> {
@@ -2334,14 +3280,23 @@ mod tests {
         fn masks(&self) -> usize {
             self.count(|a| matches!(a, Action::Mask { .. }))
         }
-        fn shows(&self) -> usize {
-            self.count(|a| matches!(a, Action::Show { .. }))
+        fn opens(&self) -> usize {
+            self.count(|a| matches!(a, Action::Open { .. }))
         }
-        fn summons(&self) -> usize {
-            self.count(|a| matches!(a, Action::Summon { .. }))
+        fn chosen(&self) -> Vec<ToolId> {
+            self.actions
+                .iter()
+                .filter_map(|(_, a)| match a {
+                    Action::Choose { tool, .. } => Some(*tool),
+                    _ => None,
+                })
+                .collect()
         }
-        fn hides(&self) -> usize {
-            self.count(|a| matches!(a, Action::Hide { .. }))
+        fn chooses(&self) -> usize {
+            self.chosen().len()
+        }
+        fn closes(&self) -> usize {
+            self.count(|a| matches!(a, Action::Close { .. }))
         }
         fn disarms(&self) -> usize {
             self.count(|a| matches!(a, Action::Disarm))
@@ -2349,28 +3304,38 @@ mod tests {
 
         /// Nothing at all touched the gate, the keyboard or the screen.
         fn untouched(&self) -> bool {
-            self.arms() == 0 && self.masks() == 0 && self.shows() == 0 && self.summons() == 0
+            self.arms() == 0 && self.masks() == 0 && self.opens() == 0 && self.chooses() == 0
         }
 
-        /// Alt down at 0, held past the delay over empty space: the pill shows.
-        fn showing(modifier: Modifier) -> Script {
-            let mut s = Script::new(modifier);
+        /// The modifier down at 0, held past the delay over empty space at [`AT`]: the menu
+        /// shows.
+        fn showing_with(modifier: Modifier, context: ToolContext) -> Script {
+            let mut s = Script::with(modifier, context);
             if modifier == Modifier::CtrlAlt {
                 s.key(0.0, LCTRL, true);
             }
-            s.key(0.0, LALT, true).moved(0.1, 100, 100);
+            s.key(0.0, LALT, true).moved(0.1, AT.0, AT.1);
             s.tick_to(0.35);
             assert_eq!(s.asks(), 1, "the lookup runs once the delay passed");
             s.answer(0.36, true);
             assert_eq!(s.g.phase(), Phase::Showing);
             s
         }
+
+        fn showing(modifier: Modifier) -> Script {
+            Script::showing_with(modifier, notes_only())
+        }
+
+        fn layout(&self) -> MenuLayout {
+            self.g.menu.as_ref().and_then(|m| m.layout).expect("placed")
+        }
     }
 
     #[test]
-    fn hold_then_click_makes_a_note() {
+    fn hold_then_click_without_moving_runs_the_first_tool() {
         let mut s = Script::showing(Modifier::Alt);
-        assert_eq!((s.arms(), s.masks(), s.shows()), (1, 1, 1));
+        assert_eq!((s.arms(), s.masks(), s.opens()), (1, 1, 1));
+        assert_eq!(s.g.tools(), &[ToolId::NewNote]);
         // The arm and the mask carry the epoch of the Alt press.
         assert!(
             s.actions
@@ -2382,31 +3347,37 @@ mod tests {
                 .iter()
                 .any(|(_, a)| *a == Action::Mask { epoch: 1 })
         );
-        // Arm comes before show: a click is never shown a pill it cannot take.
+        // Arm comes before open: a click is never shown a menu that cannot take it.
         let arm = s
             .actions
             .iter()
             .position(|(_, a)| matches!(a, Action::Arm { .. }));
-        let show = s
+        let open = s
             .actions
             .iter()
-            .position(|(_, a)| matches!(a, Action::Show { .. }));
-        assert!(arm < show);
-        s.at(0.5, Input::ClickTaken { x: 120, y: 130 });
-        let summon = s.actions.iter().find_map(|(_, a)| match a {
-            Action::Summon { point, ask } => Some((*point, *ask)),
+            .position(|(_, a)| matches!(a, Action::Open { .. }));
+        assert!(arm < open);
+        // The click where the cursor already is: the first row.
+        s.at(0.5, Input::ClickTaken { x: AT.0, y: AT.1 });
+        let chosen = s.actions.iter().find_map(|(_, a)| match a {
+            Action::Choose {
+                tool,
+                row,
+                point,
+                ask,
+            } => Some((*tool, *row, *point, *ask)),
             _ => None,
         });
-        assert_eq!(summon, Some(((120, 130), Some(1))));
+        assert_eq!(chosen, Some((ToolId::NewNote, 0, AT, Some(1))));
         assert!(
             s.actions
                 .iter()
-                .any(|(_, a)| *a == Action::Hide { animate: false })
+                .any(|(_, a)| *a == Action::Close { animate: true })
         );
         assert_eq!(s.g.phase(), Phase::Clicked);
-        // A second click in the same hold makes nothing: the gate is not armed again.
+        // A second click in the same hold runs nothing: the gate is not armed again.
         s.press(0.6, false).release(0.65);
-        assert_eq!(s.summons(), 1);
+        assert_eq!(s.chooses(), 1);
         assert_eq!(s.arms(), 1);
         // Release: a short cooldown, then idle.
         s.key(0.8, LALT, false);
@@ -2416,11 +3387,140 @@ mod tests {
     }
 
     #[test]
-    fn hold_and_release_without_a_click_makes_nothing_and_masks_the_menu() {
+    fn the_menu_opens_with_the_offered_tools() {
+        let s = Script::showing_with(Modifier::Alt, both());
+        assert_eq!(s.g.tools(), &[ToolId::NewNote, ToolId::RecordScreen]);
+        assert_eq!(s.layout().rows, 2);
+        // Recording on but running: only the note.
+        let running = ToolContext {
+            recording: true,
+            ..both()
+        };
+        let s = Script::showing_with(Modifier::Alt, running);
+        assert_eq!(s.g.tools(), &[ToolId::NewNote]);
+        // Recording without notes: only the recording.
+        let s = Script::showing_with(
+            Modifier::Alt,
+            ToolContext {
+                notes: false,
+                ..both()
+            },
+        );
+        assert_eq!(s.g.tools(), &[ToolId::RecordScreen]);
+    }
+
+    #[test]
+    fn with_no_tool_offered_nothing_opens_and_nothing_is_injected() {
+        let mut s = Script::with(Modifier::Alt, ToolContext::default());
+        s.key(0.0, LALT, true);
+        s.tick_to(0.35);
+        s.answer(0.36, true);
+        assert!(s.untouched());
+        assert_eq!(s.g.phase(), Phase::Cancelled);
+        s.tick_to(2.0);
+        assert_eq!(s.asks(), 1, "no more lookups in this hold");
+        s.key(2.0, LALT, false);
+        assert_eq!(s.g.phase(), Phase::Idle);
+        assert!(s.untouched());
+        // Recording available but switched off is not offered either.
+        assert!(
+            offered(&ToolContext {
+                recording_available: true,
+                ..ToolContext::default()
+            })
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn moving_to_the_second_row_and_clicking_runs_it() {
+        let mut s = Script::showing_with(Modifier::Alt, both());
+        let second = s.layout().row(1);
+        let point = (AT.0 + 40, (second.top + second.bottom) / 2);
+        s.moved(0.45, point.0, point.1);
+        s.tick_to(1.0);
+        assert_eq!(s.asks(), 1, "no lookup while the pointer is over the menu");
+        s.at(
+            1.0,
+            Input::ClickTaken {
+                x: point.0,
+                y: point.1,
+            },
+        );
+        assert_eq!(s.chosen(), vec![ToolId::RecordScreen]);
+        // The tool's point is where the menu opened, not the row.
+        assert!(s.actions.iter().any(|(_, a)| matches!(
+            a,
+            Action::Choose {
+                row: 1,
+                point: AT,
+                ..
+            }
+        )));
+        assert_eq!(s.g.phase(), Phase::Clicked);
+    }
+
+    #[test]
+    fn a_click_outside_every_row_closes_with_no_tool() {
+        let mut s = Script::showing_with(Modifier::Alt, both());
+        // Outside the card but still over empty space (the re-check says so).
+        s.moved(0.4, 600, 600);
+        s.tick_to(0.55);
+        s.answer(0.56, true);
+        assert_eq!(s.g.phase(), Phase::Showing);
+        // The gate takes any primary press while armed (it knows no rectangle): swallowed,
+        // and it only closes the menu.
+        s.at(0.7, Input::ClickTaken { x: 600, y: 600 });
+        assert_eq!(s.chooses(), 0);
+        assert_eq!(s.closes(), 1);
+        assert_eq!(s.g.phase(), Phase::Cancelled);
+        s.key(0.9, LALT, false);
+        assert_eq!(s.g.phase(), Phase::Idle, "no cooldown: nothing ran");
+    }
+
+    #[test]
+    fn the_pointer_inside_the_menu_keeps_it_open() {
+        let mut s = Script::showing_with(Modifier::Alt, both());
+        let card = s.layout().card;
+        // All over the card, slowly: no lookup, nothing closes.
+        for (i, (x, y)) in [
+            (card.left + 1, card.top + 1),
+            (card.right - 2, card.bottom - 2),
+            (card.left + 50, card.top + 40),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.moved(0.4 + i as f64 * 0.3, x, y);
+        }
+        s.tick_to(2.0);
+        assert_eq!(s.asks(), 1);
+        assert_eq!(s.g.phase(), Phase::Showing);
+        // A late "not empty" answer (the menu is our own window) while the pointer is inside
+        // does not close it either.
+        let mut s = Script::showing(Modifier::Alt);
+        s.moved(0.4, 600, 600);
+        s.tick_to(0.55);
+        let ask = s.last_ask().unwrap();
+        s.moved(0.56, AT.0 + 20, AT.1);
+        s.at(
+            0.57,
+            Input::Answer {
+                ask,
+                empty: false,
+                spot: Spot::Unknown,
+            },
+        );
+        assert_eq!(s.g.phase(), Phase::Showing);
+        assert_eq!(s.closes(), 0);
+    }
+
+    #[test]
+    fn releasing_alt_closes_the_menu_and_runs_nothing() {
         let mut s = Script::showing(Modifier::Alt);
         s.key(0.9, LALT, false);
-        assert_eq!(s.summons(), 0);
-        // The mask key was requested while Alt was still down (at show time), so the
+        assert_eq!(s.chooses(), 0);
+        // The mask key was requested while Alt was still down (at open time), so the
         // release is not a lone Alt.
         assert_eq!(s.masks(), 1);
         let mask = s
@@ -2430,8 +3530,8 @@ mod tests {
             .unwrap()
             .0;
         assert!(mask < 0.9);
-        // The release disarms and hides.
-        assert_eq!((s.disarms(), s.hides()), (1, 1));
+        // The release disarms and closes.
+        assert_eq!((s.disarms(), s.closes()), (1, 1));
         assert_eq!(s.g.phase(), Phase::Idle);
     }
 
@@ -2473,18 +3573,18 @@ mod tests {
             s.key(1.1, LALT, false);
             assert_eq!(s.g.phase(), Phase::Idle);
 
-            // After the pill showed (Alt held over the desktop, then Tab): the pill goes,
+            // After the menu opened (Alt held over the desktop, then Tab): the menu closes,
             // the gate is disarmed, nothing else happens; Alt stays down for the system.
             let mut s = Script::showing(Modifier::Alt);
             s.key(0.7, other, true);
             assert_eq!(s.g.phase(), Phase::Cancelled);
-            assert_eq!((s.disarms(), s.hides(), s.summons()), (1, 1, 0));
+            assert_eq!((s.disarms(), s.closes(), s.chooses()), (1, 1, 0));
             // More Tabs: nothing new.
             s.key(0.75, other, false)
                 .key(0.8, other, true)
                 .key(0.85, other, false);
             s.key(0.9, LALT, false);
-            assert_eq!((s.arms(), s.masks(), s.summons()), (1, 1, 0));
+            assert_eq!((s.arms(), s.masks(), s.chooses()), (1, 1, 0));
             assert_eq!(s.g.phase(), Phase::Idle);
         }
     }
@@ -2526,7 +3626,7 @@ mod tests {
     }
 
     #[test]
-    fn a_click_during_the_hold_before_the_pill_is_the_apps() {
+    fn a_click_during_the_hold_before_the_menu_is_the_apps() {
         let mut s = Script::new(Modifier::Alt);
         s.key(0.0, LALT, true).press(0.1, false);
         s.tick_to(1.0);
@@ -2575,45 +3675,51 @@ mod tests {
     }
 
     #[test]
-    fn leaving_empty_space_hides_the_pill_and_a_click_then_is_not_taken() {
+    fn leaving_empty_space_closes_the_menu_and_a_click_then_is_not_taken() {
         let mut s = Script::showing(Modifier::Alt);
-        // Move over a text field: a re-check after the gap says not empty.
-        s.moved(0.40, 300, 300);
-        s.tick_to(0.50);
+        // Move over a text field outside the menu: a re-check after the gap says not empty.
+        s.moved(0.40, 600, 600);
+        s.tick_to(0.55);
         assert_eq!(s.asks(), 2);
-        s.answer(0.52, false);
+        s.answer(0.56, false);
         assert_eq!(s.g.phase(), Phase::Looking);
-        assert_eq!((s.disarms(), s.hides()), (1, 1));
+        assert_eq!((s.disarms(), s.closes()), (1, 1));
         // A click now reaches us through the feed (the gate was disarmed, so the hook let
-        // it through to the app): it uses up the hold and makes nothing.
+        // it through to the app): it uses up the hold and runs nothing.
         s.press(0.6, false);
-        assert_eq!(s.summons(), 0);
+        assert_eq!(s.chooses(), 0);
         assert_eq!(s.g.phase(), Phase::Cancelled);
         assert_eq!(s.arms(), 1);
     }
 
     #[test]
-    fn back_on_empty_space_the_pill_returns_without_a_second_mask() {
+    fn back_on_empty_space_the_menu_opens_again_without_a_second_mask() {
         let mut s = Script::showing(Modifier::Alt);
-        s.moved(0.40, 300, 300);
-        s.tick_to(0.50);
-        s.answer(0.52, false);
-        s.moved(0.60, 100, 100);
+        s.moved(0.40, 600, 600);
+        s.tick_to(0.55);
+        s.answer(0.56, false);
+        s.moved(0.60, 800, 300);
         s.tick_to(0.70);
         s.answer(0.71, true);
         assert_eq!(s.g.phase(), Phase::Showing);
-        assert_eq!((s.arms(), s.shows(), s.masks()), (2, 2, 1));
+        assert_eq!((s.arms(), s.opens(), s.masks()), (2, 2, 1));
+        // At the new spot.
+        assert_eq!(s.layout().row_at((800, 300)), Some(0));
     }
 
     #[test]
-    fn rechecks_are_throttled_and_still_cursors_are_not_rechecked() {
+    fn rechecks_outside_the_menu_are_throttled_and_still_cursors_are_not_rechecked() {
         let mut s = Script::showing(Modifier::Alt);
         for i in 0..40 {
-            s.moved(0.37 + f64::from(i) * 0.005, 100 + i * 10, 100);
+            s.moved(0.37 + f64::from(i) * 0.005, 400 + i * 10, 400);
             if let Some(ask) = s.g.pending {
                 s.at(
                     0.37 + f64::from(i) * 0.005 + 0.001,
-                    Input::Answer { ask, empty: true },
+                    Input::Answer {
+                        ask,
+                        empty: true,
+                        spot: Spot::Desktop,
+                    },
                 );
             }
         }
@@ -2632,7 +3738,7 @@ mod tests {
     }
 
     #[test]
-    fn over_a_text_field_no_pill() {
+    fn over_a_text_field_no_menu() {
         let mut s = Script::new(Modifier::Alt);
         s.key(0.0, LALT, true);
         s.tick_to(0.35);
@@ -2645,7 +3751,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lookup_timeout_means_no_pill() {
+    fn a_lookup_timeout_means_no_menu() {
         let mut s = Script::new(Modifier::Alt);
         s.key(0.0, LALT, true);
         s.tick_to(0.35);
@@ -2676,10 +3782,10 @@ mod tests {
         s.key(0.0, LALT, true).at(0.1, Input::Blocked(true));
         s.tick_to(1.0);
         assert_eq!(s.asks(), 0);
-        // Blocked while the pill shows: it goes and the gate is disarmed.
+        // Blocked while the menu shows: it closes and the gate is disarmed.
         let mut s = Script::showing(Modifier::Alt);
         s.at(0.5, Input::Blocked(true));
-        assert_eq!((s.disarms(), s.hides()), (1, 1));
+        assert_eq!((s.disarms(), s.closes()), (1, 1));
         assert_eq!(s.g.phase(), Phase::Cancelled);
         // Unblocked: the next hold works.
         s.at(0.6, Input::Blocked(false))
@@ -2698,17 +3804,17 @@ mod tests {
         assert!(s.untouched());
         let mut s = Script::showing(Modifier::Alt);
         s.at(0.5, Input::Enabled(false));
-        assert_eq!((s.disarms(), s.hides()), (1, 1));
+        assert_eq!((s.disarms(), s.closes()), (1, 1));
     }
 
     #[test]
-    fn pen_and_touch_presses_never_summon() {
+    fn pen_and_touch_presses_never_run_a_tool() {
         // The gate does not take them (hook tests); they reach the feed and use up the hold.
         let mut s = Script::showing(Modifier::Alt);
         s.press(0.5, true);
-        assert_eq!(s.summons(), 0);
+        assert_eq!(s.chooses(), 0);
         assert_eq!(s.g.phase(), Phase::Cancelled);
-        assert_eq!((s.disarms(), s.hides()), (1, 1));
+        assert_eq!((s.disarms(), s.closes()), (1, 1));
     }
 
     #[test]
@@ -2730,7 +3836,7 @@ mod tests {
         };
         s.at(0.5, Input::KeysReset(held));
         assert_eq!(s.g.phase(), Phase::Cancelled);
-        assert_eq!((s.disarms(), s.hides()), (1, 1));
+        assert_eq!((s.disarms(), s.closes()), (1, 1));
         // The release the new hook sees ends it.
         s.key(0.9, LALT, false);
         assert_eq!(s.g.phase(), Phase::Idle);
@@ -2741,13 +3847,13 @@ mod tests {
     }
 
     #[test]
-    fn quit_mid_gesture_disarms_and_hides_at_once() {
+    fn quit_mid_gesture_disarms_and_closes_at_once() {
         let mut s = Script::showing(Modifier::Alt);
         s.at(0.5, Input::Shutdown);
         let last: Vec<Action> = s.actions.iter().rev().take(2).map(|(_, a)| *a).collect();
         assert!(last.contains(&Action::Disarm));
-        assert!(last.contains(&Action::Hide { animate: false }));
-        assert_eq!(s.summons(), 0);
+        assert!(last.contains(&Action::Close { animate: false }));
+        assert_eq!(s.chooses(), 0);
         assert_eq!(s.masks(), 1, "nothing new is injected on the way out");
         // Even idle, shutdown disarms (belt and braces).
         let mut s = Script::new(Modifier::Alt);
@@ -2759,9 +3865,9 @@ mod tests {
     fn ctrl_alt_mode() {
         // Either order of the two keys starts it; no mask key is needed or sent.
         let mut s = Script::showing(Modifier::CtrlAlt);
-        assert_eq!((s.arms(), s.masks(), s.shows()), (1, 0, 1));
-        s.at(0.5, Input::ClickTaken { x: 1, y: 2 });
-        assert_eq!(s.summons(), 1);
+        assert_eq!((s.arms(), s.masks(), s.opens()), (1, 0, 1));
+        s.at(0.5, Input::ClickTaken { x: AT.0, y: AT.1 });
+        assert_eq!(s.chooses(), 1);
         s.key(0.6, LALT, false);
         assert_eq!(s.g.phase(), Phase::Clicked, "Ctrl still down");
         s.key(0.7, LCTRL, false);
@@ -2771,6 +3877,11 @@ mod tests {
         s.key(0.0, LALT, true).key(0.05, LCTRL, true);
         s.tick_to(0.4);
         assert_eq!(s.asks(), 1);
+
+        // Releasing either key closes the menu.
+        let mut s = Script::showing(Modifier::CtrlAlt);
+        s.key(0.6, LCTRL, false);
+        assert_eq!((s.disarms(), s.closes(), s.chooses()), (1, 1, 0));
 
         // Alt alone does nothing in Ctrl+Alt mode.
         let mut s = Script::new(Modifier::CtrlAlt);
@@ -2794,24 +3905,24 @@ mod tests {
         let mut s = Script::showing(Modifier::Alt);
         s.at(0.5, Input::Modifier(Modifier::CtrlAlt));
         assert_eq!(s.g.phase(), Phase::Cancelled);
-        assert_eq!((s.disarms(), s.hides()), (1, 1));
+        assert_eq!((s.disarms(), s.closes()), (1, 1));
     }
 
     #[test]
-    fn a_click_taken_after_the_release_still_makes_its_note() {
+    fn a_click_taken_just_before_the_release_still_runs_its_tool() {
         // The hook took the click just before Alt went up, but the summoner saw the key
-        // first (different threads): the click is gone, so the note is made.
+        // first (different threads): the click is gone, so the tool under it runs.
         let mut s = Script::showing(Modifier::Alt);
         s.key(0.5, LALT, false);
-        s.at(0.5, Input::ClickTaken { x: 3, y: 4 });
-        assert_eq!(s.summons(), 1);
+        s.at(0.5, Input::ClickTaken { x: AT.0, y: AT.1 });
+        assert_eq!(s.chosen(), vec![ToolId::NewNote]);
         assert_eq!(s.g.phase(), Phase::Cooldown);
     }
 
     #[test]
     fn a_new_hold_in_the_cooldown_is_ignored_until_released() {
         let mut s = Script::showing(Modifier::Alt);
-        s.at(0.5, Input::ClickTaken { x: 3, y: 4 });
+        s.at(0.5, Input::ClickTaken { x: AT.0, y: AT.1 });
         s.key(0.6, LALT, false).key(0.7, LALT, true);
         s.tick_to(1.5);
         assert_eq!(s.g.phase(), Phase::Cancelled);
@@ -2828,64 +3939,340 @@ mod tests {
         assert!(!s.g.wants_moves());
     }
 
-    // --- The pill ---
+    // --- The menu opened without the gesture ---
 
-    #[test]
-    fn spring_starts_at_zero_overshoots_a_little_and_settles() {
-        assert_eq!(spring(0.0), 0.0);
-        assert_eq!(spring(APPEAR), 1.0);
-        let peak = (1..36)
-            .map(|i| spring(f64::from(i) * 0.01))
-            .fold(0.0, f64::max);
-        assert!(peak > 1.0 && peak < 1.08, "{peak}");
-        assert!((spring(APPEAR - 0.001) - 1.0).abs() < 0.01);
+    fn free_menu(context: ToolContext) -> Script {
+        let mut s = Script::with(Modifier::Alt, context);
+        // The shortcut's keys are down when it fires (Ctrl+Shift+M, say).
+        s.key(0.0, LCTRL, true)
+            .key(0.0, 0xA0, true)
+            .key(0.0, 0x4D, true);
+        let epoch = s.epoch;
+        s.at(0.01, Input::OpenMenu { point: AT, epoch });
+        s
     }
 
     #[test]
-    fn motion_runs_only_while_it_changes_and_is_instant_with_reduced_motion() {
-        let mut m = PillMotion::hidden();
-        assert!(!m.moving(0.0));
-        m.appear(1.0, true);
-        assert!(m.moving(1.1));
-        assert!(!m.moving(1.0 + APPEAR + 1e-9));
-        assert_eq!(m.value(1.0 + APPEAR + 1e-9), 1.0);
-        m.disappear(2.0, true);
-        assert!(m.moving(2.05));
-        assert_eq!(m.value(2.0 + DISAPPEAR + 1e-9), 0.0);
-        assert!(!m.moving(2.0 + DISAPPEAR + 1e-9));
-        // Reduced motion: no clock at all.
-        let mut m = PillMotion::hidden();
-        m.appear(1.0, false);
-        assert!(!m.moving(1.0));
-        assert_eq!(m.value(1.0), 1.0);
-        m.disappear(1.5, false);
-        assert_eq!(m.value(1.5), 0.0);
-        // Hiding half way through appearing shrinks from where it was.
-        let mut m = PillMotion::hidden();
-        m.appear(0.0, true);
-        let mid = m.value(0.05);
-        m.disappear(0.05, true);
-        assert!((m.value(0.05) - mid.clamp(0.0, 1.0)).abs() < 1e-9);
+    fn open_menu_at_cursor_shows_it_without_a_mask() {
+        let mut s = free_menu(both());
+        assert_eq!(s.g.phase(), Phase::Showing);
+        assert!(s.g.is_free());
+        assert_eq!((s.arms(), s.masks(), s.opens()), (1, 0, 1));
+        assert_eq!(s.asks(), 1, "a lookup only for the origin");
+        // The shortcut's keys come up: each release disarmed the gate in the hook, so it is
+        // armed again with that key's epoch; the menu stays.
+        s.key(0.05, 0x4D, false)
+            .key(0.06, 0xA0, false)
+            .key(0.07, LCTRL, false);
+        assert_eq!(s.arms(), 4);
+        assert!(
+            s.actions
+                .iter()
+                .any(|(_, a)| *a == Action::Arm { epoch: s.epoch })
+        );
+        assert_eq!(s.g.phase(), Phase::Showing);
+        // Any answer names the origin, even "not empty" (the cursor may be over a window).
+        s.answer(0.1, false);
+        assert_eq!(s.g.phase(), Phase::Showing);
+        // A click on the second row runs it, with the origin's lookup.
+        let second = s.layout().row(1);
+        s.at(
+            0.5,
+            Input::ClickTaken {
+                x: AT.0,
+                y: second.top + 2,
+            },
+        );
+        assert!(s.actions.iter().any(|(_, a)| matches!(
+            a,
+            Action::Choose {
+                tool: ToolId::RecordScreen,
+                ask: Some(1),
+                ..
+            }
+        )));
     }
 
     #[test]
-    fn the_pill_is_centred_and_fits_its_window() {
-        for scale in [1.0, 1.25, 1.5, 2.0] {
-            let (w, h) = pill_window_size(scale);
-            assert_eq!((w % 2, h % 2), (0, 0));
-            let mut pixmap = Pixmap::new(w, h).unwrap();
-            // At the spring's peak the plate still leaves a clear edge.
-            render_pill(&mut pixmap, 1.06, scale, false);
-            let alpha = |x: u32, y: u32| pixmap.pixel(x, y).unwrap().alpha();
-            assert_eq!(alpha(0, 0), 0);
-            assert_eq!(alpha(w - 1, h - 1), 0);
-            assert!(alpha(w / 2, h / 2) > 200);
-            // Symmetric left to right around the hot spot.
-            assert_eq!(alpha(w / 2 - 10, h / 2), alpha(w / 2 + 9, h / 2));
+    fn open_menu_at_cursor_closes_on_a_key_a_click_or_after_a_while() {
+        // A key press.
+        let mut s = free_menu(notes_only());
+        s.key(0.2, KEY_F, true);
+        assert_eq!((s.disarms(), s.closes(), s.chooses()), (1, 1, 0));
+        // A click outside (the gate takes it: swallowed, closes, runs nothing).
+        let mut s = free_menu(notes_only());
+        s.at(0.2, Input::ClickTaken { x: 900, y: 900 });
+        assert_eq!((s.closes(), s.chooses()), (1, 0));
+        // A click the gate did not take (another button).
+        let mut s = free_menu(notes_only());
+        s.press(0.2, false);
+        assert_eq!(s.closes(), 1);
+        // No pointer over it for MENU_IDLE.
+        let mut s = free_menu(notes_only());
+        s.key(0.05, 0x4D, false)
+            .key(0.06, 0xA0, false)
+            .key(0.07, LCTRL, false);
+        s.moved(1.0, AT.0 + 10, AT.1);
+        s.moved(2.0, 900, 900);
+        s.tick_to(1.0 + MENU_IDLE - 0.01);
+        assert_eq!(s.closes(), 0, "the pointer was over it at 1.0");
+        s.tick_to(1.0 + MENU_IDLE + 0.01);
+        assert_eq!((s.disarms(), s.closes()), (1, 1));
+        assert_eq!(s.g.phase(), Phase::Idle);
+        // Not while a hold is under way, blocked, or with no tool.
+        let mut s = Script::new(Modifier::Alt);
+        s.key(0.0, LALT, true);
+        s.at(
+            0.1,
+            Input::OpenMenu {
+                point: AT,
+                epoch: 1,
+            },
+        );
+        assert_eq!(s.opens(), 0);
+        let mut s = Script::with(Modifier::Alt, ToolContext::default());
+        s.at(
+            0.1,
+            Input::OpenMenu {
+                point: AT,
+                epoch: 0,
+            },
+        );
+        assert_eq!(s.opens(), 0);
+        let mut s = Script::new(Modifier::Alt);
+        s.at(0.0, Input::Blocked(true));
+        s.at(
+            0.1,
+            Input::OpenMenu {
+                point: AT,
+                epoch: 0,
+            },
+        );
+        assert_eq!(s.opens(), 0);
+    }
+
+    // --- Placement ---
+
+    #[test]
+    fn the_first_row_is_under_the_cursor_and_the_card_on_screen_near_every_edge() {
+        let monitors = [
+            Bounds {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040,
+            },
+            // Left of and above the primary, with a top taskbar.
+            Bounds {
+                left: -2560,
+                top: -1400,
+                right: 0,
+                bottom: 0,
+            },
+            Bounds {
+                left: 1920,
+                top: 48,
+                right: 3840,
+                bottom: 1080,
+            },
+        ];
+        for work in monitors {
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                for rows in [1, 2, 4] {
+                    let xs = [
+                        work.left,
+                        work.left + 3,
+                        work.left + 500,
+                        work.right - 200,
+                        work.right - 1,
+                    ];
+                    let ys = [
+                        work.top,
+                        work.top + 4,
+                        work.top + 400,
+                        work.bottom - 60,
+                        work.bottom - 10,
+                        work.bottom - 1,
+                    ];
+                    for &x in &xs {
+                        for &y in &ys {
+                            let l = menu_layout((x, y), rows, 220.0, work, scale);
+                            let what = format!("{work:?} at {x},{y}, {scale}x, {rows} rows");
+                            assert_eq!(l.row_at((x, y)), Some(0), "{what}");
+                            assert!(l.card.inside(&work), "{what}: {:?}", l.card);
+                            assert_eq!(l.card.height(), 2 * l.pad + rows as i32 * l.row_height);
+                            assert!(l.window.left < l.card.left && l.window.bottom > l.card.bottom);
+                        }
+                    }
+                }
+            }
         }
-        let mut pixmap = Pixmap::new(80, 60).unwrap();
-        render_pill(&mut pixmap, 0.0, 1.0, true);
-        assert!(pixmap.pixels().iter().all(|p| p.alpha() == 0));
+    }
+
+    #[test]
+    fn the_cursor_sits_at_the_anchor_away_from_edges_and_near_the_bottom_it_opens_upward() {
+        let l = menu_layout((500, 400), 2, 220.0, WORK, 1.0);
+        assert!(!l.upward);
+        assert_eq!(l.card.left, 500 - ANCHOR.0 as i32);
+        assert_eq!(l.row(0).top, 400 - ANCHOR.1 as i32);
+        assert!(l.row(1).top > l.row(0).top);
+        assert_eq!(l.row_at((520, 400 + 32)), Some(1));
+        // 125%: everything scales.
+        let l = menu_layout((500, 400), 2, 220.0, WORK, 1.25);
+        assert_eq!(l.row_height, 40);
+        assert_eq!(l.card.width(), 275);
+        // Near the bottom: upward, the first tool at the bottom, exactly where it would be.
+        let l = menu_layout((500, 1000), 2, 220.0, WORK, 1.0);
+        assert!(l.upward);
+        assert_eq!(l.row(0).top, 1000 - ANCHOR.1 as i32);
+        assert!(l.row(1).top < l.row(0).top);
+        assert_eq!(l.row_at((520, 1000 - 32)), Some(1));
+        // The padding counts as the nearest row; outside the card is no row.
+        let l = menu_layout((500, 400), 2, 220.0, WORK, 1.0);
+        assert_eq!(l.row_at((520, l.card.top)), Some(0));
+        assert_eq!(l.row_at((520, l.card.bottom - 1)), Some(1));
+        assert_eq!(l.row_at((520, l.card.bottom)), None);
+        assert_eq!(l.row_at((l.card.left - 1, 400)), None);
+    }
+
+    // --- Chips ---
+
+    #[test]
+    fn the_chips_come_from_the_current_shortcuts() {
+        let mut shortcuts = Shortcuts::defaults();
+        assert!(tool_chips(ToolId::NewNote, &shortcuts).is_empty());
+        assert_eq!(
+            tool_chips(ToolId::RecordScreen, &shortcuts),
+            vec!["Ctrl", "Shift", "6"]
+        );
+        shortcuts
+            .set(Shortcut::NewNote, Some(Chord::parse("Ctrl+Alt+N").unwrap()))
+            .unwrap();
+        shortcuts.set(Shortcut::ToggleRecording, None).unwrap();
+        assert_eq!(
+            tool_chips(ToolId::NewNote, &shortcuts),
+            Chord::parse("Ctrl+Alt+N").unwrap().chips()
+        );
+        assert!(tool_chips(ToolId::RecordScreen, &shortcuts).is_empty());
+    }
+
+    #[test]
+    fn tools_are_one_list_with_their_actions() {
+        assert_eq!(
+            TOOLS[0].id,
+            ToolId::NewNote,
+            "the note stays under the cursor"
+        );
+        assert_eq!(tool(ToolId::NewNote).action, Shortcut::NewNote);
+        assert_eq!(tool(ToolId::RecordScreen).action, Shortcut::ToggleRecording);
+        assert_eq!(ToolId::parse("record"), Some(ToolId::RecordScreen));
+        assert_eq!(ToolId::NewNote.id(), "note");
+        // In the app today recording is not built, so the menu has one row.
+        let app = ToolContext {
+            notes: true,
+            recording_available: Shortcut::ToggleRecording.available(),
+            recording_enabled: true,
+            ..ToolContext::default()
+        };
+        assert_eq!(offered(&app), vec![ToolId::NewNote]);
+    }
+
+    // --- Motion and drawing ---
+
+    #[test]
+    fn motion_runs_only_while_something_changes() {
+        let mut m = MenuMotion::hidden();
+        assert!(!m.frame(0.0).moving);
+        m.open(Some(0), 1000.0, true);
+        let f = m.frame(1000.0 + OPEN_MS / 2.0);
+        assert!(f.moving && f.alpha > 0.0 && f.alpha < 1.0 && f.rise > 0.0);
+        let f = m.frame(1000.0 + OPEN_MS + 1.0);
+        assert!(!f.moving);
+        assert_eq!((f.alpha, f.rise, f.highlight, f.lit), (1.0, 0.0, 0.0, 1.0));
+        // The highlight slides to the second row.
+        m.hover(Some(1), 2000.0);
+        let mid = m.frame(2000.0 + SLIDE_MS / 4.0);
+        assert!(mid.moving && mid.highlight > 0.0 && mid.highlight < 1.0);
+        assert_eq!(m.frame(2000.0 + SLIDE_MS + 1.0).highlight, 1.0);
+        assert!(!m.frame(2000.0 + SLIDE_MS + 1.0).moving);
+        // Chosen: a flash, then the fade, then gone.
+        m.choose(1, 3000.0);
+        m.close(3000.0, true);
+        let f = m.frame(3000.0 + FLASH_MS / 2.0);
+        assert!(f.flash > 0.0 && f.alpha == 1.0 && f.moving && !f.gone);
+        let f = m.frame(3000.0 + FLASH_MS + CLOSE_MS / 2.0);
+        assert!(f.alpha > 0.0 && f.alpha < 1.0);
+        let f = m.frame(3000.0 + FLASH_MS + CLOSE_MS + 1.0);
+        assert!(f.gone && !f.moving);
+        // Closing without a choice fades at once.
+        let mut m = MenuMotion::hidden();
+        m.open(Some(0), 0.0, true);
+        m.close(500.0, true);
+        assert!(m.frame(500.0 + CLOSE_MS / 2.0).alpha < 1.0);
+        assert!(m.frame(500.0 + CLOSE_MS + 1.0).gone);
+    }
+
+    #[test]
+    fn reduced_motion_is_instant() {
+        let mut m = MenuMotion::hidden();
+        m.open(Some(0), 0.0, false);
+        let f = m.frame(0.0);
+        assert_eq!((f.alpha, f.rise, f.moving), (1.0, 0.0, false));
+        m.hover(Some(1), 10.0);
+        assert_eq!(m.frame(10.0).highlight, 1.0);
+        assert!(!m.frame(10.0).moving);
+        m.choose(1, 20.0);
+        m.close(20.0, true);
+        let f = m.frame(20.0);
+        assert!(f.gone && !f.moving && f.flash == 0.0);
+    }
+
+    #[test]
+    fn the_menu_draws_inside_its_window() {
+        let rows = vec![
+            (ToolId::NewNote, Vec::new()),
+            (
+                ToolId::RecordScreen,
+                vec!["Ctrl".into(), "Shift".into(), "6".into()],
+            ),
+        ];
+        for scale in [1.0, 1.25] {
+            for dark in [false, true] {
+                let width = menu_width(&rows, scale);
+                assert!(width >= MENU_MIN_WIDTH);
+                let layout = menu_layout((300, 300), 2, width, WORK, scale);
+                let pixmap = render_menu(&MenuPicture {
+                    rows: &rows,
+                    layout: &layout,
+                    dark,
+                    highlight: 0.0,
+                    lit: 1.0,
+                    flash: 0.0,
+                })
+                .expect("drawn");
+                assert_eq!(pixmap.width() as i32, layout.window.width());
+                let alpha = |x: i32, y: i32| {
+                    pixmap
+                        .pixel(
+                            (x - layout.window.left) as u32,
+                            (y - layout.window.top) as u32,
+                        )
+                        .unwrap()
+                        .alpha()
+                };
+                // Corners of the window are clear; the card is opaque.
+                assert_eq!(alpha(layout.window.left, layout.window.top), 0);
+                assert_eq!(alpha(layout.window.right - 1, layout.window.top), 0);
+                let row = layout.row(1);
+                assert_eq!(alpha(row.left + 3, (row.top + row.bottom) / 2), 255);
+                // Fading multiplies every channel.
+                let mut faded = pixmap.clone();
+                apply_alpha(&mut faded, 0.5);
+                let x = (row.left + 3 - layout.window.left) as u32;
+                let y = ((row.top + row.bottom) / 2 - layout.window.top) as u32;
+                assert!((i32::from(faded.pixel(x, y).unwrap().alpha()) - 128).abs() <= 1);
+            }
+        }
     }
 
     #[test]
