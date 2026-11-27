@@ -12,13 +12,23 @@
 //! cost follows the current stroke, not the number of finished ones. Undo, clear, a resize, a
 //! scale change or a new highlighter stroke (which must stay under every pen stroke) rebuild
 //! the layer.
+//!
+//! The current stroke is not repainted whole on every frame. Its outline (from `freehand`)
+//! only changes near its end as points are added, so the frame compares the new outline with
+//! the previous one, takes the bounding box of the points that differ (old and new), and
+//! repaints just that rectangle: the committed layer is copied into a small scratch pixmap,
+//! the whole current path is filled into it with a translation (tiny-skia clips the path's
+//! edges to the scratch, so the cost follows the rectangle, not the stroke's length), and the
+//! scratch is copied back. Both outlines are closed polygons that agree outside the changed
+//! run, so the area where the fill changes is enclosed by the changed parts of the two
+//! outlines and lies inside that box.
 
-use igorio_core::freehand::PathCmd;
+use igorio_core::freehand::{self, PathCmd};
 use igorio_core::geom::Point;
 use igorio_core::ink::{Ink, InkTool, Stroke as InkStroke};
 use tiny_skia::{
-    Color, FillRule, Mask, Paint, Path, PathBuilder, Pixmap, Shader, Stroke as SkiaStroke,
-    Transform,
+    Color, FillRule, Mask, Paint, Path, PathBuilder, Pixmap, PixmapMut, Shader,
+    Stroke as SkiaStroke, Transform,
 };
 
 /// `InkStyle.penColor`: calibrated hue 212/360, saturation 0.72, brightness 0.88, alpha 1.
@@ -33,6 +43,8 @@ const SHADOW_OFFSET_Y: f64 = 0.5;
 /// `InkStyle.penWidth` / `highlighterWidth`, in points.
 const PEN_WIDTH: f64 = 5.0;
 const HIGHLIGHTER_WIDTH: f64 = 22.0;
+/// Extra pixels painted around a partial frame's part and not copied back.
+const PART_MARGIN: u32 = 4;
 
 /// A tiny-skia path plus its (physical) bounding box.
 struct Shape {
@@ -164,6 +176,10 @@ pub struct InkRenderer {
     blur: Vec<u8>,
     /// Running column sums for the vertical box-blur pass, reused every frame.
     column_sums: Vec<u32>,
+    /// The current stroke's outline (logical) as of the last frame, for the damage diff.
+    outline: Vec<Point>,
+    /// Pixels of the small scratch pixmap a partial frame is painted in.
+    scratch: Vec<u8>,
 }
 
 impl InkRenderer {
@@ -185,6 +201,8 @@ impl InkRenderer {
             shadow: Mask::new(1, 1).expect("1x1 ink mask"),
             blur: Vec::new(),
             column_sums: Vec::new(),
+            outline: Vec::new(),
+            scratch: Vec::new(),
         }
     }
 
@@ -286,20 +304,45 @@ impl InkRenderer {
             return;
         }
 
-        // The current stroke: its whole shape is repainted, never just the new segment, so the
-        // outline stays correct when the last points ease in.
-        let current_shape = current.and_then(|stroke| build_shape(stroke, false, scale));
-        if let Some(shape) = &current_shape {
-            damage_bounds = Some(match damage_bounds {
-                Some(bounds) => bounds.union(shape.bounds.expand(margin)),
-                None => shape.bounds.expand(margin),
-            });
-        }
-        if !full && let Some(old) = self.current_bounds {
-            damage_bounds = Some(match damage_bounds {
-                Some(bounds) => bounds.union(old),
-                None => old,
-            });
+        // The current stroke: its whole shape is filled, never just the new segment, so the
+        // outline stays correct when the last points ease in. Only the changed rectangle is
+        // painted, though (see the module comment).
+        let outline = current
+            .map(|stroke| outline_of(stroke, false))
+            .unwrap_or_default();
+        let current_shape = current.and_then(|_| shape_from_outline(&outline, scale, true));
+        let same_stroke = !layer_event
+            && !self.outline.is_empty()
+            && !outline.is_empty()
+            && match (self.current, current_sig) {
+                (Some(old), Some(new)) => {
+                    old.tool == new.tool && old.first == new.first && new.points >= old.points
+                }
+                _ => false,
+            };
+        if !full && same_stroke {
+            match changed_bounds(&self.outline, &outline, scale) {
+                None => {
+                    // More points, but the same outline.
+                    self.current = current_sig;
+                    self.surface = Some(surface);
+                    return;
+                }
+                Some(bounds) => damage_bounds = Some(bounds.expand(margin)),
+            }
+        } else {
+            if let Some(shape) = &current_shape {
+                damage_bounds = Some(match damage_bounds {
+                    Some(bounds) => bounds.union(shape.bounds.expand(margin)),
+                    None => shape.bounds.expand(margin),
+                });
+            }
+            if !full && let Some(old) = self.current_bounds {
+                damage_bounds = Some(match damage_bounds {
+                    Some(bounds) => bounds.union(old),
+                    None => old,
+                });
+            }
         }
 
         let region = if full {
@@ -312,48 +355,84 @@ impl InkRenderer {
             self.current_bounds = current_shape
                 .as_ref()
                 .map(|shape| shape.bounds.expand(margin));
+            self.outline = outline;
             self.opacity = opacity;
             self.surface = Some(surface);
             return;
         };
 
-        let faded = opacity < 1.0;
+        let current_tool = current.map(|stroke| stroke.tool());
+        if full {
+            self.paint_full(
+                pixmap,
+                rect,
+                current_shape.as_ref(),
+                current_tool,
+                scale,
+                opacity,
+            );
+        } else {
+            self.paint_part(
+                pixmap,
+                rect,
+                &outline,
+                current_shape.as_ref(),
+                current_tool,
+                scale,
+                opacity,
+            );
+        }
+
+        self.damage = Some(rect);
+        self.has_content = self.has_content || current_shape.is_some();
+        self.current = current_sig;
+        self.current_bounds = current_shape
+            .as_ref()
+            .map(|shape| shape.bounds.expand(margin));
+        self.outline = outline;
+        self.opacity = opacity;
+        self.surface = Some(surface);
+    }
+
+    /// Paints the whole frame straight into the output.
+    fn paint_full(
+        &mut self,
+        pixmap: &mut Pixmap,
+        rect: (u32, u32, u32, u32),
+        shape: Option<&Shape>,
+        tool: Option<InkTool>,
+        scale: f64,
+        opacity: f64,
+    ) {
         let units = alpha_units(opacity);
-        match current {
+        match (shape, tool) {
             // The highlighter's container is below the pen one, so the current highlighter is
             // painted first and the finished layer is composited over it.
-            Some(stroke) if stroke.tool() == InkTool::Highlighter => {
-                if let Some(shape) = &current_shape {
-                    clear_region(pixmap, rect);
-                    paint(
-                        pixmap,
-                        shape,
-                        InkTool::Highlighter,
-                        scale,
-                        opacity,
-                        &mut self.shadow,
-                        &mut self.blur,
-                        &mut self.column_sums,
-                        false,
-                    );
-                    composite_layer_over(&self.committed, pixmap, rect, units);
-                } else {
-                    copy_region(&self.committed, pixmap, rect);
-                    if faded {
-                        fade_region(pixmap, rect, units);
-                    }
-                }
+            (Some(shape), Some(InkTool::Highlighter)) => {
+                clear_region(pixmap, rect);
+                paint(
+                    pixmap,
+                    shape,
+                    InkTool::Highlighter,
+                    scale,
+                    opacity,
+                    &mut self.shadow,
+                    &mut self.blur,
+                    &mut self.column_sums,
+                    false,
+                );
+                composite_layer_over(&self.committed, pixmap, rect, units);
             }
             _ => {
                 copy_region(&self.committed, pixmap, rect);
-                if faded {
+                if opacity < 1.0 {
                     fade_region(pixmap, rect, units);
                 }
-                if let (Some(shape), Some(stroke)) = (&current_shape, current) {
+                if let (Some(shape), Some(tool)) = (shape, tool) {
                     paint(
                         pixmap,
                         shape,
-                        stroke.tool(),
+                        tool,
                         scale,
                         opacity,
                         &mut self.shadow,
@@ -364,15 +443,59 @@ impl InkRenderer {
                 }
             }
         }
+    }
 
-        self.damage = Some(rect);
-        self.has_content = self.has_content || current_shape.is_some();
-        self.current = current_sig;
-        self.current_bounds = current_shape
-            .as_ref()
-            .map(|shape| shape.bounds.expand(margin));
-        self.opacity = opacity;
-        self.surface = Some(surface);
+    /// Paints one rectangle through the scratch pixmap: the current path is filled with a
+    /// translation into a part pixmap around `rect`, so tiny-skia rasterizes only that part.
+    /// A curve that crosses the part's edge is cut there and tessellated anew, which can
+    /// move its pixels by one anti-aliasing step along its whole length, so the part is grown
+    /// until every curve of the outline that touches `rect` lies inside it ([`part_rect`]).
+    /// Only `rect` is copied back.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_part(
+        &mut self,
+        pixmap: &mut Pixmap,
+        rect: (u32, u32, u32, u32),
+        outline: &[Point],
+        shape: Option<&Shape>,
+        tool: Option<InkTool>,
+        scale: f64,
+        opacity: f64,
+    ) {
+        let (x, y, w, h) = part_rect(rect, outline, scale, pixmap.width(), pixmap.height());
+        let len = w as usize * h as usize * 4;
+        if self.scratch.len() < len {
+            self.scratch.resize(len, 0);
+        }
+        let units = alpha_units(opacity);
+        let Some(mut part) = PixmapMut::from_bytes(&mut self.scratch[..len], w, h) else {
+            return;
+        };
+        let shift = Transform::from_translate(-(x as f32), -(y as f32));
+        match (shape, tool) {
+            (Some(shape), Some(InkTool::Highlighter)) => {
+                part.data_mut().fill(0);
+                paint_live(
+                    &mut part,
+                    shape,
+                    InkTool::Highlighter,
+                    scale,
+                    opacity,
+                    shift,
+                );
+                layer_over_part(&self.committed, &mut part, (x, y), units);
+            }
+            _ => {
+                copy_into_part(&self.committed, &mut part, (x, y));
+                if opacity < 1.0 {
+                    fade_bytes(part.data_mut(), units);
+                }
+                if let (Some(shape), Some(tool)) = (shape, tool) {
+                    paint_live(&mut part, shape, tool, scale, opacity, shift);
+                }
+            }
+        }
+        copy_part_out(&self.scratch[..len], (x, y, w), pixmap, rect);
     }
 
     /// The rectangle that changed since the last `render`: `(x, y, width, height)` in physical
@@ -457,7 +580,24 @@ impl Default for InkRenderer {
 
 /// Builds the filled outline of a stroke in physical pixels.
 fn build_shape(stroke: &InkStroke, complete: bool, scale: f64) -> Option<Shape> {
-    let cmds = Ink::shape(stroke, complete);
+    shape_from_outline(&outline_of(stroke, complete), scale, false)
+}
+
+/// The outline polygon of a stroke in logical pixels (`Ink::shape` before `freehand::path`).
+fn outline_of(stroke: &InkStroke, complete: bool) -> Vec<Point> {
+    freehand::outline(stroke.points(), &Ink::options(stroke.tool()), complete)
+}
+
+/// The tiny-skia path through an outline, in physical pixels.
+///
+/// `live`: the path also gets an empty sub-path far above and left of any pixmap, so it is
+/// never "contained in the clip". tiny-skia then always builds its edges through the clipper,
+/// which splits curves at their x extrema as well; a path inside the clip would skip that
+/// split and tessellate a little differently. With the sub-path, a full frame and a part
+/// frame tessellate every curve inside the part the same way, so their pixels match. The
+/// sub-path is a vertical line drawn down and back up: it adds no coverage anywhere.
+fn shape_from_outline(outline: &[Point], scale: f64, live: bool) -> Option<Shape> {
+    let cmds = freehand::path(outline);
     if cmds.is_empty() {
         return None;
     }
@@ -488,10 +628,58 @@ fn build_shape(stroke: &InkStroke, complete: bool, scale: f64) -> Option<Shape> 
     if bounds.is_empty() {
         return None;
     }
+    if live {
+        builder.move_to(-1.0e6, -1.0e6);
+        builder.line_to(-1.0e6, -0.9e6);
+        builder.line_to(-1.0e6, -1.0e6);
+        builder.close();
+    }
     Some(Shape {
         path: builder.finish()?,
         bounds,
     })
+}
+
+/// The physical box around the parts of two outlines that differ, or `None` when they are
+/// the same. Curve `i` of `freehand::path` runs from the midpoint of points `i - 1` and `i`
+/// to that of `i` and `i + 1`, with `i` as its control point, so a changed point changes the
+/// curves `i - 1` to `i + 1`, and those lie within points `i - 2` to `i + 2`.
+fn changed_bounds(old: &[Point], new: &[Point], scale: f64) -> Option<Bounds> {
+    let same =
+        |a: &Point, b: &Point| a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits();
+    let shortest = old.len().min(new.len());
+    let prefix = old.iter().zip(new).take_while(|(a, b)| same(a, b)).count();
+    if prefix == old.len() && prefix == new.len() {
+        return None;
+    }
+    let suffix = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take(shortest - prefix)
+        .take_while(|(a, b)| same(a, b))
+        .count();
+    let mut bounds = Bounds::empty();
+    for points in [old, new] {
+        let n = points.len();
+        if n == 0 {
+            continue;
+        }
+        // The changed run is `prefix..n - suffix`, plus two neighbours on each side, wrapping
+        // around because the path is closed.
+        let first = prefix as isize - 2;
+        let last = (n - suffix) as isize + 1;
+        for index in first..=last {
+            let point = points[index.rem_euclid(n as isize) as usize];
+            let (x, y) = physical(point, scale)?;
+            bounds.add(x as f64, y as f64);
+        }
+    }
+    if bounds.is_empty() {
+        None
+    } else {
+        Some(bounds)
+    }
 }
 
 /// A point in physical pixels, rejected when it is not representable.
@@ -746,6 +934,177 @@ fn blend_shadow(pixmap: &mut Pixmap, mask: &Mask, rect: (u32, u32, u32, u32), st
     }
 }
 
+/// A live stroke into a part pixmap: the flat pen shadow, then the fill, both shifted.
+fn paint_live(
+    part: &mut PixmapMut,
+    shape: &Shape,
+    tool: InkTool,
+    scale: f64,
+    opacity: f64,
+    shift: Transform,
+) {
+    if opacity <= 0.0 {
+        return;
+    }
+    if tool == InkTool::Pen {
+        let alpha = color_alpha(SHADOW_ALPHA, opacity);
+        if alpha > 0 {
+            let paint = Paint {
+                shader: Shader::SolidColor(Color::from_rgba8(0, 0, 0, alpha)),
+                anti_alias: true,
+                ..Paint::default()
+            };
+            part.fill_path(
+                &shape.path,
+                &paint,
+                FillRule::Winding,
+                shift.pre_translate(0.0, (SHADOW_OFFSET_Y * scale) as f32),
+                None,
+            );
+        }
+    }
+    let (rgb, base_alpha) = match tool {
+        InkTool::Pen => (PEN_COLOR, 1.0),
+        InkTool::Highlighter => (HIGHLIGHTER_COLOR, HIGHLIGHTER_ALPHA),
+    };
+    let alpha = color_alpha(base_alpha, opacity);
+    if alpha == 0 {
+        return;
+    }
+    let paint = Paint {
+        shader: Shader::SolidColor(Color::from_rgba8(rgb[0], rgb[1], rgb[2], alpha)),
+        anti_alias: true,
+        ..Paint::default()
+    };
+    part.fill_path(&shape.path, &paint, FillRule::Winding, shift, None);
+}
+
+/// Copies the layer's pixels at `origin` (the part's size) into the part.
+fn copy_into_part(src: &Pixmap, part: &mut PixmapMut, origin: (u32, u32)) {
+    let (w, h) = (part.width() as usize, part.height() as usize);
+    let src_stride = src.width() as usize * 4;
+    let start = origin.0 as usize * 4;
+    let src_data = src.data();
+    let dst = part.data_mut();
+    for row in 0..h {
+        let from = (origin.1 as usize + row) * src_stride + start;
+        dst[row * w * 4..(row + 1) * w * 4].copy_from_slice(&src_data[from..from + w * 4]);
+    }
+}
+
+/// `composite_layer_over` for a part pixmap whose top-left is `origin` in the layer.
+fn layer_over_part(src: &Pixmap, part: &mut PixmapMut, origin: (u32, u32), units: u32) {
+    let (w, h) = (part.width() as usize, part.height() as usize);
+    let src_stride = src.width() as usize * 4;
+    let src_data = src.data();
+    let dst = part.data_mut();
+    let units = units.min(256);
+    for row in 0..h {
+        let src_row = (origin.1 as usize + row) * src_stride + origin.0 as usize * 4;
+        for column in 0..w {
+            let s = src_row + column * 4;
+            let d = (row * w + column) * 4;
+            over(&src_data[s..s + 4], &mut dst[d..d + 4], units);
+        }
+    }
+}
+
+/// One premultiplied pixel `src`, faded by `units / 256`, over `dst`.
+#[inline]
+fn over(src: &[u8], dst: &mut [u8], units: u32) {
+    let alpha = (src[3] as u32 * units + 128) >> 8;
+    if alpha == 0 {
+        return;
+    }
+    let red = ((src[0] as u32 * units + 128) >> 8).min(alpha);
+    let green = ((src[1] as u32 * units + 128) >> 8).min(alpha);
+    let blue = ((src[2] as u32 * units + 128) >> 8).min(alpha);
+    let keep = 255 - alpha;
+    let out_alpha = alpha + (dst[3] as u32 * keep + 127) / 255;
+    dst[0] = (red + (dst[0] as u32 * keep + 127) / 255).min(out_alpha) as u8;
+    dst[1] = (green + (dst[1] as u32 * keep + 127) / 255).min(out_alpha) as u8;
+    dst[2] = (blue + (dst[2] as u32 * keep + 127) / 255).min(out_alpha) as u8;
+    dst[3] = out_alpha as u8;
+}
+
+/// Multiplies premultiplied pixels by `units / 256`.
+fn fade_bytes(data: &mut [u8], units: u32) {
+    let units = units.min(256);
+    if units >= 256 {
+        return;
+    }
+    for pixel in data.as_chunks_mut::<4>().0 {
+        let alpha = (pixel[3] as u32 * units + 128) >> 8;
+        pixel[0] = ((pixel[0] as u32 * units + 128) >> 8).min(alpha) as u8;
+        pixel[1] = ((pixel[1] as u32 * units + 128) >> 8).min(alpha) as u8;
+        pixel[2] = ((pixel[2] as u32 * units + 128) >> 8).min(alpha) as u8;
+        pixel[3] = alpha as u8;
+    }
+}
+
+/// The part pixmap for a partial frame: `rect` grown to hold every curve of the live path
+/// that comes near it, plus [`PART_MARGIN`], clipped to a `width` by `height` pixmap. Each
+/// curve of `freehand::path` lies within its three outline points (`i - 1`, `i`, `i + 1`);
+/// the pen's flat shadow is the same path moved down by `SHADOW_OFFSET_Y`.
+fn part_rect(
+    rect: (u32, u32, u32, u32),
+    outline: &[Point],
+    scale: f64,
+    width: u32,
+    height: u32,
+) -> (u32, u32, u32, u32) {
+    let (x, y, w, h) = rect;
+    let near = Bounds {
+        min_x: f64::from(x),
+        min_y: f64::from(y),
+        max_x: f64::from(x + w),
+        max_y: f64::from(y + h),
+    }
+    .expand(2.0);
+    let offset = SHADOW_OFFSET_Y * scale;
+    let mut part = near;
+    let n = outline.len();
+    for i in 0..n {
+        let mut curve = Bounds::empty();
+        for point in [outline[(i + n - 1) % n], outline[i], outline[(i + 1) % n]] {
+            if let Some((px, py)) = physical(point, scale) {
+                curve.add(f64::from(px), f64::from(py));
+                curve.add(f64::from(px), f64::from(py) + offset);
+            }
+        }
+        let touches = curve.min_x <= near.max_x
+            && curve.max_x >= near.min_x
+            && curve.min_y <= near.max_y
+            && curve.max_y >= near.min_y;
+        if touches {
+            part = part.union(curve);
+        }
+    }
+    part.expand(f64::from(PART_MARGIN))
+        .clip(width, height)
+        .unwrap_or(rect)
+}
+
+/// Writes the `rect` part of a part pixmap (tightly packed, top-left `(px, py)`, `pw` wide)
+/// into the output at `rect`.
+fn copy_part_out(
+    part: &[u8],
+    (px, py, pw): (u32, u32, u32),
+    dst: &mut Pixmap,
+    rect: (u32, u32, u32, u32),
+) {
+    let (x, y, w, h) = rect;
+    let stride = dst.width() as usize * 4;
+    let part_stride = pw as usize * 4;
+    let len = w as usize * 4;
+    let data = dst.data_mut();
+    for row in 0..h as usize {
+        let to = (y as usize + row) * stride + x as usize * 4;
+        let from = (y - py) as usize * part_stride + row * part_stride + (x - px) as usize * 4;
+        data[to..to + len].copy_from_slice(&part[from..from + len]);
+    }
+}
+
 fn copy_region(src: &Pixmap, dst: &mut Pixmap, rect: (u32, u32, u32, u32)) {
     let (x, y, w, h) = rect;
     let src_stride = src.width() as usize * 4;
@@ -764,8 +1123,7 @@ fn copy_region(src: &Pixmap, dst: &mut Pixmap, rect: (u32, u32, u32, u32)) {
 /// Writes the finished layer (faded by `units`) over the current highlighter in the region.
 fn composite_layer_over(src: &Pixmap, dst: &mut Pixmap, rect: (u32, u32, u32, u32), units: u32) {
     let (x, y, w, h) = rect;
-    let width = dst.width() as usize;
-    let stride = width * 4;
+    let stride = dst.width() as usize * 4;
     let src_data = src.data();
     let dst_data = dst.data_mut();
     let units = units.min(256);
@@ -773,23 +1131,7 @@ fn composite_layer_over(src: &Pixmap, dst: &mut Pixmap, rect: (u32, u32, u32, u3
         let row_index = (y as usize + row) * stride;
         for column in 0..w as usize {
             let i = row_index + (x as usize + column) * 4;
-            let alpha = (src_data[i + 3] as u32 * units + 128) >> 8;
-            if alpha == 0 {
-                continue;
-            }
-            let red = ((src_data[i] as u32 * units + 128) >> 8).min(alpha);
-            let green = ((src_data[i + 1] as u32 * units + 128) >> 8).min(alpha);
-            let blue = ((src_data[i + 2] as u32 * units + 128) >> 8).min(alpha);
-            let keep = 255 - alpha;
-            let below_alpha = dst_data[i + 3] as u32;
-            let out_alpha = alpha + (below_alpha * keep + 127) / 255;
-            let out_red = red + (dst_data[i] as u32 * keep + 127) / 255;
-            let out_green = green + (dst_data[i + 1] as u32 * keep + 127) / 255;
-            let out_blue = blue + (dst_data[i + 2] as u32 * keep + 127) / 255;
-            dst_data[i] = out_red.min(out_alpha) as u8;
-            dst_data[i + 1] = out_green.min(out_alpha) as u8;
-            dst_data[i + 2] = out_blue.min(out_alpha) as u8;
-            dst_data[i + 3] = out_alpha as u8;
+            over(&src_data[i..i + 4], &mut dst_data[i..i + 4], units);
         }
     }
 }

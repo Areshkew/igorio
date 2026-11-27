@@ -9,10 +9,12 @@
 //! signals an event handle, and calls `CallNextHookEx`. No logging, COM, clipboard,
 //! process queries or heap allocation happen on that thread.
 //!
-//! It swallows exactly one kind of event: the press the [`CLICK_GATE`] is armed for, and the
-//! release of that press (the note gesture). The decision reads one atomic and compares
-//! ([`ClickGate::on_press`]); everything else goes on to `CallNextHookEx`. A swallowed
-//! press and release are not queued: to the rest of the app they did not happen.
+//! It swallows exactly two kinds of event: the press the [`CLICK_GATE`] is armed for, and the
+//! release of that press (the note gesture); and, while a recording runs and its zoom
+//! modifier is held, wheel events ([`WHEEL_GATE`]). Each decision reads one atomic and
+//! compares ([`ClickGate::on_press`], [`WheelGate::on_wheel`], which also reads the async
+//! key state); everything else goes on to `CallNextHookEx`. A swallowed event is not queued:
+//! to the rest of the app it did not happen.
 //! A panic inside the callback is caught, so it cannot unwind across the `extern "system"`
 //! boundary, and `CallNextHookEx` still runs.
 //!
@@ -79,7 +81,9 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::os::windows::io::AsRawHandle;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicIsize, AtomicU64, Ordering::Relaxed, Ordering::SeqCst,
+};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -97,7 +101,9 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, GetSystemMetricsForDpi,
     MDT_EFFECTIVE_DPI, SetThreadDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetDoubleClickTime, VK_CONTROL, VK_MENU,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, HC_ACTION, HHOOK, LLMHF_INJECTED,
     LLMHF_LOWER_IL_INJECTED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW,
@@ -532,6 +538,162 @@ impl Default for ClickGate {
     }
 }
 
+// MARK: Wheel gate
+
+/// Swallows wheel events while a recording runs and its zoom modifier is held: the zoom
+/// gesture of `recording::input`. The app under the cursor never sees those events.
+///
+/// Three facts decide, all read in the hook callback without a lock:
+/// - armed: a recording runs (`recording::input` arms the gate at start and disarms it at
+///   stop, on shutdown and when its thread ends however it ends);
+/// - held: the recording's keyboard hook saw exactly the modifier go down and stay down
+///   (it sets this bit on its own thread in input order, so it is current when the wheel
+///   event that follows a key change reaches the mouse hook);
+/// - the modifier keys are really down right now (`GetAsyncKeyState`). This check makes a
+///   stale `held` bit harmless: if the keyboard hook died without clearing it, a wheel event
+///   without the modifier still passes.
+///
+/// Injected wheel events are never taken. A taken event is not queued for the rest of the
+/// app (to it, the event did not happen); its delta is added up here instead and
+/// [`wake_handle`](Self::wake_handle) is set. The recording reads the sum with
+/// [`take`](Self::take).
+pub struct WheelGate {
+    /// [`WHEEL_ARMED`], [`WHEEL_HELD`], [`WHEEL_CTRL`].
+    state: AtomicU64,
+    /// Sum of the deltas taken and not yet read, in `WHEEL_DELTA` units (120 per notch).
+    delta: AtomicI64,
+    /// Events taken since start.
+    taken: AtomicU64,
+    /// An auto-reset event handle (0 until first asked for). Never closed.
+    wake: AtomicIsize,
+}
+
+/// A recording runs.
+const WHEEL_ARMED: u64 = 1;
+/// The zoom modifier is held, as the recording's keyboard hook saw it.
+const WHEEL_HELD: u64 = 2;
+/// The modifier is Ctrl+Alt: Ctrl must be down too.
+const WHEEL_CTRL: u64 = 4;
+
+/// The process's one wheel gate, read by the process's one mouse hook.
+pub static WHEEL_GATE: WheelGate = WheelGate::new();
+
+impl WheelGate {
+    pub const fn new() -> WheelGate {
+        WheelGate {
+            state: AtomicU64::new(0),
+            delta: AtomicI64::new(0),
+            taken: AtomicU64::new(0),
+            wake: AtomicIsize::new(0),
+        }
+    }
+
+    /// A recording started. `ctrl_too`: the modifier is Ctrl+Alt rather than Alt. Clears
+    /// `held` and any delta left from before.
+    pub fn arm(&self, ctrl_too: bool) {
+        self.delta.store(0, SeqCst);
+        self.state
+            .store(WHEEL_ARMED | if ctrl_too { WHEEL_CTRL } else { 0 }, SeqCst);
+    }
+
+    /// The recording stopped: nothing is taken any more, and the held bit is cleared.
+    pub fn disarm(&self) {
+        self.state.store(0, SeqCst);
+        self.delta.store(0, SeqCst);
+    }
+
+    /// Set by the recording's keyboard hook when the modifier goes down (alone) or up.
+    pub fn set_held(&self, held: bool) {
+        if held {
+            self.state.fetch_or(WHEEL_HELD, SeqCst);
+        } else {
+            self.state.fetch_and(!WHEEL_HELD, SeqCst);
+        }
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.state.load(SeqCst) & WHEEL_ARMED != 0
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.state.load(SeqCst) & WHEEL_HELD != 0
+    }
+
+    /// The decision for one wheel event, made in the hook callback. True: swallow it (its
+    /// delta is recorded). `keys_down(ctrl_too)` says whether Alt (and Ctrl when `ctrl_too`)
+    /// are down right now; it is asked only when armed and held.
+    pub fn on_wheel(
+        &self,
+        delta: i32,
+        injected: bool,
+        keys_down: impl FnOnce(bool) -> bool,
+    ) -> bool {
+        if injected {
+            return false;
+        }
+        let state = self.state.load(SeqCst);
+        if state & (WHEEL_ARMED | WHEEL_HELD) != WHEEL_ARMED | WHEEL_HELD {
+            return false;
+        }
+        if !keys_down(state & WHEEL_CTRL != 0) {
+            return false;
+        }
+        self.delta.fetch_add(i64::from(delta), SeqCst);
+        self.taken.fetch_add(1, SeqCst);
+        let wake = self.wake.load(SeqCst);
+        if wake != 0 {
+            // SAFETY: the handle was created by `wake_handle` and is never closed.
+            let _ = unsafe { SetEvent(HANDLE(wake as *mut _)) };
+        }
+        true
+    }
+
+    /// The delta taken since the last call (`WHEEL_DELTA` units), and the number of events
+    /// taken since start.
+    pub fn take(&self) -> (i64, u64) {
+        (self.delta.swap(0, SeqCst), self.taken.load(SeqCst))
+    }
+
+    /// An auto-reset event set after every taken event. Created on the first call (not in
+    /// the hook), never closed. Invalid if it could not be created.
+    pub fn wake_handle(&self) -> HANDLE {
+        let current = self.wake.load(SeqCst);
+        if current != 0 {
+            return HANDLE(current as *mut _);
+        }
+        // SAFETY: no pointers; auto-reset, not signalled, unnamed. Kept for the process's life.
+        let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
+            return HANDLE::default();
+        };
+        match self
+            .wake
+            .compare_exchange(0, event.0 as isize, SeqCst, SeqCst)
+        {
+            Ok(_) => event,
+            Err(existing) => {
+                // SAFETY: our own new handle, which nobody else saw.
+                let _ = unsafe { CloseHandle(event) };
+                HANDLE(existing as *mut _)
+            }
+        }
+    }
+}
+
+impl Default for WheelGate {
+    fn default() -> Self {
+        WheelGate::new()
+    }
+}
+
+/// Alt (and Ctrl when `ctrl_too`) down right now. Cheap: reads the async key state.
+fn zoom_keys_down(ctrl_too: bool) -> bool {
+    // SAFETY: plain value arguments; the high bit is set while the key is down.
+    unsafe {
+        GetAsyncKeyState(i32::from(VK_MENU.0)) < 0
+            && (!ctrl_too || GetAsyncKeyState(i32::from(VK_CONTROL.0)) < 0)
+    }
+}
+
 /// What the callback reaches. Only the hook thread touches it.
 struct Context {
     shared: Arc<Shared>,
@@ -646,14 +808,22 @@ fn handle(message: u32, info: &MSLLHOOKSTRUCT, started: Instant) -> bool {
                     injected,
                 })
             }
-            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => Some(MouseEvent::Wheel {
-                delta: (info.mouseData >> 16) as u16 as i16 as i32,
-                horizontal: message == WM_MOUSEHWHEEL,
-                x,
-                y,
-                time,
-                injected,
-            }),
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                let delta = (info.mouseData >> 16) as u16 as i16 as i32;
+                if WHEEL_GATE.on_wheel(delta, injected, zoom_keys_down) {
+                    // Taken by the recording's zoom: not queued.
+                    finish(&context.shared, started);
+                    return true;
+                }
+                Some(MouseEvent::Wheel {
+                    delta,
+                    horizontal: message == WM_MOUSEHWHEEL,
+                    x,
+                    y,
+                    time,
+                    injected,
+                })
+            }
             _ => None,
         };
         if let Some(event) = event {
@@ -1341,6 +1511,54 @@ mod tests {
         gate.withdraw();
         assert_eq!(gate.epoch(), after);
         assert!(!gate.arm(held, Button::Left));
+    }
+
+    // --- Wheel gate ---
+
+    #[test]
+    fn wheel_gate_takes_only_while_armed_held_and_the_keys_are_down() {
+        let gate = WheelGate::new();
+        // Not recording: nothing is taken, the keys are not even asked.
+        assert!(!gate.on_wheel(120, false, |_| panic!("asked")));
+        gate.set_held(true);
+        assert!(!gate.on_wheel(120, false, |_| panic!("asked")));
+        // Recording, modifier not held: a plain wheel event passes.
+        gate.arm(false);
+        assert!(!gate.on_wheel(120, false, |_| panic!("asked")));
+        gate.set_held(true);
+        // Held, but the keys are up now (a stale bit): passes.
+        assert!(!gate.on_wheel(120, false, |_| false));
+        // Held and down: taken, and the delta adds up.
+        assert!(gate.on_wheel(120, false, |ctrl| !ctrl));
+        assert!(gate.on_wheel(-240, false, |_| true));
+        assert_eq!(gate.take(), (-120, 2));
+        assert_eq!(gate.take(), (0, 2));
+        // Injected wheel events are never taken.
+        assert!(!gate.on_wheel(120, true, |_| true));
+        // Released: passes again.
+        gate.set_held(false);
+        assert!(!gate.on_wheel(120, false, |_| true));
+    }
+
+    #[test]
+    fn wheel_gate_disarm_releases_everything() {
+        let gate = WheelGate::new();
+        gate.arm(true);
+        gate.set_held(true);
+        assert!(gate.on_wheel(120, false, |ctrl| ctrl));
+        gate.disarm();
+        assert!(!gate.is_armed() && !gate.is_held());
+        assert!(!gate.on_wheel(120, false, |_| true));
+        assert_eq!(gate.take().0, 0);
+        // Ctrl+Alt mode asks for Ctrl too.
+        gate.arm(true);
+        gate.set_held(true);
+        let mut asked = None;
+        gate.on_wheel(120, false, |ctrl| {
+            asked = Some(ctrl);
+            true
+        });
+        assert_eq!(asked, Some(true));
     }
 
     #[test]
