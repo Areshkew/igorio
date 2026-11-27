@@ -1295,6 +1295,8 @@ fn overlay_hint(message: &str) -> String {
 }
 
 fn main() -> windows::core::Result<()> {
+    // First, so a panic or a fault anywhere below leaves a record in crash.log.
+    igorio_app::crash::install();
     overlay::ensure_dpi_awareness();
     let settings_path = settings::default_settings_path();
     let settings = LiveSettings::from(Settings::load(&settings_path).unwrap_or_default());
