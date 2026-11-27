@@ -409,13 +409,13 @@ impl Panel {
         let hide_all = child(
             w!("BUTTON"),
             w!("Hide all"),
-            BS_PUSHBUTTON as u32,
+            BS_OWNERDRAW as u32,
             HIDE_ALL_ID,
         )?;
         let show_all = child(
             w!("BUTTON"),
             w!("Show all"),
-            BS_PUSHBUTTON as u32,
+            BS_OWNERDRAW as u32,
             SHOW_ALL_ID,
         )?;
         let shown = (0..notes.len()).collect();
@@ -513,6 +513,25 @@ impl Panel {
 
     pub fn button_hwnds(&self) -> [HWND; 2] {
         self.state.buttons
+    }
+
+    /// For each button: is the control exactly where it is painted? (tests)
+    pub fn buttons_in_place(&self) -> [bool; 2] {
+        let s = &*self.state;
+        let painted = s.button_rects();
+        [0, 1].map(|index| {
+            let mut rect = RECT::default();
+            // SAFETY: our own button and panel; writable locals.
+            unsafe {
+                let _ = GetWindowRect(s.buttons[index], &mut rect);
+                let mut corners =
+                    [POINT { x: rect.left, y: rect.top }, POINT { x: rect.right, y: rect.bottom }];
+                MapWindowPoints(None, Some(s.hwnd), &mut corners);
+                let p = painted[index];
+                (corners[0].x, corners[0].y, corners[1].x, corners[1].y)
+                    == (p.left, p.top, p.right, p.bottom)
+            }
+        })
     }
 
     /// A new list (the notes changed): the filter and the selected note are kept.
@@ -1320,6 +1339,14 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             (s.request)(PanelRequest::Close);
         }
         WM_MOUSEACTIVATE => return LRESULT(MA_ACTIVATE as isize),
+        // The client area changes once the frame is taken away: the controls follow it, so
+        // they sit where they are painted.
+        WM_SIZE => {
+            s.layout();
+            s.invalidate();
+        }
+        // The buttons are painted by `button_proc`; the system draws nothing of its own.
+        WM_DRAWITEM => return LRESULT(1),
         WM_SETFOCUS => {
             // SAFETY: focus to our own filter field.
             let _ = unsafe { SetFocus(Some(s.edit)) };

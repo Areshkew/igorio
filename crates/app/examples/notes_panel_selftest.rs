@@ -340,6 +340,10 @@ fn run() -> Result<bool> {
     wait_state(&notes, trip, NoteState::Shown);
     wait(Duration::from_secs(3), || notes.test_idle());
     let buttons = notes.test_panel(|panel| panel.button_hwnds().map(|hwnd| hwnd.0 as isize)).unwrap_or_default();
+    checks.check(
+        "the Hide all and Show all controls are where they are painted",
+        notes.test_panel(|panel| panel.buttons_in_place()) == Some([true, true]),
+    );
     click(HWND(buttons[0] as *mut _));
     let hidden = wait(Duration::from_secs(3), || {
         notes.test_open_ids().is_empty()
