@@ -47,12 +47,13 @@
 //!   never opens the menu (or offers no tool), Alt+Tab, Alt+F4, Alt+letter and Alt+drag
 //!   never inject anything. If the menu shows over the desktop and the user then presses
 //!   Tab, Alt+Tab still works: Alt is still down.
-//! - **Mouse: one press and its release**, of the primary button, and only while the menu
-//!   shows: the summoner arms `hook::CLICK_GATE` when the menu opens and disarms it when it
-//!   closes. The app's single mouse hook decides in its callback from that one atomic
-//!   ([`crate::hook::ClickGate::on_press`]). The gate knows no rectangle, so while it is
-//!   armed it takes the next primary press wherever it lands: on a row it runs that tool,
-//!   anywhere else it only closes the menu (see "Clicks outside the menu" below). The
+//! - **Mouse: one press and its release**, of the primary button, only on the menu's card,
+//!   and only while the menu shows: the summoner arms `hook::CLICK_GATE` with the card's
+//!   screen rectangle when the menu opens and disarms it when it closes. The app's single
+//!   mouse hook decides in its callback from a few atomics
+//!   ([`crate::hook::ClickGate::on_press`]). A press on the card is swallowed and runs the
+//!   row under it; a press anywhere else disarms the gate and passes on, press and release,
+//!   to the app underneath, and the menu closes (see "Clicks outside the menu" below). The
 //!   keyboard hook disarms the gate on every key change, on its own thread, before Windows
 //!   passes on the next input, so a click right after Alt is released is never swallowed
 //!   even if the summoner thread is late. Pen and touch presses, injected presses and other
@@ -103,22 +104,22 @@
 //!   that times out means "not empty".
 //! - The row under the pointer is highlighted.
 //! - A click on a row runs that tool ([`SummonerEvent::ToolChosen`]); the point given is
-//!   where the menu opened. A click outside every row closes the menu with no tool.
+//!   where the menu opened. The card's padding counts as the nearest row. A click outside the
+//!   card closes the menu with no tool and reaches the app underneath.
 //! - Releasing the modifier, any other key, a button the gate did not take, being blocked or
 //!   disabled, a hook restart and quitting close it.
 //!
 //! # Clicks outside the menu
 //!
-//! The gate is decided in the mouse hook from one atomic and knows nothing of the menu's
-//! position, so today a primary click anywhere while the menu shows is swallowed; outside the
-//! rows it only closes the menu. To let such a click reach the app, `hook.rs` would need the
-//! armed rectangle: `ClickGate` gets two more `AtomicU64` fields with the menu card's screen
-//! rectangle (left and top packed as two `i32` in one, right and bottom in the other), stored
-//! by a new `arm_in(epoch, button, rect)` before its `state` compare-and-swap; `on_press`
-//! gains the point and, after the compare-and-swap that takes the gate (unchanged, so an
-//! outside press still disarms it), returns false when the point is outside the rectangle;
-//! the hook passes `x, y`. The summoner then sees that press in its feed, where it already
-//! closes the menu (the [`Gesture`]'s mouse rule), and the app gets the click.
+//! The gate is armed with the card's rectangle ([`crate::hook::ClickGate::arm_in`]), so the
+//! menu is opened first, placed, and only then armed: [`Action::Open`] comes before
+//! [`Action::Arm`], and the mask key after both (an arm that fails closes the menu before it
+//! is ever drawn, and sends no mask key). In the hook, any press while armed disarms the gate;
+//! only a press of the primary button inside the rectangle is swallowed, with its release.
+//! A press outside passes on with its release (the hook marks a release for swallowing only
+//! when it swallowed the press), so the app gets the whole click; the summoner sees that
+//! press in its feed and closes the menu (the [`Gesture`]'s mouse rule). A free menu that is
+//! armed again after a key release gets the same rectangle.
 //!
 //! # Opening the menu without the gesture
 //!
@@ -209,7 +210,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::context::{self, AppNames, facts_at, is_empty_space};
 use super::editor::{
-    GdiFonts, Palette, Surface, Transition, animation_effects, mix, px, rounded_path, system_dark,
+    GdiFonts, Palette, Surface, Transition, animation_effects, mix, px, system_dark,
 };
 use super::store::{NoteKind, NoteOrigin};
 use crate::hook::{self, Button, CLICK_GATE, MouseEvent};
@@ -886,7 +887,8 @@ pub enum Action {
         ask: u64,
         point: (i32, i32),
     },
-    /// Arm the click gate for the primary button, with this epoch.
+    /// Arm the click gate for the primary button, with this epoch, on the card of the menu
+    /// placed by the [`Action::Open`] before it ([`Gesture::card`]).
     Arm {
         epoch: u64,
     },
@@ -997,6 +999,14 @@ impl Gesture {
     /// The tools of the menu that shows (or showed last).
     pub fn tools(&self) -> &[ToolId] {
         self.menu.as_ref().map_or(&[], |menu| &menu.tools)
+    }
+
+    /// The card of the menu that shows, once placed: the click gate's rectangle.
+    pub fn card(&self) -> Option<Bounds> {
+        if self.phase != Phase::Showing {
+            return None;
+        }
+        self.menu.as_ref()?.layout.map(|layout| layout.card)
     }
 
     /// The menu shows and was opened without the gesture.
@@ -1283,12 +1293,13 @@ impl Gesture {
             return;
         }
         self.empty_ask = Some(ask);
+        // Placed first (the gate needs the card), then armed, then the mask key.
+        out.push(Action::Open { point: self.cursor });
         out.push(Action::Arm { epoch: self.epoch });
         if self.modifier == Modifier::Alt && !self.masked {
             self.masked = true;
             out.push(Action::Mask { epoch: self.epoch });
         }
-        out.push(Action::Open { point: self.cursor });
         self.menu = Some(Menu {
             tools,
             anchor: self.cursor,
@@ -1311,8 +1322,8 @@ impl Gesture {
         self.epoch = epoch;
         self.masked = true; // no modifier is held: never a mask key
         self.empty_ask = None;
-        out.push(Action::Arm { epoch });
         out.push(Action::Open { point });
+        out.push(Action::Arm { epoch });
         self.menu = Some(Menu {
             tools,
             anchor: point,
@@ -1712,6 +1723,7 @@ pub fn render_menu(picture: &MenuPicture) -> Option<Pixmap> {
             );
         }
         canvas.finish_labels();
+        canvas.opaque_inside(card, radius);
     }
     // The DIB is BGRA (the canvas fed colours with red and blue swapped): back to RGBA.
     let mut pixels = surface.pixels();
@@ -1719,34 +1731,7 @@ pub fn render_menu(picture: &MenuPicture) -> Option<Pixmap> {
         pixel.swap(0, 2);
     }
     let size = tiny_skia::IntSize::from_wh(w, h)?;
-    let mut pixmap = Pixmap::from_vec(pixels, size)?;
-    opaque_inside(&mut pixmap, card, radius);
-    Some(pixmap)
-}
-
-/// GDI leaves alpha at 0 where it drew text; everything fully inside the card is opaque, so
-/// those pixels get alpha 255 back. The card's antialiased edge is left as tiny-skia drew
-/// it (the editor's `Canvas::opaque_inside` scales edge pixels by their coverage a second
-/// time, which darkens the rim of a white card).
-fn opaque_inside(pixmap: &mut Pixmap, card: RECT, radius: f32) {
-    let Some(path) = rounded_path(card, radius) else {
-        return;
-    };
-    let Some(mut mask) = tiny_skia::Mask::new(pixmap.width(), pixmap.height()) else {
-        return;
-    };
-    mask.fill_path(&path, FillRule::Winding, true, Transform::identity());
-    for (pixel, cover) in pixmap
-        .data_mut()
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(mask.data())
-    {
-        if *cover == 255 {
-            pixel[3] = 255;
-        }
-    }
+    Pixmap::from_vec(pixels, size)
 }
 
 /// Multiplies a premultiplied pixmap by `alpha`.
@@ -2556,10 +2541,18 @@ impl Driver {
                 }
                 Action::Arm { epoch } => {
                     let button = primary_button();
-                    if CLICK_GATE.arm(epoch, button) {
-                        self.log(&format!("gate armed for {button:?} (epoch {epoch})"));
+                    // Only on the menu's card: a press elsewhere passes to the app.
+                    let armed = self.gesture.card().is_some_and(|card| {
+                        let area = (card.left, card.top, card.right, card.bottom);
+                        CLICK_GATE.arm_in(epoch, button, area)
+                    });
+                    if armed {
+                        self.log(&format!(
+                            "gate armed for {button:?} on the menu {:?} (epoch {epoch})",
+                            self.gesture.card()
+                        ));
                     } else {
-                        self.log("gate refused (a key changed): no menu");
+                        self.log("gate refused (a key changed, or no menu placed): no menu");
                         let more = self.gesture.step(Input::ArmFailed, now);
                         self.execute(more);
                         return;
@@ -3347,16 +3340,14 @@ mod tests {
                 .iter()
                 .any(|(_, a)| *a == Action::Mask { epoch: 1 })
         );
-        // Arm comes before open: a click is never shown a menu that cannot take it.
-        let arm = s
-            .actions
-            .iter()
-            .position(|(_, a)| matches!(a, Action::Arm { .. }));
-        let open = s
-            .actions
-            .iter()
-            .position(|(_, a)| matches!(a, Action::Open { .. }));
-        assert!(arm < open);
+        // Open (and placed) comes before the arm, which needs the card; the mask comes last,
+        // so a refused arm sends no mask. The menu is drawn only after all of them ran.
+        let at = |f: fn(&Action) -> bool| s.actions.iter().position(|(_, a)| f(a));
+        let open = at(|a| matches!(a, Action::Open { .. }));
+        let arm = at(|a| matches!(a, Action::Arm { .. }));
+        let mask = at(|a| matches!(a, Action::Mask { .. }));
+        assert!(open < arm && arm < mask);
+        assert_eq!(s.g.card(), Some(s.layout().card));
         // The click where the cursor already is: the first row.
         s.at(0.5, Input::ClickTaken { x: AT.0, y: AT.1 });
         let chosen = s.actions.iter().find_map(|(_, a)| match a {
@@ -3460,22 +3451,82 @@ mod tests {
         assert_eq!(s.g.phase(), Phase::Clicked);
     }
 
+    /// The gate as the driver arms it for the scripted menu.
+    fn armed_gate(s: &Script) -> hook::ClickGate {
+        let gate = hook::ClickGate::new();
+        let epoch = gate.epoch();
+        let card = s.g.card().expect("the menu shows");
+        assert!(gate.arm_in(
+            epoch,
+            Button::Left,
+            (card.left, card.top, card.right, card.bottom)
+        ));
+        gate
+    }
+
     #[test]
-    fn a_click_outside_every_row_closes_with_no_tool() {
+    fn a_click_outside_the_menu_closes_it_and_passes_through() {
         let mut s = Script::showing_with(Modifier::Alt, both());
         // Outside the card but still over empty space (the re-check says so).
         s.moved(0.4, 600, 600);
         s.tick_to(0.55);
         s.answer(0.56, true);
         assert_eq!(s.g.phase(), Phase::Showing);
-        // The gate takes any primary press while armed (it knows no rectangle): swallowed,
-        // and it only closes the menu.
+        // The hook: a press outside the card is not taken (the gate is disarmed), and no
+        // release is marked for swallowing, so the app gets the press and its release.
+        let gate = armed_gate(&s);
+        assert!(!gate.on_press(Button::Left, false, false, 600, 600));
+        assert!(!gate.is_armed());
+        let mut pending = None;
+        assert!(!hook::swallows_release(&mut pending, Button::Left, false));
+        // The summoner sees that press in its feed: the menu closes, nothing runs.
+        s.at(
+            0.7,
+            Input::Mouse(MouseEvent::Down {
+                button: Button::Left,
+                x: 600,
+                y: 600,
+                time: 0.7,
+                click_count: 1,
+                injected: false,
+                window: 0,
+                touch: false,
+            }),
+        );
+        assert_eq!(s.chooses(), 0);
+        assert_eq!((s.disarms(), s.closes()), (1, 1));
+        assert_eq!(s.g.phase(), Phase::Cancelled);
+        s.release(0.75);
+        s.key(0.9, LALT, false);
+        assert_eq!(s.g.phase(), Phase::Idle, "no cooldown: nothing ran");
+        // The card's padding is part of the menu: a press there is taken and runs the row.
+        let mut s = Script::showing_with(Modifier::Alt, both());
+        let card = s.layout().card;
+        let gate = armed_gate(&s);
+        assert!(gate.on_press(Button::Left, false, false, card.left, card.bottom - 1));
+        s.at(
+            0.5,
+            Input::ClickTaken {
+                x: card.left,
+                y: card.bottom - 1,
+            },
+        );
+        assert_eq!(s.chosen(), vec![ToolId::RecordScreen]);
+        // Just outside the card: passes.
+        let s = Script::showing_with(Modifier::Alt, both());
+        let gate = armed_gate(&s);
+        assert!(!gate.on_press(Button::Left, false, false, card.left - 1, AT.1));
+    }
+
+    #[test]
+    fn a_click_taken_outside_every_row_still_only_closes() {
+        // Cannot come from the hook now (it takes presses on the card only, and the whole
+        // card is rows); kept safe anyway: a taken click with no row runs nothing.
+        let mut s = Script::showing_with(Modifier::Alt, both());
         s.at(0.7, Input::ClickTaken { x: 600, y: 600 });
         assert_eq!(s.chooses(), 0);
         assert_eq!(s.closes(), 1);
         assert_eq!(s.g.phase(), Phase::Cancelled);
-        s.key(0.9, LALT, false);
-        assert_eq!(s.g.phase(), Phase::Idle, "no cooldown: nothing ran");
     }
 
     #[test]
@@ -3999,9 +4050,24 @@ mod tests {
         let mut s = free_menu(notes_only());
         s.key(0.2, KEY_F, true);
         assert_eq!((s.disarms(), s.closes(), s.chooses()), (1, 1, 0));
-        // A click outside (the gate takes it: swallowed, closes, runs nothing).
+        // A click outside: the gate is armed on the card only, so it passes to the app; the
+        // feed closes the menu and runs nothing.
         let mut s = free_menu(notes_only());
-        s.at(0.2, Input::ClickTaken { x: 900, y: 900 });
+        let gate = armed_gate(&s);
+        assert!(!gate.on_press(Button::Left, false, false, 900, 900));
+        s.at(
+            0.2,
+            Input::Mouse(MouseEvent::Down {
+                button: Button::Left,
+                x: 900,
+                y: 900,
+                time: 0.2,
+                click_count: 1,
+                injected: false,
+                window: 0,
+                touch: false,
+            }),
+        );
         assert_eq!((s.closes(), s.chooses()), (1, 0));
         // A click the gate did not take (another button).
         let mut s = free_menu(notes_only());

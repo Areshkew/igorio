@@ -3961,8 +3961,11 @@ impl Canvas<'_> {
         }
     }
 
-    /// GDI leaves alpha at 0; inside the card everything is opaque. Sets alpha 255 there
-    /// (premultiplied colours stay as drawn).
+    /// GDI leaves alpha at 0 where it drew; inside the card everything is opaque. Sets alpha
+    /// 255 there (premultiplied colours stay as drawn). On the card's antialiased edge, a
+    /// pixel tiny-skia drew already holds its premultiplied colour and alpha and stays as it
+    /// is; only a pixel whose alpha GDI cleared (alpha 0) is made the card's colour at that
+    /// coverage. (Scaling every edge pixel by its coverage applied it twice: a dark rim.)
     pub fn opaque_inside(&mut self, card: RECT, radius: f32) {
         let Some(path) = rounded_path(card, radius) else { return };
         let mut mask =
@@ -3977,8 +3980,8 @@ impl Canvas<'_> {
             let pixel = &mut pixels[index * 4..index * 4 + 4];
             if *cover == 255 {
                 pixel[3] = 255;
-            } else {
-                // Edge pixels: the shape's own antialiased coverage over the shadow.
+            } else if pixel[3] == 0 {
+                // An edge pixel GDI wrote (opaque colour, alpha 0): the card's coverage.
                 let a = u16::from(*cover);
                 for channel in &mut pixel[..3] {
                     *channel = ((u16::from(*channel) * a) / 255) as u8;

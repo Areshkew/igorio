@@ -27,9 +27,13 @@ under the cursor.
    menu, slowly and fast, including its edges. Must: the menu stays open, no `lookup` line
    while the pointer is inside it, the highlight follows the row under the pointer.
 5. **A click outside.** Hold Alt until the menu opens, move off the menu onto empty desktop
-   and click. Must: the menu closes, no `TOOL` line, and the click is swallowed (`swallowed
-   press`; the desktop does not start a selection). This is the known limit of today's
-   click gate (see the module docs of `notes::summoner`, "Clicks outside the menu").
+   and click. Must: the menu closes, no `TOOL` line, no `swallowed press` line, and the
+   desktop gets the click (it deselects its icons; press and drag instead and a selection
+   rectangle starts, so the app got the press and, on letting go, the release). Repeat in a
+   Notepad window: hold Alt over its status bar gap until the menu opens (if it does), then
+   click into the text: the caret moves there. Also click just outside the menu's rounded
+   edge, in its shadow: that click passes too. A click on the card's padding above the first
+   row or below the last runs that row.
 6. **Near each screen edge.** Hold Alt with the cursor a few pixels from the left, right,
    top and bottom edges of the work area (just above the taskbar), and in each corner, on
    every monitor you have (and one at 125% or 150% if you can). Must: the whole menu is on

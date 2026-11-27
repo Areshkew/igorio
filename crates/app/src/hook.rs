@@ -9,8 +9,9 @@
 //! signals an event handle, and calls `CallNextHookEx`. No logging, COM, clipboard,
 //! process queries or heap allocation happen on that thread.
 //!
-//! It swallows exactly two kinds of event: the press the [`CLICK_GATE`] is armed for, and the
-//! release of that press (the note gesture); and, while a recording runs and its zoom
+//! It swallows exactly two kinds of event: the press the [`CLICK_GATE`] is armed for (inside
+//! its rectangle: the tool menu at the cursor), and the release of that press; and, while a
+//! recording runs and its zoom
 //! modifier is held, wheel events ([`WHEEL_GATE`]). Each decision reads one atomic and
 //! compares ([`ClickGate::on_press`], [`WheelGate::on_wheel`], which also reads the async
 //! key state); everything else goes on to `CallNextHookEx`. A swallowed event is not queued:
@@ -360,24 +361,31 @@ impl Shared {
 
 // MARK: Click gate
 
-/// Swallows one press of one button, and its release, on request: the click that makes a
-/// note while the summon pill shows (`notes::summoner`).
+/// Swallows one press of one button inside one screen rectangle, and its release, on request:
+/// the click on the tool menu at the cursor (`notes::summoner`).
 ///
-/// The summoner arms the gate only while the pill shows, with the epoch it read when the
-/// modifier went down. The keyboard hook of the summoner calls [`disarm`](Self::disarm) on
+/// The summoner arms the gate only while the menu shows, with the epoch it read when the
+/// modifier went down and the menu card's rectangle ([`arm_in`](Self::arm_in)). The keyboard hook of the summoner calls [`disarm`](Self::disarm) on
 /// every key change, which also moves the epoch on: an arm based on an older key state
 /// fails, and a released modifier or a typed key disarms at once, on the hook thread,
 /// before Windows passes the next input on (low-level hooks are called in input order).
 ///
 /// The mouse hook asks [`on_press`](Self::on_press) on every press: one load, and a
-/// compare-and-swap only when armed. A press of the armed button that is not injected and
-/// not pen or touch takes the gate (it is disarmed) and is swallowed; any other press while
-/// armed disarms it. The matching release is swallowed by the hook's own state. The taken
-/// click's point and time are kept here and [`wake_handle`](Self::wake_handle) is set.
+/// compare-and-swap and two more loads only when armed. Any press while armed (that is not
+/// injected) disarms the gate. It is swallowed only when it is of the armed button, not pen
+/// or touch, and inside the rectangle; any other press, including one outside the rectangle,
+/// passes on with its release, so the app below gets the whole click. The matching release
+/// of a swallowed press is swallowed by the hook's own state. The taken click's point and
+/// time are kept here and [`wake_handle`](Self::wake_handle) is set.
 pub struct ClickGate {
     /// Bits 0 to 7: the armed button ([`button_code`]), 0 when not armed. Bits 8 and up:
     /// the epoch.
     state: AtomicU64,
+    /// The armed rectangle, physical pixels, right and bottom exclusive: left in the high 32
+    /// bits and top in the low of `area_lt`, right and bottom likewise in `area_rb`. Written
+    /// before the arm's compare-and-swap, so a press that sees the gate armed sees it.
+    area_lt: AtomicU64,
+    area_rb: AtomicU64,
     /// Clicks taken since start.
     taken: AtomicU64,
     /// Point of the last taken click: x in the high 32 bits, y in the low.
@@ -415,10 +423,20 @@ pub fn button_code(button: Button) -> u64 {
 
 const ARM_BITS: u64 = 0xFF;
 
+fn pack(a: i32, b: i32) -> u64 {
+    ((a as u32 as u64) << 32) | b as u32 as u64
+}
+
+fn unpack(v: u64) -> (i32, i32) {
+    ((v >> 32) as u32 as i32, v as u32 as i32)
+}
+
 impl ClickGate {
     pub const fn new() -> ClickGate {
         ClickGate {
             state: AtomicU64::new(0),
+            area_lt: AtomicU64::new(0),
+            area_rb: AtomicU64::new(0),
             taken: AtomicU64::new(0),
             taken_point: AtomicU64::new(0),
             taken_time: AtomicU64::new(0),
@@ -432,9 +450,22 @@ impl ClickGate {
         self.state.load(SeqCst) >> 8
     }
 
-    /// Arms the gate for one press of `button`, if the epoch is still `epoch` and the gate
-    /// is not armed. False when a key changed since (the caller must not show the pill).
+    /// Arms the gate for one press of `button` anywhere on the screen. See
+    /// [`arm_in`](Self::arm_in).
     pub fn arm(&self, epoch: u64, button: Button) -> bool {
+        self.arm_in(epoch, button, (i32::MIN, i32::MIN, i32::MAX, i32::MAX))
+    }
+
+    /// Arms the gate for one press of `button` inside `area` (left, top, right, bottom;
+    /// physical pixels, right and bottom exclusive), if the epoch is still `epoch` and the
+    /// gate is not armed. False when a key changed since (the caller must not show the menu)
+    /// or it is armed already. The gate has one arming caller (the summoner thread).
+    pub fn arm_in(&self, epoch: u64, button: Button, area: (i32, i32, i32, i32)) -> bool {
+        if self.is_armed() {
+            return false;
+        }
+        self.area_lt.store(pack(area.0, area.1), SeqCst);
+        self.area_rb.store(pack(area.2, area.3), SeqCst);
         self.state
             .compare_exchange(epoch << 8, epoch << 8 | button_code(button), SeqCst, SeqCst)
             .is_ok()
@@ -460,10 +491,11 @@ impl ClickGate {
         self.state.load(SeqCst) & ARM_BITS != 0
     }
 
-    /// The decision for one press, made in the hook callback. True: swallow it (the gate
-    /// was armed for this button and is now taken). Injected presses never touch the gate;
-    /// any other press while armed disarms it.
-    pub fn on_press(&self, button: Button, injected: bool, touch: bool) -> bool {
+    /// The decision for one press at (`x`, `y`), made in the hook callback. True: swallow it
+    /// (the gate was armed for this button, the press is inside its rectangle, and the gate
+    /// is now taken). Injected presses never touch the gate; any other press while armed
+    /// disarms it and passes.
+    pub fn on_press(&self, button: Button, injected: bool, touch: bool, x: i32, y: i32) -> bool {
         if injected {
             return false;
         }
@@ -478,14 +510,18 @@ impl ClickGate {
             .compare_exchange(state, next, SeqCst, SeqCst)
             .is_ok();
         // A disarm that raced with us already did what the else branch would.
-        taken && armed == button_code(button) && !touch
+        if !taken || armed != button_code(button) || touch {
+            return false;
+        }
+        let (left, top) = unpack(self.area_lt.load(SeqCst));
+        let (right, bottom) = unpack(self.area_rb.load(SeqCst));
+        x >= left && x < right && y >= top && y < bottom
     }
 
     /// Records a taken click and wakes the waiter. Called by the hook after `on_press` said
     /// true.
     fn record(&self, x: i32, y: i32, time: f64) {
-        self.taken_point
-            .store(((x as u32 as u64) << 32) | y as u32 as u64, SeqCst);
+        self.taken_point.store(pack(x, y), SeqCst);
         self.taken_time.store(time.to_bits(), SeqCst);
         self.taken.fetch_add(1, SeqCst);
         let wake = self.wake.load(SeqCst);
@@ -498,11 +534,11 @@ impl ClickGate {
     /// The last taken click (count 0: none yet).
     pub fn taken(&self) -> TakenClick {
         let count = self.taken.load(SeqCst);
-        let point = self.taken_point.load(SeqCst);
+        let (x, y) = unpack(self.taken_point.load(SeqCst));
         TakenClick {
             count,
-            x: (point >> 32) as u32 as i32,
-            y: point as u32 as i32,
+            x,
+            y,
             time: f64::from_bits(self.taken_time.load(SeqCst)),
         }
     }
@@ -763,7 +799,7 @@ fn handle(message: u32, info: &MSLLHOOKSTRUCT, started: Instant) -> bool {
                     _ => xbutton,
                 };
                 let touch = is_pen_or_touch(info.dwExtraInfo);
-                if CLICK_GATE.on_press(button, injected, touch) {
+                if CLICK_GATE.on_press(button, injected, touch, x, y) {
                     context.swallow_release = Some(button);
                     CLICK_GATE.record(x, y, time);
                     finish(&context.shared, started);
@@ -1441,7 +1477,7 @@ mod tests {
     fn unarmed_gate_lets_every_press_through() {
         let gate = ClickGate::new();
         for button in [Button::Left, Button::Right, Button::Middle] {
-            assert!(!gate.on_press(button, false, false));
+            assert!(!gate.on_press(button, false, false, 0, 0));
         }
         assert!(!gate.is_armed());
     }
@@ -1451,10 +1487,10 @@ mod tests {
         let gate = ClickGate::new();
         let epoch = gate.epoch();
         assert!(gate.arm(epoch, Button::Left));
-        assert!(gate.on_press(Button::Left, false, false));
+        assert!(gate.on_press(Button::Left, false, false, 0, 0));
         // Only that one: the next press passes.
         assert!(!gate.is_armed());
-        assert!(!gate.on_press(Button::Left, false, false));
+        assert!(!gate.on_press(Button::Left, false, false, 0, 0));
         let mut pending = Some(Button::Left);
         assert!(!swallows_release(&mut pending, Button::Right, false));
         assert!(!swallows_release(&mut pending, Button::Left, true));
@@ -1467,14 +1503,14 @@ mod tests {
         let gate = ClickGate::new();
         assert!(gate.arm(gate.epoch(), Button::Left));
         // Injected presses do not even look at the gate.
-        assert!(!gate.on_press(Button::Left, true, false));
+        assert!(!gate.on_press(Button::Left, true, false, 0, 0));
         assert!(gate.is_armed());
         // Another button disarms.
-        assert!(!gate.on_press(Button::Right, false, false));
+        assert!(!gate.on_press(Button::Right, false, false, 0, 0));
         assert!(!gate.is_armed());
         // A pen or touch press of the armed button disarms and passes.
         assert!(gate.arm(gate.epoch(), Button::Left));
-        assert!(!gate.on_press(Button::Left, false, true));
+        assert!(!gate.on_press(Button::Left, false, true, 0, 0));
         assert!(!gate.is_armed());
     }
 
@@ -1485,10 +1521,10 @@ mod tests {
         assert!(gate.arm(held, Button::Left));
         let after = gate.disarm(); // the modifier went up (keyboard hook)
         assert_eq!(after, held + 1);
-        assert!(!gate.on_press(Button::Left, false, false));
+        assert!(!gate.on_press(Button::Left, false, false, 0, 0));
         // The summoner, a step behind, tries to arm with the old epoch: refused.
         assert!(!gate.arm(held, Button::Left));
-        assert!(!gate.on_press(Button::Left, false, false));
+        assert!(!gate.on_press(Button::Left, false, false, 0, 0));
         // Arming twice is refused too.
         assert!(gate.arm(after, Button::Left));
         assert!(!gate.arm(after, Button::Right));
@@ -1501,9 +1537,9 @@ mod tests {
         assert!(gate.arm(held, Button::Left));
         gate.withdraw(); // the cursor left empty space
         assert!(!gate.is_armed());
-        assert!(!gate.on_press(Button::Left, false, false));
+        assert!(!gate.on_press(Button::Left, false, false, 0, 0));
         assert!(gate.arm(held, Button::Left)); // and came back
-        assert!(gate.on_press(Button::Left, false, false));
+        assert!(gate.on_press(Button::Left, false, false, 0, 0));
         // After a key change, withdrawing does not bring an old epoch back.
         let held = gate.epoch();
         assert!(gate.arm(held, Button::Left));
@@ -1559,6 +1595,39 @@ mod tests {
             true
         });
         assert_eq!(asked, Some(true));
+    }
+
+    #[test]
+    fn a_press_outside_the_armed_area_disarms_and_passes_with_its_release() {
+        let gate = ClickGate::new();
+        let area = (-200, 100, 50, 180);
+        // Outside (right and bottom are exclusive): passes, and the gate is gone.
+        for (x, y) in [(50, 120), (0, 180), (-201, 120), (0, 99)] {
+            assert!(gate.arm_in(gate.epoch(), Button::Left, area));
+            assert!(!gate.on_press(Button::Left, false, false, x, y), "{x},{y}");
+            assert!(!gate.is_armed());
+        }
+        // So its release passes too: the hook marks a release only for a swallowed press.
+        let mut pending = None;
+        assert!(!swallows_release(&mut pending, Button::Left, false));
+        // Inside, corners included: swallowed.
+        for (x, y) in [(-200, 100), (49, 179), (0, 150)] {
+            assert!(gate.arm_in(gate.epoch(), Button::Left, area));
+            assert!(gate.on_press(Button::Left, false, false, x, y), "{x},{y}");
+            assert!(!gate.is_armed());
+        }
+        // Another button or a touch inside still only disarms.
+        assert!(gate.arm_in(gate.epoch(), Button::Left, area));
+        assert!(!gate.on_press(Button::Right, false, false, 0, 150));
+        assert!(gate.arm_in(gate.epoch(), Button::Left, area));
+        assert!(!gate.on_press(Button::Left, false, true, 0, 150));
+        // A new arm replaces the area; an armed gate refuses another arm and keeps its own.
+        assert!(gate.arm_in(gate.epoch(), Button::Left, (0, 0, 10, 10)));
+        assert!(!gate.arm_in(gate.epoch(), Button::Left, (100, 100, 200, 200)));
+        assert!(gate.on_press(Button::Left, false, false, 5, 5));
+        // `arm` alone is the whole screen.
+        assert!(gate.arm(gate.epoch(), Button::Left));
+        assert!(gate.on_press(Button::Left, false, false, i32::MIN, i32::MAX - 1));
     }
 
     #[test]

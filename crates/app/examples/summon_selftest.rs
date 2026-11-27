@@ -6,15 +6,16 @@
 //! Checks of the menu window: its styles (layered, click-through, topmost, no-activate, tool
 //! window), that the first row is under the cursor and the card inside the work area, that
 //! it is excluded from screen capture, that the whole window is click-through seen from
-//! another process (the click gate in the mouse hook takes the click on a row, never the
-//! window), that it never becomes the foreground window, and that it costs no CPU while
+//! another process (the click gate in the mouse hook takes a click on the card, never the
+//! window; a click anywhere else passes to the app), that it never becomes the foreground window, and that it costs no CPU while
 //! hidden or shown and still. Whether the foreground window changed while the menu showed is
 //! printed as INFO (the person at the desktop may switch windows meanwhile).
 //!
 //! What it cannot check: the hook-level swallow of a click, and the gesture itself (both
 //! need real input). A message posted to our own window does not pass through the low-level
 //! mouse hook, so check (b) only shows that our own window receives every posted click while
-//! the gate is off; the swallow is covered by the unit tests of `hook::ClickGate`, the
+//! the gate is off; the swallow (on the card only) is covered by the unit tests of
+//! `hook::ClickGate` and of `notes::summoner`, the
 //! gesture by the unit tests of `notes::summoner` and by `SUMMON_TEST.md`.
 //!
 //! `summon_selftest --probe X Y HWND` is the helper mode: run as a separate process, it
