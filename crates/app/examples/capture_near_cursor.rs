@@ -1,5 +1,5 @@
 //! Saves a PNG of the screen around the mouse cursor, layered windows included.
-//! For checking by eye what the overlay shows: run the app with FAIRY_CAPTURABLE=1, then
+//! For checking by eye what the overlay shows: run the app with IGORIO_CAPTURABLE=1, then
 //! `cargo run -p igorio-app --example capture_near_cursor -- out.png`.
 
 use std::ffi::c_void;

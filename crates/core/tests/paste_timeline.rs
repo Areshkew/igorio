@@ -1,15 +1,15 @@
 use igorio_core::paste_policy::{Outcome, OutcomeRules, RestoreRules, RestoreStep};
 
 /// Runs the outcome and restore rules together over a simulated timeline, like `PasteJob` does
-/// (polling every 50 ms / 100 ms after ⌘V).
+/// (polling every 50 ms / 100 ms after Ctrl+V).
 #[derive(Default)]
 struct Timeline {
     has_probe: bool,
-    /// Times (after ⌘V) at which the target reads the promised data.
+    /// Times (after Ctrl+V) at which the target reads the promised data.
     reads: Vec<f64>,
     /// Time at which the probe first sees a change.
     probe_changes_at: Option<f64>,
-    /// Time at which someone else writes the pasteboard.
+    /// Time at which someone else writes the clipboard.
     foreign_write_at: Option<f64>,
 }
 
@@ -81,8 +81,8 @@ fn test_browser_composer_reads_immediately() {
 }
 
 #[test]
-fn test_app_ignoring_cmd_v_keeps_the_screenshot_and_restores_clipboard() {
-    // The ChatGPT failure: ⌘V never reached a paste handler.
+fn test_app_ignoring_ctrl_v_keeps_the_screenshot_and_restores_clipboard() {
+    // The ChatGPT failure: Ctrl+V never reached a paste handler.
     let r = Timeline::default().run();
     assert_eq!(r.outcome, Outcome::Failed);
     assert!(r.restored);
@@ -104,8 +104,8 @@ fn test_slow_native_app_reading_late_is_not_cut_off() {
 }
 
 #[test]
-fn test_busy_app_handling_cmd_v_late_still_gets_the_screenshot() {
-    // A Chromium page frozen for 3 s: the fairy reports "couldn't paste" at 1.6 s, but the
+fn test_busy_app_handling_ctrl_v_late_still_gets_the_screenshot() {
+    // A Chromium page frozen for 3 s: the app reports "couldn't paste" at 1.6 s, but the
     // clipboard must still hold the screenshot when the page finally reads it at 3 s.
     let r = Timeline {
         reads: vec![3.0],
@@ -119,7 +119,7 @@ fn test_busy_app_handling_cmd_v_late_still_gets_the_screenshot() {
 
 #[test]
 fn test_search_field_refuses_image() {
-    // Single-line field: looked at the pasteboard types, never read image data.
+    // Single-line field: looked at the clipboard types, never read image data.
     let r = Timeline {
         has_probe: true,
         ..Default::default()

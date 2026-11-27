@@ -1,11 +1,10 @@
-//! The pile of held cards, translated from
-//! `fairy-cursor/sources/core/HeldPile.swift`.
+//! The pile of held cards.
 
 use std::collections::HashMap;
 
 use crate::geom::CardId;
 
-/// Stands in for `Card: Identifiable where Card.ID == UUID`: the pile only needs the id.
+/// A card the pile can hold: the pile only needs its id.
 pub trait HasCardId {
     fn card_id(&self) -> CardId;
 }
@@ -29,7 +28,7 @@ pub enum ReleaseReason {
     Spurious,
 }
 
-/// One remember()ed release. Swift nests this in `HeldPile`; Rust keeps it at module level.
+/// One remember()ed release.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReleasedBatch<Card> {
     /// In pile order (oldest first).
@@ -38,7 +37,7 @@ pub struct ReleasedBatch<Card> {
     pub at: f64,
 }
 
-/// The pile of screenshots the fairy carries, as a pure value: which cards are held, which are
+/// The pile of screenshots that follows the cursor, as a pure value: which cards are held, which are
 /// on their way out (animating), and a short memory of what recently left so it can be brought
 /// back ("Restore Last Screenshot").
 ///

@@ -1,4 +1,4 @@
-//! Pure decision logic, translated from `fairy-cursor/sources/core`.
+//! Pure decision logic.
 //! No Windows API and no dependencies. Coordinates are f64 with a top-left origin.
 
 pub mod geom;

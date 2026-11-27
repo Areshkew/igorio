@@ -1,4 +1,4 @@
-//! Translation of `fairy-cursor/tests/core/RecordingViewportTests.swift`.
+//! The zoomed area of a screen recording.
 
 use igorio_core::geom::{Point, Rect};
 use igorio_core::viewport::RecordingViewport;
@@ -13,7 +13,7 @@ fn settle(v: &mut RecordingViewport, cursor: Point, following: bool) {
     }
 }
 
-/// `CGRect.contains(_ rect: CGRect)`: the inner rect is entirely inside the outer one.
+/// The inner rect is entirely inside the outer one.
 fn contains_rect(outer: Rect, inner: Rect) -> bool {
     inner.min_x() >= outer.min_x()
         && inner.max_x() <= outer.max_x()

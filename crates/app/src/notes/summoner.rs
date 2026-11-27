@@ -5,8 +5,8 @@
 //! "hold Alt, click" runs the first tool (a new note by default) in one click; moving to another row and
 //! clicking runs that tool. The click is swallowed, so the app underneath never sees an
 //! Alt+click. Releasing Alt closes the menu.
-//! It replaces the summon pill of `NoteSummoner.swift` (the gesture is the same; the direct
-//! action is now a menu, `ROADMAP.md` "Tool menu at the cursor").
+//! It replaced an earlier summon pill (the gesture is the same; the direct action is now a
+//! menu, `ROADMAP.md` "Tool menu at the cursor").
 //!
 //! # The Alt key on Windows
 //!
@@ -69,8 +69,7 @@
 //! meant that. Holding Alt over a foreground window of an elevated app: Windows does not call
 //! our keyboard hook then, so the gesture simply does not start.
 //!
-//! Verdict: plain Alt can be made safe this way, so it stays the default ([`Modifier::Alt`],
-//! as on macOS). Ctrl+Alt ([`Modifier::CtrlAlt`]) is the fallback in the config: a Ctrl+Alt
+//! Verdict: plain Alt can be made safe this way, so it stays the default ([`Modifier::Alt`]). Ctrl+Alt ([`Modifier::CtrlAlt`]) is the fallback in the config: a Ctrl+Alt
 //! release is never a lone Alt, so it needs no mask key at all. AltGr arrives as a fake left
 //! Ctrl (scan code `0x21D`) plus right Alt; it never starts the gesture in either mode.
 //!
@@ -78,7 +77,7 @@
 //! happens on the press, before we can know anything); and a hard kill between a swallowed
 //! press and its release lets the release reach the app below without its press.
 //!
-//! # When the menu opens (the rules of `NoteSummoner.swift`)
+//! # When the menu opens
 //!
 //! - The modifier went down on its own: no other key, no mouse button down (an Alt+drag
 //!   already under way), not AltGr. In Ctrl+Alt mode, the hold starts when the second of the
@@ -224,11 +223,11 @@ use crate::shortcuts::{self, Shortcuts};
 use crate::uia::{Lookup, Outcome, RequestId, Requester};
 
 // ---------------------------------------------------------------------------------------
-// Constants (the Swift values where there is one)
+// Constants
 // ---------------------------------------------------------------------------------------
 
 /// The modifier must be held this long first, so shortcuts and quick taps never flash the
-/// menu (`holdDelay`).
+/// menu.
 pub const HOLD_DELAY: f64 = 0.3;
 /// While the hold tracks the cursor, the spot is checked again at most this often (`0.12`
 /// in `track()`).
@@ -307,7 +306,7 @@ const WM_STOP: u32 = WM_APP + 1;
 /// The modifier held for the gesture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Modifier {
-    /// Alt alone (either Alt key), as Option on macOS. The default.
+    /// Alt alone (either Alt key). The default.
     #[default]
     Alt,
     /// Ctrl and Alt together, nothing else.
@@ -337,9 +336,9 @@ pub struct SummonConfig {
     pub modifier: Modifier,
     /// The settings switch ("Hold Alt and click").
     pub enabled: bool,
-    /// Emit [`SummonerEvent::Log`] lines (`FAIRY_DEBUG=1`).
+    /// Emit [`SummonerEvent::Log`] lines (`IGORIO_DEBUG=1`).
     pub debug: bool,
-    /// Let screenshots see the menu (`FAIRY_CAPTURABLE=1`, for demos).
+    /// Let screenshots see the menu (`IGORIO_CAPTURABLE=1`, for demos).
     pub capturable: bool,
 }
 

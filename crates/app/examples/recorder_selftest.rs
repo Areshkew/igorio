@@ -860,7 +860,7 @@ fn run(keep: bool) -> Result<()> {
         (duration - 4.0).abs() <= 0.2,
         "Finished duration is within 0.2 s of 4 s",
     )?;
-    hard(valid_name(file), "final name follows the Swift pattern")?;
+    hard(valid_name(file), "final name follows the naming pattern")?;
     hard(
         fs::read_dir(&scratch.folder)?.count() == 1,
         "finalization left no temporary file",

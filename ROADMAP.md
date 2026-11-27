@@ -1,21 +1,17 @@
-# Roadmap: fairy cursor for Windows, in Rust
+# Igorio: design and roadmap
 
-Source: https://github.com/Rrrima/fairy-cursor at commit `3d5f655` (MIT).
-About 8,500 lines of Swift plus 1,500 lines of tests. Its `ausm` dependency
-(screenshot and cursor monitoring) is mac-only and is replaced, not translated.
-The copy of the Swift source in `reference/` was removed once the port was done; its MIT
-notice and the Barlow font licence are in `NOTICE`.
+Igorio is a Windows app written in Rust. Screenshots follow the cursor as a small pile
+until they are pasted, saved or shaken off; notes open at the cursor; the screen can be
+recorded with zoom and ink. This document holds the design decisions and the rules for
+the code.
 
-## Rules for the translation
+## Rules for the code
 
-- `sources/core` is pure logic. Translate it file by file, keep names, keep every test.
-- Everything else is rewritten against Win32. Keep the same split: pure decision in
-  `core`, live lookups and actions in `app`.
-- Coordinates: macOS uses points with a bottom-left origin. The port uses physical
-  pixels with a top-left origin everywhere, and converts sizes with the monitor DPI.
-- All Swift timing constants (paste delays, shake thresholds) are copied first and
-  tuned only after testing on Windows.
-- Keyboard: `⌘` becomes `Ctrl`, `⌥` becomes `Alt`. Final shortcut choice is in M7/M8.
+- `core` is pure logic: no Windows API, unit tests for every rule. Live lookups and
+  actions are in `app`: the pure decision in `core`, the Windows calls in `app`.
+- Coordinates: physical pixels with a top-left origin everywhere. Sizes are given in
+  logical pixels and converted with the monitor DPI.
+- Timing constants (paste delays, shake thresholds) are tuned by testing on Windows.
 
 ## Rules for the Win32 code
 
@@ -63,86 +59,28 @@ owner-drawn where the look needs it. The note editor is a RichEdit control.
 ```
 Cargo.toml              workspace
 crates/
-  core/                 pure logic, no Windows API, unit tests   (sources/core)
-  kit/                  Capability trait, Host trait, shared types (sources/kit)
-  platform/             Win32 wrappers: hooks, UI Automation, clipboard, input, shell
-  screenshots/          capability
-  notes/                capability
-  recording/            capability
-  app/                  exe: overlay, tray, settings, guide, drop routing
+  core/                 pure logic, no Windows API, unit tests: geom, shake, pile,
+                        drop_policy, paste_policy, editable, capture_watchdog, ink,
+                        freehand, viewport
+  kit/                  shared types: held cards, images, theme
+  app/                  the exe (igorio.exe) and its modules:
+                          overlay, draw, scene, layout, follower, state: the pile
+                          hook, input, uia, clipboard, explorer, drop_router: drops
+                          snip, saver: screenshot detection and saving
+                          notes/: summoner (tool menu), context, window, editor,
+                            markdown, store, panel
+                          recording/: feature, recorder, frame, ink_overlay, input
+                          ink_draw, settings, settings_window, shortcuts, guide,
+                          tray, crash
+spikes/                 throwaway experiments from M0, outside the workspace
+installer/              Inno Setup script and build script
 assets/                 icon, Barlow fonts (OFL)
 ```
 
-Crates: `windows`, `tiny-skia`, `fontdue`, `png`,
-`serde`/`serde_json`, `windows-capture`.
+Crates: `windows`, `tiny-skia`, `fontdue`, `png`, `serde`/`serde_json`.
 
-## File map
-
-### core (translate 1:1)
-
-| Swift | Rust | Lines |
-|---|---|---|
-| `ShakeDetector.swift` | `core/src/shake.rs` | 203 |
-| `HeldPile.swift` | `core/src/pile.rs` | 137 |
-| `DropPolicy.swift` | `core/src/drop_policy.rs` | 198 |
-| `PastePolicy.swift` | `core/src/paste_policy.rs` | 199 |
-| `EditableResolver.swift` | `core/src/editable.rs` (trait `AccessibilityNode`) | 87 |
-| `CaptureWatchdog.swift` | `core/src/capture_watchdog.rs` | 61 |
-| `Ink.swift` | `core/src/ink.rs` | 110 |
-| `Freehand.swift` | `core/src/freehand.rs` | 250 |
-| `RecordingViewport.swift` | `core/src/viewport.rs` | 86 |
-| `tests/core/*.swift` (11 files) | `core/tests/*.rs` | 1542 |
-
-`DropPolicy` and `EditableResolver` use macOS role names (`AXTextArea`, `AXWebArea`).
-Replace them with a small role enum in `core`, filled from UI Automation control types.
-
-### kit
-
-| Swift | Rust |
-|---|---|
-| `Capability.swift` | `kit/src/capability.rs`: `Capability` and `Host` traits, `Manifest`, `DropZone` |
-| `HeldScreenshot.swift` | `kit/src/held.rs` |
-| `Theme.swift`, `SettingsRows.swift`, `KeyChip.swift` | `kit/src/theme.rs`, row helpers for the settings window |
-| `SystemScreenshotLocation.swift` | `kit/src/folders.rs` (`Pictures\Screenshots`) |
-| `Finder.swift` | `platform/src/explorer.rs` |
-| `WebAccessibility.swift` | not needed: Chromium builds its tree when a UI Automation client asks. Check in M0 |
-| `Permissions.swift` | dropped (no permission prompts on Windows) |
-
-### app
-
-| Swift | Rust | Windows API |
-|---|---|---|
-| `main.swift`, `AppDelegate.swift` | `app/src/main.rs`, `host.rs` | message loop, tray |
-| `FairyPanel.swift` | `app/src/overlay.rs` | layered click-through topmost window, `WDA_EXCLUDEFROMCAPTURE` |
-| `FairyView.swift`, `FairyState.swift`, `LogoMark.swift` | `app/src/overlay_draw.rs`, `state.rs` | `tiny-skia` + `UpdateLayeredWindow` |
-| `Follower.swift` | `app/src/follower.rs` | `GetCursorPos`, timer, monitor work area |
-| `AXNode.swift` | `platform/src/uia.rs` | `IUIAutomation`, cached reads, timeout |
-| `DropRouter.swift` | `app/src/drop_router.rs` | `WH_MOUSE_LL` double-click, UI Automation |
-| `PasteTarget.swift` | `app/src/paste.rs` | clipboard, `GetClipboardSequenceNumber`, `SendInput` |
-| `Keys.swift` | `platform/src/input.rs` | `SendInput` |
-| `FinderTarget.swift` | `app/src/explorer_target.rs` | `IShellWindows`, `CabinetWClass`, desktop |
-| `AppSettings.swift`, `CapabilityRegistry.swift` | `app/src/settings.rs`, `registry.rs` | JSON in `%APPDATA%` |
-| `SettingsWindow.swift` | `app/src/settings_window.rs` | native Win32 controls, owner-drawn where the look needs it |
-| `GuideWindow.swift`, `GuideScenes.swift` | `app/src/guide.rs` | native Win32 window; scenes simplified |
-| `Relocation.swift` | dropped (macOS translocation only) |
-
-### capabilities
-
-| Swift | Rust | Windows API |
-|---|---|---|
-| `ScreenshotsCapability.swift` + ausm `ScreenshotMonitorKit` | `screenshots/src/lib.rs`, `detect.rs` | clipboard listener after `Win+Shift+S`, folder watch for `Win+PrtScn` |
-| `SystemScreenshotTakeover.swift` | dropped (Windows has no thumbnail redirect) | |
-| `ScreenshotSaver.swift` | `screenshots/src/saver.rs` | PNG encode off the UI thread |
-| `NotesCapability.swift`, `NotesController.swift` | `notes/src/lib.rs`, `controller.rs` | |
-| `NoteStore.swift` | `notes/src/store.rs` (mostly portable) | markdown files |
-| `NoteContext.swift` | `notes/src/context.rs` | UI Automation |
-| `NoteSummoner.swift` | `notes/src/summoner.rs` | `WH_KEYBOARD_LL` + `WH_MOUSE_LL` |
-| `NoteView.swift`, `MarkdownEditor.swift` | `notes/src/view.rs`, `editor.rs` | Win32 note window hosting a RichEdit control; styling from `notes/markdown.rs` |
-| `RecordingCapability.swift`, `RecordingInput.swift` | `recording/src/lib.rs`, `input.rs` | `RegisterHotKey`, low-level hooks |
-| `ScreenRecorder.swift` | `recording/src/recorder.rs` | Windows.Graphics.Capture, Media Foundation H.264 (`.mp4`) |
-| `RecordingFrame.swift` | `recording/src/frame.rs` | overlay excluded from capture |
-| `InkOverlay.swift` | `recording/src/ink_overlay.rs` | overlay included in capture |
-| `CursorScale.swift` | `recording/src/cursor.rs` | draw a larger cursor into the video |
+The core's drop and editable rules name roles with `AX…` strings (`AXTextArea`,
+`AXWebArea`); `uia::map_role` maps UI Automation control types to them.
 
 ## Administrator and prompts
 
@@ -181,49 +119,50 @@ folder picker and an "open folder" button. A change applies at once, with no res
 
 | Setting | What goes there | Default |
 |---|---|---|
-| Notes folder | one `.md` file per note | `Documents\Fairy Notes` |
+| Notes folder | one `.md` file per note | `Documents\Igorio Notes` |
 | Captures folder | kept screenshots (`.png`) and recordings (`.mp4`) | `Pictures\Screenshots` |
 
-- Screenshots pasted into a terminal as a path are saved in `<captures>\Pasted`. The
-  Swift app uses a fixed `Pictures/Fairy Cursor` folder for this.
+- Screenshots pasted into a terminal as a path are saved in `<captures>\Pasted`.
 - Changing a folder does not move existing files. Notes in the old folder stop showing
   in "recent notes" until the user moves them.
 - If a folder is missing or not writable, the app creates it, or falls back to the
   default and shows a hint.
-- Capabilities never read the setting directly. They ask the host (`Host::captures_folder`),
-  as in the Swift `FairyHost.capturesFolder`.
+- Code that writes files never reads the setting directly. It asks `Settings::notes_dir`,
+  `captures_dir` or `pasted_dir`, which apply the fallback.
+- When no notes folder is set and an older default notes folder exists while the current
+  default does not, the first start stores the older folder as the chosen one
+  (`Settings::keep_old_notes_folder`). No note file is moved.
 
 ## Card size the user chooses
 
-The pile should not get in the user's way. The default card is 80 x 60 logical px
-(the macOS original uses 112 x 84). A setting in the settings window changes it:
+The pile should not get in the user's way. The default card is 80 x 60 logical px. A
+setting in the settings window changes it:
 
 | Choice | Card box (logical px) |
 |---|---|
 | Small (default) | 80 x 60 |
 | Medium | 96 x 72 |
-| Large (as on macOS) | 112 x 84 |
+| Large | 112 x 84 |
 
 - Stored as `card_size` in `settings.json`. A change applies at once, with no restart.
-- Today the size is the constant `layout::THUMB_MAX`. The setting replaces it with a
-  value passed to the renderer (in `Scene`) and to the follower, which uses the card
-  box to flip at screen edges. The hint text size does not change.
+- The card box (`CardSize::thumb_max`) is passed to the renderer (in `Scene`) and to the
+  follower, which uses it to flip at screen edges. The hint text size does not change.
 
 ## Shortcuts the user chooses
 
 Every action that has a keyboard shortcut can be changed, or left without one, in the
 settings window. Stored as `shortcuts` in `settings.json`; a change applies at once.
 
-| Action | Default | Available |
-|---|---|---|
-| Restore last screenshot | none | now |
-| Discard top card (same as one shake) | none | now |
-| Discard all cards | none | now |
-| Open settings | none | now |
-| New note at the cursor | none (the gesture is hold Alt and click) | with M7 |
-| Start or stop recording | Ctrl+Shift+6 | with M8 |
-| Pen | Ctrl+Shift+7 | with M8 |
-| Highlighter | Ctrl+Shift+8 | with M8 |
+| Action | Default |
+|---|---|
+| Restore last screenshot | none |
+| Discard top card (same as one shake) | none |
+| Discard all cards | none |
+| Open settings | none |
+| New note at the cursor | none (the gesture is hold Alt and click) |
+| Start or stop recording | Ctrl+Shift+6 |
+| Pen | Ctrl+Shift+7 |
+| Highlighter | Ctrl+Shift+8 |
 
 - Taking a screenshot uses the Windows shortcuts (`Win+Shift+S`, `PrtScn`, `Alt+PrtScn`,
   `Win+PrtScn`). The app only notices them; they are changed in Windows, not here. The
@@ -245,8 +184,8 @@ Holding Alt does not open a note directly. It opens a small menu of tools under 
 cursor, so users do not have to guess what the gesture does.
 
 - The menu opens anywhere except over a text field, a password field or a terminal (they
-  take typed text). The first version opened it only over empty space, as in Swift; that
-  proved hard to find (holding Alt over a button or text did nothing), so it changed.
+  take typed text). The first version opened it only over empty space; that proved hard
+  to find (holding Alt over a button or text did nothing), so it changed.
 - The menu lists tools only: **New note** and **Record screen** today. Everything else
   (restore, discard, settings, recent notes) stays in the tray menu.
 - Each row shows the tool's keyboard shortcut, so users learn the direct way.
@@ -272,8 +211,7 @@ Ideas for later, not planned yet:
 
 ## Notes editor: Notion-like writing
 
-The macOS app shows Markdown markers dimmed. This port goes further, as its owner asked:
-writing a note should feel like Notion, while the file on disk stays plain Markdown.
+Writing a note should feel like Notion, while the file on disk stays plain Markdown.
 
 - Live formatting: headings, bold, italic, code and links show formatted with their
   markers hidden. The markers reappear while the caret is inside the element.
@@ -295,14 +233,13 @@ that part is left out or done more simply; a custom text view is a separate, lar
 
 ## Hidden notes and the notes panel
 
-Not in the macOS app; the owner asked for it.
-
 - A note is shown, hidden or closed (put away). The header's hide button (left of delete)
   saves the note at once and fades it out like a put-away note. A hidden note stays open
   but off screen: it does not come back on the next start. A blank note is put away
   instead.
 - The hidden state lives only in the app's windows file (`isHidden`, written only when
-  true), so the note files stay as the Mac app writes them and older files read as shown.
+  true), so the note files stay plain Markdown with their front matter, and a windows file
+  without the key reads as shown.
 - The tray's "Notes…" opens the notes panel next to the tray icon (the corner by the
   taskbar when the icon is in the overflow area). It is a popup of the notes thread
   (`notes/panel.rs`) in the settings window's style: every note, newest edit first, with
@@ -335,10 +272,10 @@ own capture hotkey. If spike 4 fails, revisit the admin section.
 
 ### M1. Workspace and core
 
-Create the workspace. Translate `core` and all 11 test files (recording files included,
-they are small).
+Create the workspace and the pure `core` logic with its tests: shake, pile, drop and
+paste rules, editable lookup, ink, freehand strokes, recording viewport.
 
-Check: `cargo test -p igorio-core` passes with the same cases as the Swift tests.
+Check: `cargo test -p igorio-core` passes.
 
 ### M2. Overlay, follower, tray
 
@@ -348,10 +285,9 @@ edge flipping, tray menu with Quit, `--demo N` flag that loads N test images.
 Check: `app --demo 3` shows three cards following the cursor on two monitors with
 different DPI, and they do not appear in a screenshot.
 
-### M3. kit and screenshots capability
+### M3. kit and screenshots
 
-`Capability` and `Host` traits, registry, screenshot detection, "keep every
-screenshot" saving.
+Shared types in `kit`, screenshot detection, "keep every screenshot" saving.
 
 Check: `Win+Shift+S` puts a card on the pile; copying an image in a browser does not.
 
@@ -403,8 +339,8 @@ elevated window.
 Summoner (hold `Alt`, click), note windows, markdown editor, store, recent notes menu,
 drop screenshots into a note.
 
-The tool menu opens anywhere except over text fields. This was chosen after the Swift rule
-(empty space only) proved hard to discover.
+The tool menu opens anywhere except over text fields. This was chosen after an
+empty-space-only rule proved hard to discover.
 
 Open point: a lone `Alt` tap focuses the menu bar on Windows. The keyboard hook must
 swallow it, or the modifier changes to `Ctrl+Alt`.
@@ -423,6 +359,5 @@ is not in the video; the ink is.
 ## Known limits
 
 - The Snipping Tool notification cannot be turned off from code.
-- App-specific paste rules from the Swift code (Google Docs, Figma, Slack) need
-  retesting one by one on Windows.
-- The macOS glass look is not reproduced; the port uses its own flat style.
+- App-specific paste rules (Google Docs, Figma, Slack) need testing one by one on
+  Windows.

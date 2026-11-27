@@ -1,4 +1,4 @@
-//! Tests for `igorio_app::state::FairyState`, translated from the Swift behaviour.
+//! Tests for `igorio_app::state::IgorioState`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use igorio_app::layout::CardSize;
 use igorio_app::scene::{Leaving, SceneCard};
-use igorio_app::state::{FairyState, Hidden};
+use igorio_app::state::{IgorioState, Hidden};
 use igorio_core::geom::CardId;
 use igorio_core::pile::LeaveStyle;
 use igorio_kit::Image;
@@ -15,7 +15,7 @@ fn image() -> Arc<Image> {
     Arc::new(Image::new(1, 1, vec![0, 0, 0, 255]).unwrap())
 }
 
-fn hold(state: &mut FairyState, now: f64) {
+fn hold(state: &mut IgorioState, now: f64) {
     state.hold(image(), 1.0, SystemTime::UNIX_EPOCH, false, None, None, now);
 }
 
@@ -26,7 +26,7 @@ fn approx(actual: f64, expected: f64) {
     );
 }
 
-fn ids(state: &FairyState) -> Vec<CardId> {
+fn ids(state: &IgorioState) -> Vec<CardId> {
     state.stack().iter().map(|card| card.id).collect()
 }
 
@@ -36,7 +36,7 @@ fn top_card(scene: &igorio_app::scene::Scene) -> &SceneCard {
 
 #[test]
 fn hold_shows_shake_hint_then_it_clears() {
-    let mut state = FairyState::new(1);
+    let mut state = IgorioState::new(1);
     hold(&mut state, 0.0);
     assert_eq!(state.hint(), Some("shake to discard"));
     assert_eq!(
@@ -52,7 +52,7 @@ fn hold_shows_shake_hint_then_it_clears() {
 
 #[test]
 fn card_size_starts_small_and_reaches_the_scene_at_once() {
-    let mut state = FairyState::new(1);
+    let mut state = IgorioState::new(1);
     hold(&mut state, 0.0);
     assert_eq!(state.card_size(), CardSize::Small);
     assert_eq!(state.scene(0.0, 1.0).card_size, CardSize::Small);
@@ -64,14 +64,14 @@ fn card_size_starts_small_and_reaches_the_scene_at_once() {
 
 #[test]
 fn kept_card_shows_saved_hint() {
-    let mut state = FairyState::new(1);
+    let mut state = IgorioState::new(1);
     state.hold(image(), 1.0, SystemTime::UNIX_EPOCH, true, None, None, 0.0);
     assert_eq!(state.hint(), Some("saved · shake to let go"));
 }
 
 #[test]
 fn two_cards_count_them_in_the_hint() {
-    let mut state = FairyState::new(1);
+    let mut state = IgorioState::new(1);
     hold(&mut state, 0.0);
     hold(&mut state, 0.0);
     assert_eq!(state.hint(), Some("2 held · shake to discard"));
@@ -79,7 +79,7 @@ fn two_cards_count_them_in_the_hint() {
 
 #[test]
 fn a_lone_recording_shows_the_recording_hint() {
-    let mut state = FairyState::new(1);
+    let mut state = IgorioState::new(1);
     state.hold(
         image(),
         1.0,
@@ -104,7 +104,7 @@ fn a_lone_recording_shows_the_recording_hint() {
 
 #[test]
 fn tilts_alternate_sign_and_stay_between_8_and_15_degrees() {
-    let mut state = FairyState::new(0xDEAD_BEEF);
+    let mut state = IgorioState::new(0xDEAD_BEEF);
     for _ in 0..4 {
         hold(&mut state, 0.0);
     }
@@ -123,7 +123,7 @@ fn tilts_alternate_sign_and_stay_between_8_and_15_degrees() {
 
 #[test]
 fn dissolve_removes_the_top_card_after_0_26_s_and_restores() {
-    let mut state = FairyState::new(2);
+    let mut state = IgorioState::new(2);
     hold(&mut state, 1.0);
     let id = state.top().unwrap().id;
     state.dissolve(1.0);
@@ -142,7 +142,7 @@ fn dissolve_removes_the_top_card_after_0_26_s_and_restores() {
 
 #[test]
 fn deliver_drops_cards_one_by_one_top_first_and_sets_the_hint() {
-    let mut state = FairyState::new(3);
+    let mut state = IgorioState::new(3);
     hold(&mut state, 0.0);
     hold(&mut state, 0.0);
     hold(&mut state, 0.0);
@@ -179,7 +179,7 @@ fn deliver_drops_cards_one_by_one_top_first_and_sets_the_hint() {
 
 #[test]
 fn a_card_held_during_a_deliver_stays() {
-    let mut state = FairyState::new(4);
+    let mut state = IgorioState::new(4);
     hold(&mut state, 0.0);
     hold(&mut state, 0.0);
     let order: Vec<CardId> = state.deliverable().iter().map(|card| card.id).collect();
@@ -194,7 +194,7 @@ fn a_card_held_during_a_deliver_stays() {
 
 #[test]
 fn reject_bumps_the_tick_and_does_nothing_when_not_holding() {
-    let mut state = FairyState::new(5);
+    let mut state = IgorioState::new(5);
     state.reject("no", 0.0);
     assert_eq!(state.reject_tick(), 0);
     assert_eq!(state.hint(), None);
@@ -215,7 +215,7 @@ fn reject_bumps_the_tick_and_does_nothing_when_not_holding() {
 
 #[test]
 fn discard_all_then_restore_brings_everything_back() {
-    let mut state = FairyState::new(6);
+    let mut state = IgorioState::new(6);
     hold(&mut state, 0.0);
     hold(&mut state, 0.0);
     hold(&mut state, 0.0);
@@ -232,7 +232,7 @@ fn discard_all_then_restore_brings_everything_back() {
 
 #[test]
 fn hover_hint_none_keeps_a_shake_hint_and_clears_others() {
-    let mut state = FairyState::new(7);
+    let mut state = IgorioState::new(7);
     hold(&mut state, 0.0);
     assert_eq!(state.hint(), Some("shake to discard"));
 
@@ -248,7 +248,7 @@ fn hover_hint_none_keeps_a_shake_hint_and_clears_others() {
 
 #[test]
 fn hover_hint_does_nothing_when_not_holding() {
-    let mut state = FairyState::new(7);
+    let mut state = IgorioState::new(7);
     state.set_hover_hint(Some("drop to paste"), 0.0);
     assert_eq!(state.hint(), None);
     state.set_hover_hint(None, 0.1);
@@ -257,7 +257,7 @@ fn hover_hint_does_nothing_when_not_holding() {
 
 #[test]
 fn a_hover_hint_is_not_cleared_by_an_older_flash_deadline() {
-    let mut state = FairyState::new(7);
+    let mut state = IgorioState::new(7);
     hold(&mut state, 0.0);
     state.set_hover_hint(Some("drop to paste"), 0.1);
 
@@ -267,7 +267,7 @@ fn a_hover_hint_is_not_cleared_by_an_older_flash_deadline() {
 
 #[test]
 fn stash_goes_to_the_restore_memory_only() {
-    let mut state = FairyState::new(7);
+    let mut state = IgorioState::new(7);
     state.stash(image(), 1.0, SystemTime::UNIX_EPOCH, 0.0);
     assert!(!state.is_holding());
     assert!(state.can_restore());
@@ -279,8 +279,8 @@ fn stash_goes_to_the_restore_memory_only() {
 
 #[test]
 fn one_late_tick_matches_many_small_ticks() {
-    let mut late = FairyState::new(8);
-    let mut steady = FairyState::new(8);
+    let mut late = IgorioState::new(8);
+    let mut steady = IgorioState::new(8);
     for state in [&mut late, &mut steady] {
         hold(state, 0.0);
         hold(state, 0.5);
@@ -312,7 +312,7 @@ fn one_late_tick_matches_many_small_ticks() {
 
     assert_eq!(ids(&late), ids(&steady));
     let tilts =
-        |state: &FairyState| -> Vec<f64> { state.stack().iter().map(|card| card.tilt).collect() };
+        |state: &IgorioState| -> Vec<f64> { state.stack().iter().map(|card| card.tilt).collect() };
     assert_eq!(tilts(&late), tilts(&steady));
     assert_eq!(late.hint(), steady.hint());
     assert_eq!(late.reject_tick(), steady.reject_tick());
@@ -323,7 +323,7 @@ fn one_late_tick_matches_many_small_ticks() {
 
 #[test]
 fn a_lone_card_has_no_tilt_and_depths_go_down_from_the_bottom() {
-    let mut state = FairyState::new(9);
+    let mut state = IgorioState::new(9);
     hold(&mut state, 0.0);
     let scene = state.scene(0.0, 2.0);
     assert_eq!(scene.cards.len(), 1);
@@ -331,7 +331,7 @@ fn a_lone_card_has_no_tilt_and_depths_go_down_from_the_bottom() {
     assert_eq!(scene.cards[0].depth, 0.0);
     assert_eq!(scene.scale, 2.0);
 
-    let mut state = FairyState::new(9);
+    let mut state = IgorioState::new(9);
     for _ in 0..5 {
         hold(&mut state, 0.0);
     }
@@ -346,7 +346,7 @@ fn a_lone_card_has_no_tilt_and_depths_go_down_from_the_bottom() {
 
 #[test]
 fn leaving_progress_is_half_way_half_way_through() {
-    let mut state = FairyState::new(10);
+    let mut state = IgorioState::new(10);
     hold(&mut state, 0.0);
     state.dissolve(0.0);
     match state.scene(0.11, 1.0).cards[0].leaving {
@@ -354,7 +354,7 @@ fn leaving_progress_is_half_way_half_way_through() {
         other => panic!("expected a dissolve, got {other:?}"),
     }
 
-    let mut state = FairyState::new(10);
+    let mut state = IgorioState::new(10);
     hold(&mut state, 0.0);
     let id = state.top().unwrap().id;
     state.deliver(&[id], "saved", 0.0);
@@ -366,7 +366,7 @@ fn leaving_progress_is_half_way_half_way_through() {
 
 #[test]
 fn hint_and_capture_opacity_use_their_easing() {
-    let mut state = FairyState::new(11);
+    let mut state = IgorioState::new(11);
     hold(&mut state, 0.0);
     approx(state.scene(0.0, 1.0).hint_opacity, 0.0);
     approx(state.scene(0.09, 1.0).hint_opacity, 0.75);
@@ -394,7 +394,7 @@ fn hint_and_capture_opacity_use_their_easing() {
 
 #[test]
 fn is_animating_goes_false_once_everything_settles() {
-    let mut state = FairyState::new(12);
+    let mut state = IgorioState::new(12);
     assert!(!state.is_animating(0.0));
     assert_eq!(state.next_deadline(), None);
 
@@ -411,26 +411,26 @@ fn is_animating_goes_false_once_everything_settles() {
 
 #[test]
 fn is_animating_tracks_each_animation() {
-    let mut wobble = FairyState::new(13);
+    let mut wobble = IgorioState::new(13);
     hold(&mut wobble, 0.0);
     wobble.reject("no", 1.0);
     assert!(wobble.is_animating(1.1), "wobbling");
     assert!(!wobble.is_animating(1.5), "wobble over");
 
-    let mut dissolve = FairyState::new(13);
+    let mut dissolve = IgorioState::new(13);
     hold(&mut dissolve, 0.0);
     dissolve.dissolve(0.0);
     assert!(dissolve.is_animating(0.1), "dissolving");
     assert!(!dissolve.is_animating(0.25), "dissolve over");
 
-    let mut drop = FairyState::new(13);
+    let mut drop = IgorioState::new(13);
     hold(&mut drop, 0.0);
     let id = drop.top().unwrap().id;
     drop.deliver(&[id], "saved", 0.0);
     assert!(drop.is_animating(0.1), "dropping");
     assert!(!drop.is_animating(0.3), "drop over");
 
-    let mut capture = FairyState::new(13);
+    let mut capture = IgorioState::new(13);
     capture.set_hidden_for_capture(true, 0.0);
     assert!(capture.is_animating(0.1), "hiding");
     assert!(!capture.is_animating(0.2), "hide over");
@@ -438,7 +438,7 @@ fn is_animating_tracks_each_animation() {
 
 #[test]
 fn released_screenshots_are_freed_past_the_prune_time() {
-    let mut state = FairyState::new(14);
+    let mut state = IgorioState::new(14);
     let img = image();
     state.hold(
         img.clone(),
@@ -464,7 +464,7 @@ fn released_screenshots_are_freed_past_the_prune_time() {
 
 #[test]
 fn next_deadline_includes_the_prune_time() {
-    let mut state = FairyState::new(15);
+    let mut state = IgorioState::new(15);
     state.stash(image(), 1.0, SystemTime::UNIX_EPOCH, 0.0);
     let deadline = state.next_deadline().expect("the prune deadline");
     approx(deadline, 901.0);
@@ -476,7 +476,7 @@ fn next_deadline_includes_the_prune_time() {
 
 #[test]
 fn a_non_finite_now_never_becomes_a_deadline() {
-    let mut state = FairyState::new(16);
+    let mut state = IgorioState::new(16);
     hold(&mut state, f64::NAN);
     assert_eq!(state.next_deadline(), None);
     assert_eq!(state.stack().len(), 1);
@@ -488,7 +488,7 @@ fn a_non_finite_now_never_becomes_a_deadline() {
 
 #[test]
 fn a_restored_card_ignores_a_finish_task_from_before_the_restore() {
-    let mut state = FairyState::new(20);
+    let mut state = IgorioState::new(20);
     hold(&mut state, 0.0);
     hold(&mut state, 0.0);
     let top = state.top().unwrap().id;
@@ -515,7 +515,7 @@ fn a_restored_card_ignores_a_finish_task_from_before_the_restore() {
 
 #[test]
 fn a_restored_card_ignores_a_deliver_step_from_before_the_restore() {
-    let mut state = FairyState::new(21);
+    let mut state = IgorioState::new(21);
     hold(&mut state, 0.0);
     hold(&mut state, 0.0);
     let bottom = state.stack()[0].id;
@@ -539,7 +539,7 @@ fn a_restored_card_ignores_a_deliver_step_from_before_the_restore() {
 
 #[test]
 fn appear_grows_from_zero_to_one_over_0_22_s_after_hold() {
-    let mut state = FairyState::new(30);
+    let mut state = IgorioState::new(30);
     hold(&mut state, 1.0);
     approx(state.scene(1.0, 1.0).cards[0].appear, 0.0);
     let halfway = state.scene(1.11, 1.0).cards[0].appear;
@@ -553,7 +553,7 @@ fn appear_grows_from_zero_to_one_over_0_22_s_after_hold() {
 
 #[test]
 fn appear_grows_from_zero_to_one_after_restore_last() {
-    let mut state = FairyState::new(31);
+    let mut state = IgorioState::new(31);
     hold(&mut state, 0.0);
     state.dissolve(0.0);
     state.tick(0.26);
@@ -572,7 +572,7 @@ fn appear_grows_from_zero_to_one_after_restore_last() {
 
 #[test]
 fn is_animating_covers_the_appear_and_ends() {
-    let mut state = FairyState::new(32);
+    let mut state = IgorioState::new(32);
     hold(&mut state, 0.0);
     assert!(state.is_animating(0.0), "the card is appearing");
     assert!(state.is_animating(0.21), "still appearing");
@@ -581,7 +581,7 @@ fn is_animating_covers_the_appear_and_ends() {
 
 #[test]
 fn a_second_hold_moves_the_first_card_from_depth_zero_to_one() {
-    let mut state = FairyState::new(33);
+    let mut state = IgorioState::new(33);
     hold(&mut state, 0.0);
     assert_eq!(state.scene(0.0, 1.0).cards[0].depth, 0.0);
 
@@ -598,7 +598,7 @@ fn a_second_hold_moves_the_first_card_from_depth_zero_to_one() {
 
 #[test]
 fn the_card_under_a_leaving_top_card_moves_from_one_to_zero() {
-    let mut state = FairyState::new(34);
+    let mut state = IgorioState::new(34);
     hold(&mut state, 0.0);
     hold(&mut state, 0.5);
     let under = state.stack()[0].id;
@@ -622,7 +622,7 @@ fn the_card_under_a_leaving_top_card_moves_from_one_to_zero() {
 
 #[test]
 fn the_fifth_card_is_drawn_only_while_fading_out() {
-    let mut state = FairyState::new(35);
+    let mut state = IgorioState::new(35);
     for k in 0..4 {
         hold(&mut state, k as f64);
     }
@@ -639,12 +639,12 @@ fn the_fifth_card_is_drawn_only_while_fading_out() {
     approx(settled.cards[0].depth, 3.0);
 }
 
-/// The screenshot UI and a pen in hand during a recording hide the fairy for two reasons
-/// (`setCaptureUIVisible(_:owner:)`): it is hidden while either holds and comes back only
+/// The screenshot UI and a pen in hand during a recording hide the pile for two reasons: it
+/// is hidden while either holds and comes back only
 /// when both are gone, and only the edges count (fade, shake gate).
 #[test]
 fn hidden_reasons_combine() {
-    let mut state = FairyState::new(21);
+    let mut state = IgorioState::new(21);
     hold(&mut state, 0.0);
     assert!(state.set_hidden(Hidden::Drawing, true, 1.0), "hidden: an edge");
     assert!(!state.set_hidden(Hidden::Drawing, true, 1.05), "already hidden");

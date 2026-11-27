@@ -1,6 +1,6 @@
-//! Timing and decision rules for pasting a screenshot into another app: write the pasteboard,
-//! press ⌘V, learn whether it was taken, put the user's clipboard back. Pure; `PasteTarget` in
-//! the app runs it against the real pasteboard and event system.
+//! Timing and decision rules for pasting a screenshot into another app: write the clipboard,
+//! press Ctrl+V, learn whether it was taken, put the user's clipboard back. Pure; the drop router
+//! in the app runs it against the real clipboard and keyboard input.
 
 // MARK: Sequencing
 
@@ -12,9 +12,9 @@ pub const MOUSE_UP_TIMEOUT: f64 = 1.0;
 pub const AFTER_MOUSE_UP_DELAY: f64 = 0.08;
 /// After asking the target app to activate, how long to wait for it to become frontmost.
 pub const ACTIVATION_TIMEOUT: f64 = 0.6;
-/// Between collapsing the selection (→) and pressing ⌘V.
+/// Between collapsing the selection (→) and pressing Ctrl+V.
 pub const COLLAPSE_TO_PASTE_DELAY: f64 = 0.06;
-/// Between closing a whiteboard's fresh text box (esc) and pressing ⌘V.
+/// Between closing a whiteboard's fresh text box (esc) and pressing Ctrl+V.
 pub const DISMISS_TO_PASTE_DELAY: f64 = 0.18;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,10 +25,10 @@ pub enum MouseUpStep {
 
 // MARK: Terminals: wait out copy-on-select
 
-/// Terminals (iTerm, and TUIs like Claude Code through it) copy the selection to the
+/// Terminals with copy-on-select (and TUIs like Claude Code in them) copy the selection to the
 /// clipboard on every mouse-up: the double-clicked word, or the whole wrapped line when a
 /// third click follows. A copy that lands after our write replaces the screenshot, and the
-/// ⌘V then pastes that text. So for terminals the keystroke waits until the clicking is over
+/// Ctrl+V then pastes that text. So for terminals the keystroke waits until the clicking is over
 /// and the clipboard has been quiet for a moment.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TerminalSettle {
@@ -75,7 +75,7 @@ impl TerminalSettle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverwriteStep {
-    /// Put the screenshot back: the ⌘V has not been served yet and would paste their text.
+    /// Put the screenshot back: the Ctrl+V has not been served yet and would paste their text.
     Rewrite,
     /// The paste was already served; treat the write as selection noise and still restore
     /// the user's clipboard afterwards.
@@ -84,7 +84,7 @@ pub enum OverwriteStep {
     Leave,
 }
 
-/// How long after ⌘V a foreign clipboard write is taken for the click's own side effect
+/// How long after Ctrl+V a foreign clipboard write is taken for the click's own side effect
 /// rather than the user copying something.
 pub const OVERWRITE_WINDOW: f64 = 1.0;
 pub const MAX_REWRITES: u32 = 3;
@@ -142,12 +142,12 @@ pub fn mouse_up_step(elapsed: f64, buttons_down: bool) -> MouseUpStep {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyRoute {
-    /// Post into the session event stream: the frontmost app receives it exactly like real
-    /// typing (menu key equivalents, modifier state and all). Preferred.
+    /// Send as system input: the foreground app receives it exactly like real typing
+    /// (accelerators, modifier state and all). Preferred.
     Session,
-    /// Post straight to a process. Only a fallback: many native apps (SwiftUI/AppKit text
-    /// views that consult the global modifier state, Catalyst apps) ignore a ⌘V delivered
-    /// this way, which is why pasting into e.g. the ChatGPT app silently did nothing.
+    /// Post straight to a process. Only a fallback: many apps read the global modifier state
+    /// and ignore a Ctrl+V delivered this way, which is why pasting into e.g. the ChatGPT app
+    /// silently did nothing.
     Process(i32),
 }
 
@@ -181,9 +181,9 @@ pub enum Outcome {
 }
 
 /// Decides whether the paste was taken from two signals:
-///  - `reads`: how many times another process asked for the pasteboard data we promised.
-///    No read at all means the ⌘V never reached a paste handler (or the field only takes
-///    text and saw no text) — the screenshot must stay in the fairy's hands.
+///  - `reads`: how many times another process asked for the clipboard data we promised.
+///    No read at all means the Ctrl+V never reached a paste handler (or the field only takes
+///    text and saw no text) — the screenshot must stay on the pile.
 ///  - `probe_changed`: the accessibility fingerprint of a single-line field changed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OutcomeRules {
@@ -263,15 +263,15 @@ pub enum RestoreStep {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RestoreRules {
-    /// Never restore earlier than this after ⌘V (apps may read late, e.g. after an await).
+    /// Never restore earlier than this after Ctrl+V (apps may read late, e.g. after an await).
     pub min_delay: f64,
     /// Restore once the last read is this old…
     pub quiet_after_read: f64,
     /// …and in any case by this time.
     pub max_delay: f64,
-    /// Nobody has read the screenshot yet: the ⌘V may still be waiting in a busy app's queue
+    /// Nobody has read the screenshot yet: the Ctrl+V may still be waiting in a busy app's queue
     /// (Chromium apps can be frozen for seconds). Putting the user's clipboard back now would
-    /// make that late ⌘V paste their text instead, so hold the screenshot there much longer.
+    /// make that late Ctrl+V paste their text instead, so hold the screenshot there much longer.
     pub no_read_delay: f64,
 }
 
@@ -287,15 +287,15 @@ impl Default for RestoreRules {
 }
 
 impl RestoreRules {
-    /// - pasteboard_unchanged: nobody wrote the pasteboard since our write (if the user copied
+    /// - clipboard_unchanged: nobody wrote the clipboard since our write (if the user copied
     ///   something meanwhile, or a later paste of the same pile wrote it, leave it alone).
     pub fn step(
         &self,
         since_send: f64,
         since_last_read: Option<f64>,
-        pasteboard_unchanged: bool,
+        clipboard_unchanged: bool,
     ) -> RestoreStep {
-        if !pasteboard_unchanged {
+        if !clipboard_unchanged {
             return RestoreStep::Abandon;
         }
         let Some(quiet) = since_last_read else {
@@ -319,7 +319,7 @@ impl RestoreRules {
     }
 }
 
-/// The pasteboard types written for an image paste. Image types are promised lazily (so
+/// The clipboard types written for an image paste. Image types are promised lazily (so
 /// reads can be observed); terminals also get a shell-quoted path as text.
 pub fn image_types(for_terminal: bool) -> Vec<&'static str> {
     let types = vec!["public.png", "public.tiff"];

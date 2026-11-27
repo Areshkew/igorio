@@ -20,7 +20,7 @@ fn distance(a: Point, b: Point) -> f64 {
 }
 
 #[test]
-fn defaults_match_swift() {
+fn defaults_are_the_designed_values() {
     let follower = Follower::new();
     assert_eq!(follower.offset.dx, 14.0);
     assert_eq!(follower.offset.dy, 18.0);

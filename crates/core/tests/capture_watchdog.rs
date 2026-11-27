@@ -1,4 +1,4 @@
-//! Translated from `fairy-cursor/tests/core/CaptureWatchdogTests.swift`.
+//! The stale screenshot-session watchdog.
 
 use igorio_core::capture_watchdog::CaptureWatchdog;
 

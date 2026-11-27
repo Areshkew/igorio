@@ -2,7 +2,7 @@
 
 Use PowerShell. Give each capture time to finish before the next. Save the log if an expected line is missing. The watcher reads the clipboard and prints metadata. Test the app’s pile behavior separately with the watcher stopped, since the watcher is another process.
 
-1. Set `$env:FAIRY_DEBUG='1'`, then run `cargo run -p igorio-app --example snip_watch --release`. Expect `START detector, Ctrl+C to stop` and a `LOG ... FOLDER watching` line. The folder can be missing until the first saved screenshot.
+1. Set `$env:IGORIO_DEBUG='1'`, then run `cargo run -p igorio-app --example snip_watch --release`. Expect `START detector, Ctrl+C to stop` and a `LOG ... FOLDER watching` line. The folder can be missing until the first saved screenshot.
 2. Press Win+Shift+S and drag a rectangle. Expect `CaptureUiShown`, `CaptureUiGone`, and exactly one `Captured source=Snip`. At 125% on the monitor under the pointer, expect `scale=1.25`. Sequence-change messages and duplicate clipboard updates can appear without adding a second capture.
 3. With Snipping Tool auto-save enabled, repeat step 2. If the saved path arrives in time, expect `Captured source=Snip ... file=Some(...)`. Look for `LOG ... HDROP ... folder=... watching=... same_folder=...` to compare the saved path with the watched folder. If the path arrives after 400 ms, the one capture can show `file=None`.
 4. Press Win+Shift+S and cancel with Esc. Expect `CaptureUiShown`, `CaptureUiGone`, and no `Captured` line. Then right-click a browser picture and choose Copy image. Expect `Ignored reason="image accompanied by HTML or text"` or, for an image-only copy, `Ignored reason="image without recent capture evidence"`.
@@ -11,5 +11,5 @@ Use PowerShell. Give each capture time to finish before the next. Save the log i
 7. Press Win+PrtScn. Expect `LOG ... FILE path=` and one `Captured source=FullScreenFile ... file=Some(...)`. If Windows also publishes a same-sized clipboard image, expect `LOG ... PAIR matched` and still only one capture.
 8. After five seconds, select a PNG in File Explorer and press Ctrl+C. Expect `Ignored reason="file-transfer format"`.
 9. Copy an existing image from another app without invoking a screenshot shortcut. For an image-only copy, expect `Ignored reason="image without recent capture evidence"`. Then copy ordinary text and expect `Ignored reason="no supported image format"`.
-10. Press Ctrl+C in the watcher and expect `STOP detector`. Start the actual app with `FAIRY_DEBUG=1` and repeat a snip. The pile should hide during selection and return with one new card. A double-click during selection should leave the pile alone.
+10. Press Ctrl+C in the watcher and expect `STOP detector`. Start the actual app with `IGORIO_DEBUG=1` and repeat a snip. The pile should hide during selection and return with one new card. A double-click during selection should leave the pile alone.
 11. In the actual app, paste a held image and allow the app to restore the clipboard. Expect no new screenshot card and no `CLIPBOARD seq=` lines for the app’s own stage, render, and restore in `%LOCALAPPDATA%\Igorio\snip.log`.

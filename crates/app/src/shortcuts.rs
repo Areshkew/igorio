@@ -137,9 +137,8 @@ impl Action {
         }
     }
 
-    /// The shortcut a fresh install has, from the ROADMAP table. Recording, pen and
-    /// highlighter keep the digits of the macOS app (`RecordingInput.swift`: Cmd+Shift+6, 7,
-    /// 8), with Ctrl for Cmd.
+    /// The shortcut a fresh install has, from the ROADMAP table: Ctrl+Shift+6, 7 and 8 for
+    /// recording, pen and highlighter.
     pub fn default_chord(self) -> Option<Chord> {
         let ctrl_shift = |vk: u16| Chord {
             ctrl: true,

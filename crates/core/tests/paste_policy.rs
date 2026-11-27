@@ -51,7 +51,7 @@ fn test_multiline_read_means_accepted() {
 
 #[test]
 fn test_multiline_no_read_means_failed_not_silently_dropped() {
-    // The old code assumed every multi-line paste was accepted, so a ⌘V the app ignored
+    // The old code assumed every multi-line paste was accepted, so a Ctrl+V the app ignored
     // (ChatGPT) dropped the screenshot — and the clipboard was restored, so it was gone.
     let r = OutcomeRules::new(false, false);
     assert_eq!(r.evaluate(1.0, 0, false), Outcome::Pending);
@@ -123,7 +123,7 @@ fn test_waits_while_the_app_is_still_reading() {
 
 #[test]
 fn test_without_any_read_holds_the_screenshot_longer() {
-    // The ⌘V may still be queued in a busy app: restoring now would paste the user's text.
+    // The Ctrl+V may still be queued in a busy app: restoring now would paste the user's text.
     let r = RestoreRules::default();
     assert_eq!(r.step(2.0, None, true), RestoreStep::Wait);
     assert_eq!(r.step(6.0, None, true), RestoreStep::Wait);
@@ -137,13 +137,13 @@ fn test_restores_by_max_delay_even_if_reads_continue() {
 }
 
 #[test]
-fn test_abandons_when_someone_else_wrote_the_pasteboard() {
+fn test_abandons_when_someone_else_wrote_the_clipboard() {
     let r = RestoreRules::default();
     assert_eq!(r.step(0.1, None, false), RestoreStep::Abandon);
     assert_eq!(r.step(9.0, None, false), RestoreStep::Abandon);
 }
 
-// MARK: Pasteboard contents
+// MARK: Clipboard contents
 
 #[test]
 fn test_image_types() {
@@ -160,8 +160,8 @@ fn test_shell_quoting() {
         "/Users/a/Pictures/x.png "
     );
     assert_eq!(
-        shell_quoted("/Users/a/Fairy Cursor/Screenshot 1.png"),
-        "'/Users/a/Fairy Cursor/Screenshot 1.png' "
+        shell_quoted("/Users/a/My Pictures/Screenshot 1.png"),
+        "'/Users/a/My Pictures/Screenshot 1.png' "
     );
     assert_eq!(shell_quoted("/tmp/it's.png"), "'/tmp/it'\\''s.png' ");
     assert_eq!(shell_quoted("/tmp/a(1).png"), "'/tmp/a(1).png' ");
@@ -177,7 +177,7 @@ fn test_waits_while_a_third_click_is_held() {
 
 #[test]
 fn test_waits_for_the_copy_on_select_after_the_last_mouse_up() {
-    // iTerm copies the selection ~10 ms after each mouse-up.
+    // A copy-on-select terminal copies the selection ~10 ms after each mouse-up.
     let settle = TerminalSettle::default();
     assert_eq!(settle.step(0.05, false, 0.05, None), MouseUpStep::Wait);
     assert_eq!(settle.step(0.2, false, 0.2, None), MouseUpStep::Proceed);

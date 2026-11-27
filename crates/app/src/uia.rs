@@ -1,5 +1,5 @@
 //! UI Automation: what is at a screen point, answered off the UI thread within a deadline.
-//! From `AXNode.swift` and the lookup half of `DropSpotInfo.resolve` in `DropRouter.swift`.
+//! The drop router decides from the answer.
 //!
 //! # Threads
 //!
@@ -50,7 +50,7 @@
 //!
 //! # Deadline and hung apps
 //!
-//! Each request has a deadline (default [`DEFAULT_DEADLINE`], 250 ms as in `AXNode.swift`).
+//! Each request has a deadline (default [`DEFAULT_DEADLINE`], 250 ms).
 //! The worker checks it before every call and sets the `IUIAutomation2` connection and
 //! transaction timeouts to the time left, so a call into a slow app returns
 //! `UIA_E_TIMEOUT` around the deadline. The controller posts `TimedOut` at the deadline
@@ -116,9 +116,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, BSTR, Error, HRESULT, Interface, PWSTR, Result};
 
-/// How long a requester waits by default, as in `AXNode.swift`.
+/// How long a requester waits by default.
 pub const DEFAULT_DEADLINE: Duration = Duration::from_millis(250);
-/// Parent calls per lookup. `AXNode.chain` walks 12 levels too.
+/// Parent calls per lookup.
 pub const MAX_ANCESTORS: usize = 12;
 /// Cross-process calls per lookup: hit, focus, ancestors, page address, nearby search.
 pub const MAX_CALLS: u32 = 4 + MAX_ANCESTORS as u32;
@@ -127,9 +127,9 @@ pub const STUCK_GRACE: Duration = Duration::from_millis(750);
 /// Worker threads alive at once, abandoned ones included.
 pub const MAX_WORKERS: usize = 3;
 /// Levels above the focused element a probe looks for the container whose images it
-/// counts (`AcceptanceProbe` in `PasteTarget.swift`: 5).
+/// counts.
 pub const PROBE_ANCESTORS: usize = 5;
-/// Characters of the value hashed by a probe (`AcceptanceProbe`: 4000).
+/// Characters of the value hashed by a probe.
 pub const PROBE_VALUE_CHARS: usize = 4000;
 /// Native window classes of text-editing controls that may expose no Text or Value pattern,
 /// matched without case. An element with its own window of one of these classes takes typed
@@ -391,7 +391,7 @@ impl Probe {
 }
 
 /// How many of `roles` (the focused element's parents, nearest first) a probe searches
-/// under: it stops below a window, page or application (`AcceptanceProbe.init`).
+/// under: it stops below a window, page or application.
 pub fn probe_container_levels(roles: &[&str]) -> usize {
     roles
         .iter()
@@ -439,9 +439,9 @@ pub struct ElementInfo {
     pub url: Option<String>,
     /// Derived: [`is_editable_text_root`].
     pub editable_root: bool,
-    /// Derived: the macOS role ([`map_role`]).
+    /// Derived: the core's role name ([`map_role`]).
     pub role: &'static str,
-    /// Derived: the macOS subrole ([`map_role`]).
+    /// Derived: the core's subrole name ([`map_role`]).
     pub subrole: Option<&'static str>,
 }
 
@@ -805,8 +805,7 @@ fn is_page(e: &ElementInfo) -> bool {
     e.control_type == UIA_DocumentControlTypeId.0 && is_web(e) && !e.editable_root
 }
 
-/// Does this element itself take typed text? The Windows stand-in for macOS's settable
-/// `AXValue` with a selection. In order:
+/// Does this element itself take typed text? (The core's "settable text value".) In order:
 /// - Password fields, disabled elements and a read-only Value pattern: no.
 /// - A TextEdit pattern (WinUI, Chromium editables): yes.
 /// - A writable Value pattern on a text-like element (Win32 Edit, WPF and WinUI TextBox,
@@ -872,11 +871,11 @@ pub fn is_multiline_web_editor(e: &ElementInfo) -> bool {
             .any(|class| RICH_EDITOR_CLASSES.contains(&class))
 }
 
-/// The macOS role (and subrole) the core rules expect for a UI Automation element. Uses the
-/// input fields of `e`, not its derived ones.
+/// The role (and subrole) name the core rules expect for a UI Automation element. The core
+/// uses `AX…` names for roles. Uses the input fields of `e`, not its derived ones.
 #[allow(non_upper_case_globals)] // The SDK's control type constants, matched by name.
 pub fn map_role(e: &ElementInfo) -> (&'static str, Option<&'static str>) {
-    // macOS's window element; Chrome's top-level window is a Pane, so the handle decides.
+    // A top-level window; Chrome's top-level window is a Pane, so the handle decides.
     if e.top_level {
         return ("AXWindow", None);
     }
@@ -888,8 +887,8 @@ pub fn map_role(e: &ElementInfo) -> (&'static str, Option<&'static str>) {
                 return ("AXTextField", Some("AXSecureTextField"));
             }
             if !editable {
-                // A read-only or disabled field: macOS shows such text as a label, and an
-                // editable role would make the core treat it as a paste target.
+                // A read-only or disabled field: a label to the core, since an editable
+                // role would make the core treat it as a paste target.
                 "AXStaticText"
             } else if aria == "searchbox" {
                 "AXSearchField"
@@ -912,7 +911,7 @@ pub fn map_role(e: &ElementInfo) -> (&'static str, Option<&'static str>) {
         UIA_ButtonControlTypeId => "AXButton",
         UIA_CheckBoxControlTypeId => "AXCheckBox",
         // An editable combo box takes text (AXComboBox); a drop-down list (Chrome <select>,
-        // CBS_DROPDOWNLIST) has a read-only value and is macOS's pop-up button.
+        // CBS_DROPDOWNLIST) has a read-only value and is a pop-up button to the core.
         UIA_ComboBoxControlTypeId if editable => "AXComboBox",
         UIA_ComboBoxControlTypeId => "AXPopUpButton",
         UIA_HyperlinkControlTypeId => "AXLink",
@@ -936,10 +935,10 @@ pub fn map_role(e: &ElementInfo) -> (&'static str, Option<&'static str>) {
         UIA_SliderControlTypeId => "AXSlider",
         UIA_SpinnerControlTypeId => "AXIncrementor",
         UIA_TabControlTypeId => "AXTabGroup",
-        // macOS draws tabs as radio buttons.
+        // The core treats tabs as radio buttons.
         UIA_TabItemControlTypeId => "AXRadioButton",
-        // Window chrome without a macOS element (title bar, status bar, app bar): a
-        // toolbar, so it is neither a drop spot nor a canvas.
+        // Window chrome (title bar, status bar, app bar): a toolbar to the core, so it is
+        // neither a drop spot nor a canvas.
         UIA_ToolBarControlTypeId
         | UIA_TitleBarControlTypeId
         | UIA_StatusBarControlTypeId
@@ -955,7 +954,7 @@ pub fn map_role(e: &ElementInfo) -> (&'static str, Option<&'static str>) {
         | UIA_HeaderControlTypeId
         | UIA_CalendarControlTypeId
         | UIA_SemanticZoomControlTypeId => "AXGroup",
-        // Custom controls (and anything unknown) are macOS's unknown role.
+        // Custom controls (and anything unknown) have the unknown role.
         _ => "AXUnknown",
     };
     (role, None)

@@ -1,4 +1,4 @@
-//! Freehand has no Swift test; these cover the translation's edges.
+//! Edge cases of the freehand stroke outline.
 
 use igorio_core::freehand::{outline, path, Options, PathCmd};
 use igorio_core::geom::Point;

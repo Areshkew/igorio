@@ -1,4 +1,4 @@
-//! Software renderer for the overlay panel. Ports `FairyView.swift` to tiny-skia:
+//! Software renderer for the overlay panel, with tiny-skia:
 //! a tilted pile of screenshots with a hairline, a soft slate shadow and an optional
 //! hint, plus the recording badge. Everything is drawn in physical pixels.
 
@@ -770,7 +770,7 @@ impl Renderer {
     }
 
     fn build_hint_sprite(&mut self, text: &str, s: f32) -> HintSprite {
-        // White text on a dark pill. A glow behind the text (the Swift look) reads as
+        // White text on a dark pill. A glow behind the text reads as
         // blur whenever its colour contrasts with the desktop; a hard-edged pill does not.
         let font = &self.semibold;
         let px = 11.0 * s;

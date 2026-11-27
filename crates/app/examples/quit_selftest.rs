@@ -265,7 +265,7 @@ impl Case {
         .map(|id| (id.to_string(), serde_json::Value::Null))
         .collect();
         let settings = serde_json::json!({
-            "capabilities": { "fairy.screenshots": false },
+            "capabilities": { "igorio.screenshots": false },
             "notes_folder": case.notes,
             "captures_folder": case.captures,
             "keep_every_screenshot": false,
@@ -303,8 +303,8 @@ impl Case {
         let child = Command::new(app)
             .env("APPDATA", &self.roaming)
             .env("LOCALAPPDATA", &self.local)
-            .env("FAIRY_DEBUG", "1")
-            .env_remove("FAIRY_CAPTURABLE")
+            .env("IGORIO_DEBUG", "1")
+            .env_remove("IGORIO_CAPTURABLE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr)

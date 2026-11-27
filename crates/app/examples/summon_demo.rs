@@ -109,7 +109,7 @@ fn run(modifier: Modifier, tools: &[ToolId], seconds: Option<f64>) -> Result<(),
         modifier,
         enabled: true,
         debug: true,
-        capturable: std::env::var_os("FAIRY_CAPTURABLE").is_some_and(|v| v == "1"),
+        capturable: std::env::var_os("IGORIO_CAPTURABLE").is_some_and(|v| v == "1"),
     };
     let mut summoner = Summoner::start(config, requester)?;
     let record = tools.contains(&ToolId::RecordScreen);
@@ -146,7 +146,7 @@ fn run(modifier: Modifier, tools: &[ToolId], seconds: Option<f64>) -> Result<(),
         summoner.drain(&mut out);
         for event in &out {
             match event {
-                SummonerEvent::Log(line) => println!("FAIRY_DEBUG {line}"),
+                SummonerEvent::Log(line) => println!("IGORIO_DEBUG {line}"),
                 SummonerEvent::MenuOpened => {}
                 SummonerEvent::ToolChosen(chosen) => println!(
                     "TOOL {} at {},{} (t={:.3}): {} | {}",
@@ -162,11 +162,11 @@ fn run(modifier: Modifier, tools: &[ToolId], seconds: Option<f64>) -> Result<(),
         if Instant::now() >= next_check {
             next_check = Instant::now() + Duration::from_secs(1);
             if !mouse.is_alive() || mouse.seems_stalled() {
-                println!("FAIRY_DEBUG {:10.3} mouse hook restarted", hook::now());
+                println!("IGORIO_DEBUG {:10.3} mouse hook restarted", hook::now());
                 let _ = mouse.restart();
             }
             if !summoner.is_alive() {
-                println!("FAIRY_DEBUG {:10.3} summoner restarted", hook::now());
+                println!("IGORIO_DEBUG {:10.3} summoner restarted", hook::now());
                 summoner.restart()?;
             }
         }

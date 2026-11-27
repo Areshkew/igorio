@@ -1,5 +1,5 @@
 //! What is under the cursor for notes: whether the tool menu may open at a spot, and where a
-//! note made there comes from (desktop, app window, web page). From `NoteContext.swift`.
+//! note made there comes from (desktop, app window, web page).
 //!
 //! Both rules are pure functions over a UI Automation answer ([`Outcome`], a [`Snapshot`]
 //! from `uia`) plus a few Win32 facts about the window at the point ([`WindowFacts`]). The
@@ -16,7 +16,7 @@
 //! failed allows it too (unless the window is a terminal): a wrong open costs little, the
 //! menu shows and releasing Alt closes it.
 //!
-//! It used to open only over empty background (a page margin, the desktop, as in Swift). That
+//! It used to open only over empty background (a page margin, the desktop). That
 //! proved hard to find: holding Alt over a button or text did nothing, and the feature looked
 //! broken.
 //!
@@ -32,8 +32,8 @@
 //!   the top-level window title. Electron apps are apps, not pages: their address is an
 //!   internal one.
 //!
-//! The Swift code stores the window's document path (`AXDocument`). UI Automation has no
-//! such property and nothing cheap in Win32 gives it, so `url` stays empty for apps; the
+//! The window's document path is not stored: UI Automation has no such property and nothing
+//! cheap in Win32 gives it, so `url` stays empty for apps; the
 //! window title usually names the file ("notes.txt - Notepad").
 
 use std::collections::HashMap;

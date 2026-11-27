@@ -7,16 +7,16 @@ use crate::geom::{Point, Rect};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoubleClick {
     pub is_holding: bool,
-    /// The system screenshot UI is up (the fairy is hidden).
+    /// The system screenshot UI is up (the pile is hidden).
     pub hidden_for_capture: bool,
     /// A delivery is already in progress.
     pub busy: bool,
     pub click_count: i32,
-    /// The element under the cursor belongs to Fairy Cursor itself (a note): notes handle
+    /// The element under the cursor belongs to this app itself (a note): notes handle
     /// their own double-click.
     pub target_is_own_process: bool,
-    pub is_finder: bool,
-    pub finder_drop_spot: bool,
+    pub is_explorer: bool,
+    pub explorer_drop_spot: bool,
     /// The element under the cursor (or its editable ancestor) takes typed text.
     pub editable_under_cursor: bool,
     /// A terminal that did not answer the accessibility lookup in time (busy printing): its
@@ -32,8 +32,8 @@ impl Default for DoubleClick {
             busy: false,
             click_count: 2,
             target_is_own_process: false,
-            is_finder: false,
-            finder_drop_spot: false,
+            is_explorer: false,
+            explorer_drop_spot: false,
             editable_under_cursor: false,
             silent_terminal: false,
         }
@@ -43,7 +43,7 @@ impl Default for DoubleClick {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Ignore,
-    SaveToFinder,
+    SaveToExplorer,
     Paste,
     /// Not recognisably a text input yet: after the mouse-up, ask the app what got focus
     /// (custom composers, placeholder overlays, web views that expose inputs late).
@@ -59,9 +59,9 @@ pub fn decide(c: &DoubleClick) -> Action {
     {
         return Action::Ignore;
     }
-    if c.is_finder {
-        return if c.finder_drop_spot {
-            Action::SaveToFinder
+    if c.is_explorer {
+        return if c.explorer_drop_spot {
+            Action::SaveToExplorer
         } else {
             Action::Ignore
         };
@@ -75,7 +75,7 @@ pub fn decide(c: &DoubleClick) -> Action {
 
 /// After the mouse-up, no text input was found but the spot looks like a canvas (a slide, a
 /// Figma board): paste there unless typing is visibly going somewhere else, in which case
-/// the ⌘V would land in that field instead of on the canvas.
+/// the Ctrl+V would land in that field instead of on the canvas.
 pub fn confirm_canvas_drop(
     point: Point,
     canvas_spot: bool,

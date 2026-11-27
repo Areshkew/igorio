@@ -152,7 +152,7 @@ fn flush_writes_at_once() {
 }
 
 #[test]
-fn the_file_format_is_exactly_the_swift_format() {
+fn the_file_format_is_exactly_the_documented_format() {
     let scratch = Scratch::new("format");
     let folder = scratch.folder("notes");
     let windows = scratch.path("note-windows.json");
@@ -204,7 +204,7 @@ Eggs";
     drop(store);
     let reopened = NoteStore::new(&folder, &windows, at(CREATED));
     let mut expected_note = known.clone();
-    // Like Swift, `updatedAt` comes from the file's modification date, not from the content.
+    // `updatedAt` comes from the file's modification date, not from the content.
     expected_note.updated_at = modified;
     assert_eq!(reopened.note(note_id), Some(&expected_note));
 }
@@ -353,7 +353,7 @@ fn a_long_first_line_is_cut_to_48_characters() {
 
 #[test]
 fn windows_invalid_characters_never_appear_in_a_file_stem() {
-    // The Swift rules remove ':' and turn '/' and '\' into '-'; the Windows rules must catch
+    // The naming rules remove ':' and turn '/' and '\' into '-'; the Windows rules must catch
     // the rest and every control character.
     for character in ['<', '>', '"', '/', '\\', '|', '?', '\u{1}', '\u{1f}'] {
         let stem = note(id(6), &format!("a{character}b")).file_stem();
@@ -366,8 +366,8 @@ fn windows_invalid_characters_never_appear_in_a_file_stem() {
             "character {character:?} survived as {stem:?}"
         );
     }
-    assert_eq!(note(id(6), "a:b").file_stem(), "ab", "Swift removes ':'");
-    assert_eq!(note(id(6), "a*b").file_stem(), "ab", "Swift strips Markdown markers");
+    assert_eq!(note(id(6), "a:b").file_stem(), "ab", "':' is removed");
+    assert_eq!(note(id(6), "a*b").file_stem(), "ab", "Markdown markers are stripped");
     assert_eq!(note(id(6), "c:\\temp").file_stem(), "c-temp");
 }
 
@@ -596,7 +596,7 @@ fn the_hidden_state_survives_a_restart_and_old_files_read_as_shown() {
         assert!(store.flush().is_empty());
     }
     let file = fs::read_to_string(&windows).unwrap();
-    // Only a hidden note carries the key; the others stay as the Swift app wrote them.
+    // Only a hidden note carries the key; the others are written without it.
     assert_eq!(file.matches("isHidden").count(), 1, "{file}");
 
     let mut reopened = NoteStore::new(&folder, &windows, at(CREATED));
@@ -609,7 +609,7 @@ fn the_hidden_state_survives_a_restart_and_old_files_read_as_shown() {
     assert!(reopened.flush().is_empty());
     assert!(!fs::read_to_string(&windows).unwrap().contains("isHidden"));
 
-    // A windows file without the key (as the Swift app and older builds write it) reads as
+    // A windows file without the key (as older builds write it) reads as
     // open and not hidden.
     let older = NoteStore::new(&folder, &windows, at(CREATED));
     assert!(!older.note(hidden).unwrap().is_hidden);
@@ -655,7 +655,7 @@ fn recent_is_sorted_by_updated_at_newest_first() {
 }
 
 #[test]
-fn origin_labels_and_details_match_swift() {
+fn origin_labels_and_details() {
     assert_eq!(NoteOrigin::desktop().label(), "Desktop");
     assert_eq!(NoteOrigin::desktop().detail(), "Desktop");
 

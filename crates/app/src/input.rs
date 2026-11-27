@@ -1,5 +1,5 @@
-//! Synthetic keystrokes for the paste, from `Keys.swift`: `Ctrl+V`, and the Right arrow and
-//! Escape that `PasteTarget.swift` presses before it.
+//! Synthetic keystrokes for the paste: `Ctrl+V`, and the Right arrow or Escape pressed
+//! before it.
 //!
 //! Rule 7: [`send_guarded`] is the only way keys go out. It runs the caller's last check (the
 //! clipboard still holds our staging), then reads the foreground window, its process, the

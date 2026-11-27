@@ -1007,20 +1007,20 @@ const ANIM_TIMER: usize = 0x4e01;
 const WATCHDOG_TIMER: usize = 0x4e02;
 const RETRY_TIMER: usize = 0x4e03;
 
-/// `FAIRY_DEBUG=1`: the repaint watchdog is on (a one-shot timer per repaint asked for).
+/// `IGORIO_DEBUG=1`: the repaint watchdog is on (a one-shot timer per repaint asked for).
 pub fn debug_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     match DEBUG_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
         1 => false,
         2 => true,
         _ => *ENABLED
-            .get_or_init(|| std::env::var_os("FAIRY_DEBUG").is_some_and(|value| value == "1")),
+            .get_or_init(|| std::env::var_os("IGORIO_DEBUG").is_some_and(|value| value == "1")),
     }
 }
 
 static DEBUG_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Tests: debug logging on or off regardless of `FAIRY_DEBUG` (`None` follows it again).
+/// Tests: debug logging on or off regardless of `IGORIO_DEBUG` (`None` follows it again).
 #[doc(hidden)]
 pub fn test_set_debug(enabled: Option<bool>) {
     let value = match enabled {
@@ -1032,7 +1032,7 @@ pub fn test_set_debug(enabled: Option<bool>) {
 }
 
 /// One line in the app's debug log (`%LOCALAPPDATA%\Igorio\debug.log`, or the file
-/// `IGORIO_DEBUG_LOG` names), only with `FAIRY_DEBUG=1`. Never fails.
+/// `IGORIO_DEBUG_LOG` names), only with `IGORIO_DEBUG=1`. Never fails.
 pub fn debug_line(text: &str) {
     use std::io::Write as _;
     if !debug_enabled() {
@@ -3911,7 +3911,7 @@ impl State {
                 }
             }
             VK_ESCAPE => {
-                // No Escape action in the macOS note editor; swallow it so no dialog code acts.
+                // Escape does nothing in a note; swallow it so no dialog code acts.
                 self.eat_char.set(Some(0x1b));
                 return handled;
             }

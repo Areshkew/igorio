@@ -1,7 +1,7 @@
 //! Pure Markdown note text: styling spans, list continuation and screenshot insertion.
 //!
 //! The expected spans are written out so each scanner's language is visible: anchors, greedy and
-//! lazy parts, what may or may not cross a line break, and the escapes in the Swift patterns.
+//! lazy parts, what may or may not cross a line break, and the escapes in the patterns.
 
 use std::time::Instant;
 
@@ -162,7 +162,7 @@ fn style_table() {
                 (4, 5, Kind::Body, false),
             ],
         ),
-        // Bold inside a heading keeps the heading's size (Swift's `embolden` does), so the run
+        // Bold inside a heading keeps the heading's size, so the run
         // stays a heading span; only its delimiters are marked.
         (
             "## **bold**",
@@ -231,7 +231,7 @@ fn style_table() {
                 (4, 5, Kind::Code, true),
             ],
         ),
-        // There is no fenced-code rule in the Swift styler: three backticks stay body text.
+        // There is no fenced-code rule in the styler: three backticks stay body text.
         ("```\ncode\n```", &[(0, 12, Kind::Body, false)]),
         // Links; the brackets and the target are markers, the label is link text.
         (
@@ -361,7 +361,7 @@ fn style_table() {
 }
 
 #[test]
-fn looks_match_the_swift_values() {
+fn looks_match_the_design_values() {
     assert_eq!(
         look(Kind::Body),
         Look {

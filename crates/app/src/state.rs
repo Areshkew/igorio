@@ -1,8 +1,7 @@
-//! The overlay's facts, translated from `fairy-cursor/sources/app/FairyState.swift`.
+//! The overlay's facts: the pile, its animations, the hint and why it is hidden.
 //!
 //! No clocks, timers or threads: every operation that depends on time takes `now` (seconds,
-//! monotonic) and everything that would be a `Timer` or `DispatchQueue.main.asyncAfter` in
-//! Swift becomes a stored deadline. `tick` runs whatever is due, `next_deadline` says when to
+//! monotonic) and everything that would be a timer becomes a stored deadline. `tick` runs whatever is due, `next_deadline` says when to
 //! tick next. Deadlines cascade from the deadline that triggered them, so a late tick ends in
 //! the same state as many small ones.
 //!
@@ -29,7 +28,7 @@ const CAPTURE_FADE: f64 = 0.15;
 const WOBBLE: f64 = 0.42;
 /// A new (or restored) card growing in, and a card sliding to a new depth.
 const STACK_ANIMATION: f64 = 0.22;
-/// Leave animations (`FairyView.swift`); the card is dropped a little after the animation ends.
+/// Leave animations; the card is dropped a little after the animation ends.
 const DISSOLVE_ANIMATION: f64 = 0.22;
 const DROP_ANIMATION: f64 = 0.26;
 const DISSOLVE_FINISH: f64 = 0.26;
@@ -37,12 +36,12 @@ const DROP_FINISH: f64 = 0.30;
 /// Delivered cards leave one after the other, this far apart.
 const DELIVER_STEP: f64 = 0.36;
 
-/// Why the fairy steps out of the way (`AppDelegate.captureUIOwners`, by owner).
+/// Why the pile steps out of the way, by owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hidden {
     /// The system screenshot UI is up (the screenshot detector).
     CaptureUi,
-    /// A pen or highlighter is in hand during a recording: the fairy must not follow the pen
+    /// A pen or highlighter is in hand during a recording: the pile must not follow the pen
     /// around the video, and scribbling is not a shake.
     Drawing,
 }
@@ -56,7 +55,7 @@ impl Hidden {
     }
 }
 
-/// A deferred step: the Rust stand-in for one `Timer` or `asyncAfter` closure.
+/// A deferred step, run by `tick` when its deadline is due.
 #[derive(Debug, Clone)]
 enum Task {
     /// Take the hint down again if it still says `text`.
@@ -118,7 +117,7 @@ impl Appearance {
     }
 }
 
-/// The stacking ease (SwiftUI's spring is replaced with an ease-out cubic).
+/// The stacking ease: an ease-out cubic.
 fn ease_out(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t).powi(3)
@@ -131,7 +130,7 @@ fn ease_out(t: f64) -> f64 {
 /// `is_animating(now)` is true, draw every frame. Otherwise sleep until `next_deadline()`, or
 /// until input arrives when it is `None`.
 #[derive(Debug, Clone)]
-pub struct FairyState {
+pub struct IgorioState {
     pile: HeldPile<HeldCard>,
     hint: Option<String>,
     /// The text that is fading out: still drawn, but `hint` is already `None`.
@@ -141,7 +140,7 @@ pub struct FairyState {
     hint_target: f64,
     reject_tick: u64,
     last_reject_at: Option<f64>,
-    /// Why the fairy is hidden: a set of [`Hidden`] bits. Shown again when it is empty.
+    /// Why the pile is hidden: a set of [`Hidden`] bits. Shown again when it is empty.
     hidden: u8,
     opacity_from: f64,
     opacity_at: f64,
@@ -161,7 +160,7 @@ pub struct FairyState {
     deliveries: u64,
 }
 
-impl FairyState {
+impl IgorioState {
     /// `seed` drives the random tilts; the same seed and the same calls give the same pile.
     pub fn new(seed: u64) -> Self {
         Self {
@@ -244,12 +243,12 @@ impl FairyState {
         self.deliveries
     }
 
-    /// The fairy is hidden, for any reason (`AppDelegate.captureUIOwners` is not empty).
+    /// The pile is hidden, for any reason.
     pub fn hidden_for_capture(&self) -> bool {
         self.hidden != 0
     }
 
-    /// The fairy is hidden for this reason, whatever the others.
+    /// The pile is hidden for this reason, whatever the others.
     pub fn hidden_by(&self, reason: Hidden) -> bool {
         self.hidden & reason.bit() != 0
     }
@@ -264,12 +263,12 @@ impl FairyState {
         self.card_size = size;
     }
 
-    /// The fairy steps out of the way while the system capture UI is up.
+    /// The pile steps out of the way while the system capture UI is up.
     pub fn set_hidden_for_capture(&mut self, hidden: bool, now: f64) {
         self.set_hidden(Hidden::CaptureUi, hidden, now);
     }
 
-    /// Adds or removes one reason to hide (`setCaptureUIVisible(_:owner:)`). The fairy is
+    /// Adds or removes one reason to hide. The pile is
     /// hidden while any reason holds and comes back when the last one goes. Returns true when
     /// that changed: the fade starts then, and the shake gate follows the same edge.
     pub fn set_hidden(&mut self, reason: Hidden, hidden: bool, now: f64) -> bool {
@@ -371,7 +370,7 @@ impl FairyState {
             .filter(|id| taken.contains(id))
             .collect();
         let mut order = order.into_iter().enumerate();
-        // Swift schedules the first step with `asyncAfter(.now())`; run it now so the pile
+        // The first step runs now, not on the next tick, so the pile
         // already shows the drop and the hint the moment a delivery starts.
         if let Some((_, id)) = order.next() {
             self.start_drop(id, hint.to_string(), now);
@@ -854,7 +853,7 @@ impl FairyState {
         })
     }
 
-    /// When the oldest remembered release expires (the Swift prune timer).
+    /// When the oldest remembered release expires.
     fn prune_deadline(&self) -> Option<f64> {
         self.pile
             .released()

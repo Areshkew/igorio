@@ -1,16 +1,16 @@
-//! Hand-drawn strokes that feel like ink: a Rust port of Steve Ruiz's perfect-freehand
+//! Hand-drawn strokes that feel like ink: a Rust version of Steve Ruiz's perfect-freehand
 //! (MIT, https://github.com/steveruiz/perfect-freehand), the algorithm Excalidraw draws with.
 //!
 //! Instead of a line of fixed width, a stroke is a filled outline whose width follows a
 //! simulated pen pressure: fast movement thins the line, slow movement fills it out. The input
 //! is "streamlined" (each point eases toward the pointer), which irons out hand jitter.
 //!
-//! Coordinates are y-down, like the original.
+//! Coordinates are y-down, like perfect-freehand.
 
 use crate::geom::Point;
 
-/// One step of a [`path`]. Stands in for `CGPath`, which Rust does not have; a path is the
-/// commands Swift adds to it, in order.
+/// One step of a [`path`]. A path is a list of these commands, in order; the renderer fills
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PathCmd {
     MoveTo(Point),

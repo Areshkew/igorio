@@ -1,7 +1,7 @@
-//! Translation of `fairy-cursor/tests/core/InkTests.swift`.
+//! Ink strokes and the keys the ink answers to.
 //!
-//! Swift asks `CGPath` for its bounding box and for point containment; those helpers below
-//! flatten the quadratic path into a polygon the way CoreGraphics would fill it.
+//! The helpers below flatten a stroke's quadratic path into a polygon, to get its bounding box
+//! and to test whether a point is inside the filled shape.
 
 use igorio_core::freehand::PathCmd;
 use igorio_core::geom::{Point, Rect};
@@ -39,7 +39,7 @@ fn flatten(cmds: &[PathCmd]) -> Vec<Point> {
     polygon
 }
 
-/// `CGPath.boundingBoxOfPath`.
+/// The bounding box of the path's points, control points included.
 #[track_caller]
 fn bounding_box(cmds: &[PathCmd]) -> Rect {
     let polygon = flatten(cmds);
@@ -61,7 +61,7 @@ fn is_left(a: Point, b: Point, p: Point) -> f64 {
     (b.x - a.x) * (p.y - a.y) - (p.x - a.x) * (b.y - a.y)
 }
 
-/// `CGPath.contains`: nonzero winding on the filled (closed) path.
+/// Whether the point is inside the filled (closed) path, by the nonzero winding rule.
 #[track_caller]
 fn path_contains(cmds: &[PathCmd], point: Point) -> bool {
     let polygon = flatten(cmds);
@@ -151,7 +151,7 @@ fn test_done_puts_tool_down_and_wipes_the_ink() {
 
 #[test]
 fn test_editing_keys_are_left_alone_when_not_drawing() {
-    // esc, ⌘Z and ⌫ belong to the app underneath unless a tool is in hand.
+    // esc, Ctrl+Z and Backspace belong to the app underneath unless a tool is in hand.
     let mut ink = Ink::new();
     assert!(!ink.press(InkKey::Done));
     assert!(!ink.press(InkKey::Undo));

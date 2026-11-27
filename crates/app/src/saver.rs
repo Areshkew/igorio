@@ -1,6 +1,6 @@
 //! Saves held screenshots and recordings into the folder the user chose.
 //!
-//! From `ScreenshotSaver.swift` and `FinderTarget.swift`: names follow the Snipping Tool
+//! Names follow the Snipping Tool
 //! pattern, an existing file is never overwritten, the PNG carries the display's pixel
 //! density so viewers show it at its on-screen size, and encoding happens off the caller's
 //! thread. Files are written through a temp file in the same folder and then renamed, so a

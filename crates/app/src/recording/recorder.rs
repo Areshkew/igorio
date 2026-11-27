@@ -2362,7 +2362,7 @@ mod tests {
     }
 
     #[test]
-    fn name_matches_swift_and_collision_suffix() {
+    fn name_has_the_date_and_a_collision_suffix() {
         let date = (2026, 11, 6, 3, 4, 5);
         assert_eq!(
             recording_name(date, 1),

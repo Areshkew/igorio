@@ -360,11 +360,11 @@ fn run() -> Result<bool> {
     let work = monitor.work_area;
     let spot = |dx: f64, dy: f64| Point::new(work.x + work.width * dx, work.y + work.height * dy);
 
-    // A note written by the macOS app (markers visible in the file) is in the folder already.
-    let mac_id = NoteId::parse("6F9A1B2C-3D4E-4F5A-6B7C-8D9EAFB0C1D2").expect("id");
-    let mac_note = Note {
-        id: mac_id,
-        text: "# From the Mac\nThis is **bold** and *slanted*.\n- [x] done item".to_owned(),
+    // A note saved earlier (markers visible in the file) is in the folder already.
+    let saved_id = NoteId::parse("6F9A1B2C-3D4E-4F5A-6B7C-8D9EAFB0C1D2").expect("id");
+    let saved_note = Note {
+        id: saved_id,
+        text: "# Saved earlier\nThis is **bold** and *slanted*.\n- [x] done item".to_owned(),
         created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000),
         updated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000),
         origin: NoteOrigin::desktop(),
@@ -373,9 +373,9 @@ fn run() -> Result<bool> {
         is_hidden: false,
     };
     fs::create_dir_all(root.join("Notes"))?;
-    let mac_path = root.join("Notes").join("From the Mac.md");
-    fs::write(&mac_path, NoteFile::render(&mac_note))?;
-    let mac_bytes = fs::read(&mac_path)?;
+    let saved_path = root.join("Notes").join("Saved earlier.md");
+    fs::write(&saved_path, NoteFile::render(&saved_note))?;
+    let saved_bytes = fs::read(&saved_path)?;
 
     let notes = start(&root, Theme::Light, 96, &moved, true)?;
     let (_, private_start) = memory();
@@ -932,7 +932,7 @@ fn run() -> Result<bool> {
         file_ok,
     );
     checks.check(
-        &format!("the Markdown link is the Swift one ({dropped:?})"),
+        &format!("the Markdown link is the attachment's ({dropped:?})"),
         dropped.contains("![screenshot](attachments/shot-")
             && dropped.starts_with("Screenshot of the build:\n"),
     );
@@ -1053,24 +1053,24 @@ fn run() -> Result<bool> {
                 .any(|path| path.file_name() == doomed.as_ref().and_then(|p| p.file_name())),
     );
 
-    // --- The macOS note -------------------------------------------------------------------
-    notes.reopen(mac_id);
-    wait(Duration::from_secs(2), || zone(&notes, mac_id).is_some());
-    let mac = on(&notes, mac_id, |editor| {
+    // --- The note saved earlier ------------------------------------------------------------
+    notes.reopen(saved_id);
+    wait(Duration::from_secs(2), || zone(&notes, saved_id).is_some());
+    let saved = on(&notes, saved_id, |editor| {
         editor.set_focused(false);
         (editor.text(), font_at(editor, 0).hidden, font_at(editor, 3).weight)
     });
     checks.check(
-        &format!("a note in the macOS format loads formatted ({:?})", mac.0),
-        mac.0 == mac_note.text && mac.1 && mac.2 == 600,
+        &format!("a note saved earlier loads formatted ({:?})", saved.0),
+        saved.0 == saved_note.text && saved.1 && saved.2 == 600,
     );
-    shot(&mut checks, hwnd_of(&notes, mac_id), &pictures, "notes-mac-note.png")?;
-    notes.put_away(mac_id);
-    wait(Duration::from_secs(2), || zone(&notes, mac_id).is_none() && notes.test_idle());
+    shot(&mut checks, hwnd_of(&notes, saved_id), &pictures, "notes-saved-note.png")?;
+    notes.put_away(saved_id);
+    wait(Duration::from_secs(2), || zone(&notes, saved_id).is_none() && notes.test_idle());
     thread::sleep(Duration::from_millis(600));
     checks.check(
         "load, edit nothing, put away: the file is byte for byte the same",
-        fs::read(&mac_path).ok().as_deref() == Some(&mac_bytes[..]),
+        fs::read(&saved_path).ok().as_deref() == Some(&saved_bytes[..]),
     );
 
     // --- Idle, memory ----------------------------------------------------------------------

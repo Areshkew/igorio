@@ -1,5 +1,5 @@
 //! Geometry shared by the overlay window, the follower and the drawing code.
-//! From `FairyLayout` in `FairyView.swift`. All values are logical pixels (96 DPI);
+//! All values are logical pixels (96 DPI);
 //! multiply by the monitor scale to get physical pixels.
 
 use igorio_core::geom::Size;
@@ -21,12 +21,12 @@ pub enum CardSize {
     Small,
     /// 96 x 72 logical px.
     Medium,
-    /// 112 x 84 logical px, the macOS original.
+    /// 112 x 84 logical px.
     Large,
 }
 
 impl CardSize {
-    /// The box a card is fitted into, logical px: 80 x 60, 96 x 72, 112 x 84 (the macOS size).
+    /// The box a card is fitted into, logical px: 80 x 60, 96 x 72, 112 x 84.
     pub const fn thumb_max(self) -> Size {
         match self {
             CardSize::Small => Size::new(80.0, 60.0),

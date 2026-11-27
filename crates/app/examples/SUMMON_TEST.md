@@ -3,7 +3,7 @@
 Run `cargo run -p igorio-app --example summon_demo --release` in a console you can see.
 It offers one tool, New note, as the app does today. Add `-- --tools note,record` for two
 rows (steps 3 and 4), `-- --modifier ctrl-alt` for step 18. Every state change, lookup,
-swallowed click and injected key is printed (`FAIRY_DEBUG ...`), and every chosen tool as
+swallowed click and injected key is printed (`IGORIO_DEBUG ...`), and every chosen tool as
 `TOOL <id> at x,y: label | detail`. "Menu" means the small rounded list of tools that opens
 under the cursor. It opens anywhere except over a text field, a password field or a
 terminal.

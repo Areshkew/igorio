@@ -7,7 +7,7 @@ use crate::geom::{Point, Rect};
 /// The bits of an accessibility element the editable-text heuristics need. The app conforms
 /// its UI Automation element wrapper to it; tests use an in-memory tree.
 ///
-/// `Clone` stands in for the Swift class references: cloning must be cheap and keep the same
+/// Elements are shared handles: cloning must be cheap and keep the same
 /// identity, so `parent` and `children` can hand out elements the caller may keep.
 pub trait AccessibilityNode: Clone {
     fn role(&self) -> Option<String>;
@@ -19,7 +19,7 @@ pub trait AccessibilityNode: Clone {
     /// Chromium marks every node inside an editable region with `AXEditableAncestor`.
     fn has_editable_ancestor_attribute(&self) -> bool;
     /// `AXValue` is settable and the element has a text selection (`AXSelectedTextRange`):
-    /// how custom text views (SwiftUI, Catalyst, canvas editors) look when their role is a
+    /// how custom text views (custom-drawn editors, canvas editors) look when their role is a
     /// generic group.
     fn is_settable_text_value(&self) -> bool;
 }

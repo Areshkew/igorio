@@ -1,4 +1,4 @@
-//! The screen recording capability for the app (`RecordingCapability.swift`): one recording
+//! The screen recording capability for the app: one recording
 //! at a time, with the recorder ([`Recorder`]), what it shows on screen ([`RecordingUi`]) and
 //! the zoomed area ([`RecordingViewport`]). `main.rs` drives it from the UI loop like the
 //! notes: it asks for a toggle, feeds the mouse events, runs one [`RecordingFeature::pass`]
@@ -18,9 +18,8 @@
 //! [`advance`] is the whole state machine (`RecordingCapability.State`): idle, starting (the
 //! recorder sets up and waits for its first frame), recording, stopping (the file is being
 //! finished). The rules derived from the state are pure too: [`exclusive`] (the note gesture
-//! and the tool menu are off, as with `host.setExclusive`), [`pen_keys`] (the Pen and
-//! Highlighter hotkeys are registered) and [`drawing`] (the fairy steps aside while a tool is
-//! in hand, as with `host.setCaptureUIVisible`).
+//! and the tool menu are off), [`pen_keys`] (the Pen and Highlighter hotkeys are registered)
+//! and [`drawing`] (the pile steps aside while a tool is in hand).
 //!
 //! # Stop order
 //!
@@ -69,10 +68,9 @@ pub const START_HINT_RECORDINGS: u32 = 3;
 pub fn show_start_hint(shown: u32) -> bool {
     shown < START_HINT_RECORDINGS
 }
-/// The capability's id in `settings.json` (`RecordingCapability.manifest.id`).
-pub const CAPABILITY: &str = "fairy.screen-recording";
-/// The drawn cursor's size: `CursorScale.enlarge` turns the usual size 1 into
-/// `min(4, max(1 × 1.75, 2))` = 2.
+/// The capability's id in `settings.json`.
+pub const CAPABILITY: &str = "igorio.screen-recording";
+/// The drawn cursor's size: the usual size 1 becomes `min(4, max(1 × 1.75, 2))` = 2.
 pub const CURSOR_SCALE: f64 = 2.0;
 /// How long the recording UI may fade out after `stop` before it is shut down anyway.
 pub const UI_FADE_BOUND: f64 = 1.0;
@@ -126,8 +124,7 @@ pub enum Step {
     Explain,
 }
 
-/// The state machine (`RecordingCapability.toggle`, `begin`, `finish`). A toggle while
-/// starting or stopping waits, as in Swift; switching off saves a recording in progress
+/// The state machine. A toggle while starting or stopping waits; switching off saves a recording in progress
 /// first ("finish the file rather than lose it") and it still goes on the pile.
 pub fn advance(state: RecordingState, input: Input) -> (RecordingState, &'static [Step]) {
     use Input as I;
@@ -163,7 +160,7 @@ pub fn pen_keys(state: RecordingState) -> bool {
     state == RecordingState::Recording
 }
 
-/// The fairy is hidden for drawing (`setCaptureUIVisible(tool != nil, owner: inkOwner)`):
+/// The pile is hidden for drawing (a tool is in hand):
 /// it must not follow the pen around the video, and scribbling is not a shake.
 pub fn drawing(state: RecordingState, tool: Option<InkTool>) -> bool {
     state == RecordingState::Recording && tool.is_some()
@@ -175,7 +172,7 @@ pub fn shown_state(state: RecordingState, ui_closing: bool) -> RecordingState {
     if state == RecordingState::Idle && ui_closing { RecordingState::Stopping } else { state }
 }
 
-/// The tray item (`RecordingCapability.menuItems`): its label and whether it can be chosen.
+/// The tray item: its label and whether it can be chosen.
 pub fn menu_label(state: RecordingState) -> (&'static str, bool) {
     match state {
         RecordingState::Idle => ("Record Screen", true),
@@ -390,7 +387,7 @@ impl RecordingFeature {
         pen_keys(self.state)
     }
 
-    /// The fairy is hidden for drawing.
+    /// The pile is hidden for drawing.
     pub fn drawing(&self) -> bool {
         drawing(self.state, self.tool)
     }
@@ -651,7 +648,7 @@ impl RecordingFeature {
         let config = RecordingUiConfig {
             labels: labels(&settings.shortcuts),
             show_start_hint: show_start_hint(settings.recording_hints_shown),
-            capturable: std::env::var_os("FAIRY_CAPTURABLE").is_some_and(|v| v == "1"),
+            capturable: std::env::var_os("IGORIO_CAPTURABLE").is_some_and(|v| v == "1"),
             debug: self.log.enabled(),
             ..RecordingUiConfig::default()
         };
@@ -934,7 +931,7 @@ mod tests {
             (Idle, Input::Finished, Idle, &[]),
             (Idle, Input::Failed, Idle, &[]),
             (Idle, Input::SwitchedOff, Idle, &[]),
-            // Swift ignores the toggle while starting; switching off saves what there is.
+            // A toggle while starting is ignored; switching off saves what there is.
             (Starting, Input::Toggle, Starting, &[]),
             (Starting, Input::Started, Recording, &[ShowUi]),
             (Starting, Input::UiFailed, Starting, &[]),
