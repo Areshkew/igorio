@@ -5,6 +5,7 @@ pub mod layout;
 pub mod scene;
 
 pub mod clipboard;
+pub mod crash;
 pub mod draw;
 pub mod drop_router;
 pub mod explorer;

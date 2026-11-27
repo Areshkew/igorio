@@ -506,6 +506,11 @@ impl TestNote<'_> {
         self.hub.refresh_from_disk();
     }
 
+    /// The frame the store holds for this note (what will be saved).
+    pub fn saved_frame(&self) -> Option<Rect> {
+        self.hub.store.borrow().note(self.window.id).map(|note| note.frame)
+    }
+
     pub fn dpi(&self) -> u32 {
         self.window.dpi.get()
     }
@@ -731,6 +736,7 @@ fn run(
         next_seed: Cell::new(0),
         active: Cell::new(None),
         quitting: Cell::new(false),
+        handling: Cell::new(false),
     });
     // SAFETY: the hub outlives the message window (destroyed below before the box drops).
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, &*hub as *const Hub as isize) };
@@ -833,6 +839,7 @@ pub struct Hub {
     next_seed: Cell<u64>,
     active: Cell<Option<NoteId>>,
     quitting: Cell<bool>,
+    handling: Cell<bool>,
 }
 
 impl Hub {
@@ -882,13 +889,19 @@ impl Hub {
             })
     }
 
-    /// Applies a store change and arms the save timer.
-    fn update(&self, id: NoteId, change: impl FnOnce(&mut Note)) {
+    /// Applies a store change and arms the save timer. False when the store is busy (a write
+    /// in progress that pumps messages, such as the Recycle Bin): the caller tries again later.
+    fn update(&self, id: NoteId, change: impl FnOnce(&mut Note)) -> bool {
         let now = self.seconds();
-        if let Ok(mut store) = self.store.try_borrow_mut() {
-            store.update(id, now, change);
-        }
+        let done = match self.store.try_borrow_mut() {
+            Ok(mut store) => {
+                store.update(id, now, change);
+                true
+            }
+            Err(_) => false,
+        };
         self.schedule_save();
+        done
     }
 
     fn schedule_save(&self) {
@@ -926,6 +939,11 @@ impl Hub {
     }
 
     fn handle_commands(&self) {
+        // Never nested: a command that pumps messages (the Recycle Bin) must not run another
+        // command inside it; the outer loop takes the rest of the queue afterwards.
+        if self.handling.replace(true) {
+            return;
+        }
         while let Ok(command) = self.receiver.try_recv() {
             if self.quitting.get() {
                 continue;
@@ -968,6 +986,7 @@ impl Hub {
                 }
             }
         }
+        self.handling.set(false);
     }
 
     fn apply_theme(&self) {
@@ -1680,7 +1699,9 @@ impl NoteWindow {
         }
         self.dpi.set(dpi);
         self.fonts.set(GdiFonts::new(dpi));
-        *self.surface.borrow_mut() = None;
+        if let Ok(mut surface) = self.surface.try_borrow_mut() {
+            *surface = None;
+        }
         if let Some(editor) = self.editor.borrow().as_ref() {
             editor.set_dpi(dpi);
         }
@@ -1907,14 +1928,23 @@ impl NoteWindow {
             Some(editor) => editor.text(),
             None => return,
         };
-        let unchanged =
-            self.hub().store.borrow().note(self.id).is_some_and(|note| note.text == text);
-        if !unchanged {
-            let now = SystemTime::now();
-            self.hub().update(self.id, |note| {
-                note.text = text;
-                note.updated_at = now;
-            });
+        let unchanged = match self.hub().store.try_borrow() {
+            Ok(store) => store.note(self.id).is_some_and(|note| note.text == text),
+            Err(_) => false,
+        };
+        if unchanged {
+            return;
+        }
+        let now = SystemTime::now();
+        let stored = self.hub().update(self.id, |note| {
+            note.text = text;
+            note.updated_at = now;
+        });
+        if !stored {
+            // The store is busy (a write that pumps messages): try again after this message.
+            self.editor_events.borrow_mut().push(EditorEvent::Changed);
+            // SAFETY: a scalar message to our own window.
+            let _ = unsafe { PostMessageW(Some(self.hwnd), EDITOR_EVENTS, WPARAM(0), LPARAM(0)) };
         }
     }
 
@@ -2077,7 +2107,7 @@ impl NoteWindow {
     fn paint_at(&self, target: HDC, origin: POINT) {
         let client = self.client();
         let (width, height) = (client.right.max(1) as u32, client.bottom.max(1) as u32);
-        let mut storage = self.surface.borrow_mut();
+        let Ok(mut storage) = self.surface.try_borrow_mut() else { return };
         if storage.as_ref().is_none_or(|surface| surface.width != width || surface.height != height)
         {
             *storage = Surface::new(width, height).ok();
@@ -2179,9 +2209,13 @@ impl NoteWindow {
                 let label = self
                     .hub()
                     .store
-                    .borrow()
-                    .note(self.id)
-                    .map(|note| edited_label(note.created_at, note.updated_at, SystemTime::now()))
+                    .try_borrow()
+                    .ok()
+                    .and_then(|store| {
+                        store.note(self.id).map(|note| {
+                            edited_label(note.created_at, note.updated_at, SystemTime::now())
+                        })
+                    })
                     .unwrap_or_default();
                 canvas.label(
                     footer,
@@ -2429,6 +2463,14 @@ unsafe extern "system" fn button_proc(
             }
             return LRESULT(0);
         }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            // The wheel scrolls the text wherever over the note it turns.
+            if let Some(editor) = window.editor.borrow().as_ref() {
+                // SAFETY: the same message, to our own editor control.
+                unsafe { SendMessageW(editor.hwnd(), msg, Some(wp), Some(lp)) };
+            }
+            return LRESULT(0);
+        }
         WM_ERASEBKGND => return LRESULT(1),
         WM_NCDESTROY => {
             // SAFETY: removes this subclass on the last message.
@@ -2484,11 +2526,37 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     };
     match msg {
         WM_NCCALCSIZE if wp.0 != 0 => return LRESULT(0),
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            // The wheel scrolls the text wherever over the note it turns.
+            if let Some(editor) = window.editor.borrow().as_ref() {
+                // SAFETY: the same message, to our own editor control.
+                unsafe { SendMessageW(editor.hwnd(), msg, Some(wp), Some(lp)) };
+            }
+            return LRESULT(0);
+        }
         WM_NCHITTEST => {
             let (x, y) = (i32::from(lp.0 as i16), i32::from((lp.0 >> 16) as i16));
             return LRESULT(window.hit_test(x, y) as isize);
         }
         WM_NCACTIVATE => return LRESULT(1),
+        WM_WINDOWPOSCHANGING if matches!(window.window_motion.get(), Motion::Still) => {
+            // A drag is held at the minimum by WM_GETMINMAXINFO; a move or size from code
+            // (SetWindowPos) is held here. The grow animation starts small on purpose.
+            let position = lp.0 as *mut WINDOWPOS;
+            // SAFETY: Windows passes a valid WINDOWPOS for this message; we may change it.
+            if let Some(position) = unsafe { position.as_mut() }
+                && position.flags & SWP_NOSIZE == SET_WINDOW_POS_FLAGS(0)
+            {
+                let (min_w, min_h) = (window.s(MIN_NOTE_SIZE.0), window.s(MIN_NOTE_SIZE.1));
+                if position.cx < min_w {
+                    position.cx = min_w;
+                }
+                if position.cy < min_h {
+                    position.cy = min_h;
+                }
+            }
+            return default();
+        }
         WM_GETMINMAXINFO => {
             let info = lp.0 as *mut MINMAXINFO;
             if !info.is_null() {
@@ -2504,14 +2572,20 @@ unsafe extern "system" fn note_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             if matches!(window.window_motion.get(), Motion::Still) {
                 window.layout();
             }
-            *window.surface.borrow_mut() = None;
+            if let Ok(mut surface) = window.surface.try_borrow_mut() {
+                *surface = None;
+            }
         }
         WM_WINDOWPOSCHANGED => {
             let result = default();
             if matches!(window.window_motion.get(), Motion::Still) && !window.closing.get() {
                 let frame = window.card_rect();
                 let hub = window.hub();
-                let stored = hub.store.borrow().note(window.id).map(|note| note.frame);
+                let stored = hub
+                    .store
+                    .try_borrow()
+                    .ok()
+                    .and_then(|store| store.note(window.id).map(|note| note.frame));
                 if stored.is_some_and(|stored| stored != frame) {
                     hub.update(window.id, |note| note.frame = frame);
                 }

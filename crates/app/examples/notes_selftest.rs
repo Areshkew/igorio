@@ -24,7 +24,7 @@ use igorio_app::overlay::{ensure_dpi_awareness, monitor_at};
 use igorio_core::geom::{CardId, Point, Rect};
 use igorio_kit::held::HeldCard;
 use igorio_kit::image::Image;
-use windows::Win32::Foundation::{FILETIME, HWND, POINT, RECT};
+use windows::Win32::Foundation::{FILETIME, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PW_CLIENTONLY, PrintWindow};
@@ -522,6 +522,7 @@ fn run() -> Result<bool> {
         copied.0 == "# Weekly notes\r\n" && copied.1.as_deref() == Some("# Weekly notes"),
     );
 
+    placeholder_checks(&mut checks, &notes, first, "light 100%", Some(&pictures))?;
     // --- Blocks that behave, undo -------------------------------------------------------
     let list = on(&notes, first, |editor| {
         editor.set_text("- one");
@@ -1135,6 +1136,187 @@ fn run() -> Result<bool> {
         notes.put_away(grow);
     }
 
+    // --- The mouse wheel and the drawn thumb ------------------------------------------------
+    let long_text = (1..80).map(|n| format!("Scrolling line {n}")).collect::<Vec<_>>().join("\n");
+    on(&notes, first, move |editor| {
+        editor.set_focused(false);
+        editor.set_text(&long_text);
+        editor.select(0..0);
+    });
+    let note_hwnd = hwnd_of(&notes, first);
+    // SAFETY: children of our own note window.
+    let (editor_hwnd, close_hwnd) = unsafe {
+        (
+            GetDlgItem(Some(note_hwnd), igorio_app::notes::window::EDITOR_ID).unwrap_or_default(),
+            GetDlgItem(Some(note_hwnd), igorio_app::notes::window::CLOSE_ID).unwrap_or_default(),
+        )
+    };
+    let wheel = |target: HWND, delta: i16| {
+        // SAFETY: a wheel message to our own window, as Windows delivers one (no focus needed).
+        unsafe {
+            SendMessageW(
+                target,
+                WM_MOUSEWHEEL,
+                Some(WPARAM((delta as u16 as usize) << 16)),
+                Some(LPARAM(0)),
+            );
+        }
+        thread::sleep(Duration::from_millis(250));
+    };
+    for (name, target) in
+        [("editor", editor_hwnd), ("note window", note_hwnd), ("header button", close_hwnd)]
+    {
+        let before = on(&notes, first, |editor| editor.scroll_state());
+        wheel(target, -120);
+        let after = on(&notes, first, |editor| editor.scroll_state());
+        let moved = after.0 > before.0 && after.1.zip(before.1).is_some_and(|(a, b)| a.top > b.top);
+        checks.check(&format!("a wheel notch over the {name} scrolls the note and the thumb follows ({} -> {} px)", before.0, after.0), moved);
+    }
+    let before = on(&notes, first, |editor| editor.scroll_state());
+    wheel(editor_hwnd, -40);
+    let after = on(&notes, first, |editor| editor.scroll_state());
+    checks.check(
+        &format!(
+            "a high-resolution delta of 40 scrolls a third of a notch ({} -> {} px)",
+            before.0, after.0
+        ),
+        after.0 > before.0,
+    );
+    wheel(editor_hwnd, 120 * 30);
+    let top = on(&notes, first, |editor| editor.scroll_state());
+    checks.check("scrolling up stops at the top", top.0 == 0);
+    // A click on the track below the thumb pages down; dragging the thumb scrolls.
+    let (_, thumb) = top;
+    if let Some(thumb) = thumb {
+        let x = (thumb.left + thumb.right) / 2;
+        let click = |message: u32, y: i32| {
+            let point = ((y as u16 as usize) << 16) | (x as u16 as usize);
+            // SAFETY: mouse messages to our own editor control, client coordinates.
+            unsafe {
+                SendMessageW(editor_hwnd, message, Some(WPARAM(1)), Some(LPARAM(point as isize)))
+            };
+        };
+        click(WM_LBUTTONDOWN, thumb.bottom + 20);
+        click(WM_LBUTTONUP, thumb.bottom + 20);
+        thread::sleep(Duration::from_millis(250));
+        let paged = on(&notes, first, |editor| editor.scroll_state());
+        checks.check(&format!("a click on the track pages down ({} px)", paged.0), paged.0 > 0);
+        let thumb = paged.1.unwrap_or(thumb);
+        click(WM_LBUTTONDOWN, thumb.top + 2);
+        click(WM_MOUSEMOVE, thumb.top + 42);
+        click(WM_LBUTTONUP, thumb.top + 42);
+        let dragged = on(&notes, first, |editor| editor.scroll_state());
+        checks.check(
+            &format!("dragging the thumb scrolls ({} -> {} px)", paged.0, dragged.0),
+            dragged.0 > paged.0,
+        );
+    } else {
+        checks.check("a long note draws a scroll thumb", false);
+    }
+    on(&notes, first, |editor| {
+        editor.set_text("Short note");
+        editor.select(0..0);
+    });
+    wheel(editor_hwnd, -120);
+    let short = on(&notes, first, |editor| editor.scroll_state());
+    checks.check(
+        &format!("a note shorter than its window does not scroll and has no thumb ({short:?})"),
+        short.0 == 0 && short.1.is_none(),
+    );
+
+    // --- Resizing through the real message path, down to nothing and back --------------------
+    let attachment = fs::read_dir(root.join("Notes").join("attachments"))?
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.ends_with(".png"))
+        .unwrap_or_default();
+    let stress_text = format!(
+        "# Resize me\nA long line that wraps many times when the note is narrow, with **bold** and `code` in it.\n- [ ] A to-do\n- [x] Done\n![screenshot](attachments/{attachment})\n{}",
+        (1..40).map(|n| format!("Line {n} of text")).collect::<Vec<_>>().join("\n")
+    );
+    if let Some(stress) = new_note(&notes, spot(0.4, 0.3)) {
+        let text = stress_text.clone();
+        on(&notes, stress, move |editor| {
+            editor.set_text(&text);
+            editor.select(0..0);
+        });
+        let mut smallest = (i32::MAX, i32::MAX);
+        let mut steps = 0;
+        for _ in 0..3 {
+            let (count, small) = stress_resize(&notes, stress);
+            steps += count;
+            smallest = (smallest.0.min(small.0), smallest.1.min(small.1));
+        }
+        let still_there = zone(&notes, stress).is_some();
+        checks.check(
+            &format!("resizing through {steps} sizes on every edge and corner paints and survives"),
+            still_there,
+        );
+        checks.check(
+            &format!(
+                "asked for 0x0 to 1400x1000, the window never went below 190x120 (smallest {}x{})",
+                smallest.0, smallest.1
+            ),
+            smallest.0 >= 190 && smallest.1 >= 120,
+        );
+        // With the slash menu open.
+        on(&notes, stress, |editor| {
+            editor.set_focused(true);
+            editor.select(0..0);
+            type_text(editor, "\n/");
+        });
+        let open = on(&notes, stress, |editor| editor.slash_state().is_some());
+        let (steps, _) = stress_resize(&notes, stress);
+        checks.check(
+            &format!("resizing with the slash menu open ({steps} sizes, menu was open: {open})"),
+            open && zone(&notes, stress).is_some(),
+        );
+        // Caret visible, drawings on their lines, saved size the final one.
+        let hwnd = hwnd_of(&notes, stress);
+        let final_rect = RECT { left: 200, top: 150, right: 200 + 330, bottom: 150 + 260 };
+        resize_to(hwnd, final_rect, 8);
+        let (caret_visible, aligned) = on(&notes, stress, |editor| {
+            editor.set_focused(false);
+            let text = editor.text();
+            let at = text.find("A to-do").unwrap_or(0);
+            editor.select(at..at);
+            (editor.caret_visible(), editor.decos_aligned())
+        });
+        checks.check("after a resize the caret is visible", caret_visible);
+        checks.check(
+            &format!(
+                "checkboxes, bullets and images sit on their lines after re-wrapping ({aligned:?})"
+            ),
+            aligned.is_none(),
+        );
+        thread::sleep(Duration::from_millis(700));
+        let saved = notes.test_with(stress, |note| note.saved_frame()).flatten();
+        let actual = rect_of_win(window_rect(hwnd));
+        checks
+            .check(&format!("the saved size is the final one ({saved:?})"), saved == Some(actual));
+        // While the note is still growing in.
+        let before = notes.test_open_ids();
+        notes.open_new(spot(0.5, 0.5), NoteOrigin::desktop());
+        let mut grower = None;
+        wait(Duration::from_secs(2), || {
+            grower = notes.test_open_ids().into_iter().find(|id| !before.contains(id));
+            grower.is_some()
+        });
+        if let Some(grower) = grower {
+            let (steps, _) = stress_resize(&notes, grower);
+            checks.check(
+                &format!("resizing while the note grows in ({steps} sizes)"),
+                steps > 0 && notes.test_open_ids().contains(&grower),
+            );
+            wait(Duration::from_secs(2), || notes.test_idle());
+            notes.delete(grower);
+        }
+        notes.delete(stress);
+        wait(Duration::from_secs(2), || notes.test_idle());
+    } else {
+        checks.check("a note for the resize test opens", false);
+    }
+
     // --- UI Automation reaches the editor with its text -------------------------------------
     let editor_hwnd = {
         // SAFETY: a child of our own note window.
@@ -1211,6 +1393,7 @@ fn run() -> Result<bool> {
     });
     thread::sleep(Duration::from_millis(100));
     shot(&mut checks, hwnd_of(&notes, first), &pictures, "notes-blocks-dark-125.png")?;
+    placeholder_checks(&mut checks, &notes, first, "dark 125%", None)?;
 
     // --- Shutdown with a pending write ----------------------------------------------------
     on(&notes, first, |editor| {
@@ -1239,6 +1422,9 @@ fn run() -> Result<bool> {
 
 fn main() {
     ensure_dpi_awareness();
+    igorio_app::crash::install_at(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/notes-selftest-crash.log"),
+    );
     let ok = match run() {
         Ok(ok) => ok,
         Err(error) => {
@@ -1279,4 +1465,177 @@ fn uia_text(hwnd: HWND) -> (Option<String>, Option<String>) {
             .map(|text| text.to_string());
         (name, text)
     }
+}
+
+fn window_rect(hwnd: HWND) -> RECT {
+    let mut rect = RECT::default();
+    // SAFETY: a window of this process; writes the local.
+    let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+    rect
+}
+
+fn rect_of_win(r: RECT) -> Rect {
+    Rect::new(
+        f64::from(r.left),
+        f64::from(r.top),
+        f64::from(r.right - r.left),
+        f64::from(r.bottom - r.top),
+    )
+}
+
+/// One drag step the way the sizing loop does it: WM_SIZING with the edge, then the move, then
+/// a paint of the window and its children.
+fn resize_step(hwnd: HWND, edge: u32, mut rect: RECT) -> (i32, i32) {
+    // SAFETY: messages to our own note window (owned by the notes thread; SendMessage waits
+    // for it), with a local RECT for the call.
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_SIZING,
+            Some(WPARAM(edge as usize)),
+            Some(LPARAM(&mut rect as *mut RECT as isize)),
+        );
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        // A raw WM_SIZE with the asked size too (smaller than the window may really get).
+        let (w, h) = (
+            (rect.right - rect.left).clamp(0, 0xffff) as usize,
+            (rect.bottom - rect.top).clamp(0, 0xffff) as usize,
+        );
+        SendMessageW(hwnd, WM_SIZE, Some(WPARAM(0)), Some(LPARAM((w | h << 16) as isize)));
+        let _ =
+            RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
+    let real = window_rect(hwnd);
+    (real.right - real.left, real.bottom - real.top)
+}
+
+fn resize_to(hwnd: HWND, rect: RECT, edge: u32) {
+    // SAFETY: as in resize_step.
+    unsafe { SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None) };
+    let _ = resize_step(hwnd, edge, rect);
+    // SAFETY: as above.
+    unsafe { SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None) };
+}
+
+/// Drags every edge and corner from large to nothing and back, painting at each step. Returns
+/// the steps taken and the smallest window size seen.
+fn stress_resize(notes: &Notes, id: NoteId) -> (usize, (i32, i32)) {
+    let sizes: [(i32, i32); 16] = [
+        (1400, 1000),
+        (900, 700),
+        (400, 300),
+        (304, 224),
+        (220, 140),
+        (190, 120),
+        (189, 119),
+        (150, 200),
+        (400, 40),
+        (40, 400),
+        (120, 31),
+        (60, 20),
+        (10, 10),
+        (1, 1),
+        (0, 0),
+        (500, 380),
+    ];
+    let mut steps = 0;
+    let mut smallest = (i32::MAX, i32::MAX);
+    // The window itself (a note still growing in has no drop zone yet).
+    let hwnd = HWND(notes.test_with(id, |note| note.hwnd().0 as isize).unwrap_or(0) as *mut _);
+    if hwnd.0.is_null() {
+        return (0, smallest);
+    }
+    for edge in 1..=8u32 {
+        let start = window_rect(hwnd);
+        // SAFETY: as in resize_step.
+        unsafe { SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None) };
+        for (w, h) in sizes {
+            // WMSZ_LEFT 1, RIGHT 2, TOP 3, TOPLEFT 4, TOPRIGHT 5, BOTTOM 6, BOTTOMLEFT 7, BOTTOMRIGHT 8.
+            let left_moves = matches!(edge, 1 | 4 | 7);
+            let top_moves = matches!(edge, 3..=5);
+            let horizontal = !matches!(edge, 3 | 6);
+            let vertical = !matches!(edge, 1 | 2);
+            let width = if horizontal { w } else { start.right - start.left };
+            let height = if vertical { h } else { start.bottom - start.top };
+            let left = if left_moves { start.right - width } else { start.left };
+            let top = if top_moves { start.bottom - height } else { start.top };
+            let (w, h) = resize_step(
+                hwnd,
+                edge,
+                RECT { left, top, right: left + width, bottom: top + height },
+            );
+            smallest = (smallest.0.min(w), smallest.1.min(h));
+            steps += 1;
+        }
+        // SAFETY: as above.
+        unsafe { SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None) };
+        let _ = capture(hwnd);
+        let _ = resize_step(hwnd, 8, start);
+    }
+    (steps, smallest)
+}
+
+/// For an empty line of each block type with the caret on it: the placeholder sits after the
+/// revealed marker and the caret, on the marker's baseline. Saves the heading and quote
+/// pictures when `pictures` is given.
+fn placeholder_checks(
+    checks: &mut Checks,
+    notes: &Notes,
+    id: NoteId,
+    suffix: &str,
+    pictures: Option<&Path>,
+) -> Result<()> {
+    let cases: [(&str, &str, Option<&str>); 8] = [
+        ("Heading 1", "# ", Some("notes-placeholder-heading.png")),
+        ("Heading 2", "## ", None),
+        ("Heading 3", "### ", None),
+        ("Quote", "> ", Some("notes-placeholder-quote.png")),
+        ("To-do", "- [ ] ", None),
+        ("List (bullet)", "- ", None),
+        ("List (numbered)", "1. ", None),
+        ("Type / for commands", "Some text\n", None),
+    ];
+    for (name, text, picture) in cases {
+        let geometry = on(notes, id, move |editor| {
+            editor.set_text(text);
+            editor.set_focused(true);
+            let end = text.len();
+            editor.select(end..end);
+            editor.freeze(Some(editor.now() + 10_000.0));
+            editor.placeholder_geometry()
+        });
+        let ok = geometry.is_some_and(|g| {
+            let after_caret = g.placeholder.left > g.caret_x;
+            match g.marker {
+                Some((marker, base)) => {
+                    after_caret
+                        && g.placeholder.left >= marker.right
+                        && (g.baseline - base).abs() <= 1
+                }
+                None => after_caret,
+            }
+        });
+        checks.check(&format!("{suffix}: the {name} placeholder sits after the marker and the caret, on its baseline ({geometry:?})"), ok);
+        if let (Some(folder), Some(picture)) = (pictures, picture) {
+            shot(checks, hwnd_of(notes, id), folder, picture)?;
+        }
+        on(notes, id, |editor| editor.freeze(None));
+    }
+    // A code block shows no placeholder at all.
+    let code = on(notes, id, |editor| {
+        editor.set_text("```\n\n```");
+        editor.select(4..4);
+        editor.placeholder_geometry()
+    });
+    checks.check(&format!("{suffix}: an empty code line has no placeholder"), code.is_none());
+    on(notes, id, |editor| editor.set_focused(false));
+    Ok(())
 }

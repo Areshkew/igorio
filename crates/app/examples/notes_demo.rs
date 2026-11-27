@@ -67,6 +67,9 @@ fn test_card(id: u64) -> HeldCard {
 
 fn main() -> std::io::Result<()> {
     ensure_dpi_awareness();
+    igorio_app::crash::install_at(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/notes-demo-crash.log"),
+    );
     // The workspace target folder, without the \? prefix canonicalize would add.
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = manifest
