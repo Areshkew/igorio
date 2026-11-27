@@ -20,6 +20,7 @@
   --dot-on: #09265b;
   --kbd: #e9eef6;
   --kbd-ink: #3e4759;
+  --mark: #3b7bea;
 
   /* The stage: a piece of a Windows screen, in the app's own palette. */
   --wall-a: #d6e2f4;
@@ -73,6 +74,7 @@
     --dot-on: #d9e8ff;
     --kbd: #2a303d;
     --kbd-ink: #c9d3e4;
+    --mark: #6fa2f7;
 
     --wall-a: #141a26;
     --wall-b: #1e2738;
@@ -145,7 +147,7 @@ a { color: inherit; }
   font: 600 19px/1 var(--font-display);
   letter-spacing: -0.01em;
 }
-.brand-mark { width: 26px; height: 26px; color: var(--text); }
+.brand-mark { width: 26px; height: 26px; color: var(--mark); }
 .actions { display: flex; align-items: center; gap: 8px; }
 .btn {
   display: inline-flex;
@@ -507,7 +509,7 @@ kbd {
 .apps span.on { background: var(--hill-b); }
 .apps span.on::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: -6px; height: 3px; border-radius: 2px; background: var(--accent); }
 .tray { position: absolute; right: 16px; top: 0; height: 48px; display: flex; align-items: center; gap: 14px; color: var(--ink); }
-.tray-logo { width: 18px; height: 18px; color: var(--ink); transform-origin: 50% 50%; }
+.tray-logo { width: 18px; height: 18px; color: var(--mark); transform-origin: 50% 50%; }
 .chev { width: 7px; height: 7px; border-left: 1.5px solid var(--ink-muted); border-top: 1.5px solid var(--ink-muted); transform: rotate(45deg) translateY(2px); }
 .wifi { width: 16px; height: 16px; border-radius: 50% 50% 0 50%; border: 0; background: conic-gradient(from 315deg at 100% 100%, var(--ink-muted) 0 90deg, transparent 0); transform: rotate(45deg) scale(0.8); opacity: 0.85; }
 .vol { width: 14px; height: 12px; background: var(--ink-muted); clip-path: polygon(0 30%, 35% 30%, 75% 0, 75% 100%, 35% 70%, 0 70%); opacity: 0.85; }
@@ -602,6 +604,7 @@ kbd {
 .doc-ico::after { content: ""; position: absolute; left: 2.5px; top: 6px; width: 5px; height: 4px; border-top: 1.5px solid var(--ink-muted); border-bottom: 1.5px solid var(--ink-muted); }
 .rec-ico { position: absolute; left: 11px; top: 9px; width: 17px; height: 17px; border-radius: 50%; border: 1.5px solid var(--ink-muted); }
 .rec-ico::after { content: ""; position: absolute; inset: 2.5px; border-radius: 50%; background: var(--red); }
+.pin-ico { position: absolute; left: 10px; top: 9px; width: 18px; height: 18px; fill: none; stroke: var(--ink-muted); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .mchips { margin-left: auto; display: flex; gap: 4px; }
 .menu kbd, .hud kbd { height: 22px; padding: 0 6px; background: var(--chip); color: var(--chip-ink); font-size: 11.5px; }
 
@@ -669,6 +672,22 @@ kbd {
   font: 600 11px/1 "Segoe UI", sans-serif;
 }
 .badge i { width: 0; height: 0; border-left: 6px solid #fff; border-top: 4px solid transparent; border-bottom: 4px solid transparent; }
+
+/* A pinned card: the picture alone, rounded corners and shadow; a close button while hovered */
+.pin {
+  left: 0;
+  top: 0;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 0 0 1px rgba(var(--shadow), 0.14), 0 2px 6px rgba(var(--shadow), 0.14), 0 16px 36px -10px rgba(var(--shadow), 0.4);
+  transform-origin: 0 0;
+  opacity: 0;
+}
+.pin svg { display: block; width: 100%; height: 100%; }
+.pin-x { position: absolute; top: 8px; right: 8px; width: 20px; height: 20px; border-radius: 50%; background: rgba(255, 255, 255, 0.86); box-shadow: 0 1px 2px rgba(28, 38, 58, 0.2); opacity: 0; }
+.pin-x.hot { background: #fff; }
+.pin-x::before, .pin-x::after { content: ""; position: absolute; left: 50%; top: 50%; width: 10px; height: 1.6px; margin: -0.8px 0 0 -5px; border-radius: 1px; background: #1d2433; transform: rotate(45deg); }
+.pin-x::after { transform: rotate(-45deg); }
 
 .ripple { left: 0; top: 0; width: 34px; height: 34px; margin: -17px 0 0 -17px; border-radius: 50%; border: 2px solid var(--accent); opacity: 0; }
 
@@ -744,7 +763,7 @@ body.og main { padding-bottom: 26px; }
   border: 1px solid var(--line);
   box-shadow: var(--frame-shadow);
 }
-.thanks-mark { width: 52px; height: 52px; color: var(--text); }
+.thanks-mark { width: 52px; height: 52px; color: var(--mark); }
 .thanks h1 { margin: 20px 0 6px; font: 600 28px/1.2 var(--font-display); letter-spacing: -0.02em; }
 .thanks p { margin: 0 0 26px; color: var(--muted); }
 .thanks .btn.dark { height: 42px; padding: 0 20px; }

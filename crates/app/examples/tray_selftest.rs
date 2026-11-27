@@ -8,7 +8,7 @@ use std::io::BufWriter;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use igorio_app::tray::{MenuItem, PopupMenu, TRAY_UID, Tray, logo_pixmap};
+use igorio_app::tray::{MARK_BLUE, MARK_BLUE_DARK, MenuItem, PopupMenu, TRAY_UID, Tray, logo_pixmap};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::{NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -311,7 +311,7 @@ fn write_logos(report: &mut Report) {
         report.check(false, &format!("create {}: {e}", dir.display()));
         return;
     }
-    for (name, color) in [("white", [255, 255, 255, 255]), ("black", [0, 0, 0, 255])] {
+    for (name, color) in [("light", MARK_BLUE), ("dark", MARK_BLUE_DARK)] {
         for size in [16u32, 20, 24, 32] {
             let path = dir.join(format!("logo-{size}-{name}.png"));
             let result = write_enlarged(&path, &logo_pixmap(size, color), 8);
