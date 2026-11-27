@@ -2018,7 +2018,7 @@ impl NoteWindow {
         unsafe {
             let _ = ShowWindow(
                 self.hwnd,
-                if self.hub().test.no_activate { SW_SHOWNOACTIVATE } else { SW_SHOW },
+                if self.hub().test.no_activate || !focus { SW_SHOWNOACTIVATE } else { SW_SHOW },
             );
             let _ = SetWindowPos(
                 self.hwnd,
@@ -2029,7 +2029,7 @@ impl NoteWindow {
                 0,
                 SWP_NOMOVE
                     | SWP_NOSIZE
-                    | if self.hub().test.no_activate {
+                    | if self.hub().test.no_activate || !focus {
                         SWP_NOACTIVATE
                     } else {
                         SET_WINDOW_POS_FLAGS(0)
@@ -2175,7 +2175,11 @@ impl NoteWindow {
                     self.set_layered(None);
                     self.show_children(true);
                     self.layout();
+                    // Only a note that already has the foreground: focusing the editor of a
+                    // note shown without focus would take the foreground (and close the panel).
+                    // SAFETY: plain query.
                     if !self.hub().test.no_activate
+                        && unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() } == self.hwnd
                         && let Some(editor) = self.editor.borrow().as_ref()
                     {
                         editor.focus();
