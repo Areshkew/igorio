@@ -66,6 +66,7 @@ fn note(id: NoteId, text: &str) -> Note {
         origin: NoteOrigin::desktop(),
         frame: Rect::new(10.0, 20.0, 320.0, 240.0),
         is_open: false,
+        is_hidden: false,
     }
 }
 
@@ -174,6 +175,7 @@ fn the_file_format_is_exactly_the_swift_format() {
         },
         frame: Rect::new(10.5, 20.5, 320.0, 240.0),
         is_open: true,
+        is_hidden: false,
     };
     store.insert(known.clone()).unwrap();
 
@@ -576,7 +578,42 @@ fn window_state_round_trips_through_the_windows_file() {
     let loaded = reopened.note(note_id).expect("the note file is there");
     assert_eq!(loaded.frame, placed.frame);
     assert!(loaded.is_open);
+    assert!(!loaded.is_hidden);
     assert_eq!(loaded.text, placed.text);
+}
+
+#[test]
+fn the_hidden_state_survives_a_restart_and_old_files_read_as_shown() {
+    let scratch = Scratch::new("hidden");
+    let folder = scratch.folder("notes");
+    let windows = scratch.path("note-windows.json");
+    let (hidden, shown) = (id(61), id(62));
+    {
+        let mut store = NoteStore::new(&folder, &windows, at(CREATED));
+        store.insert(Note { is_open: true, ..note(shown, "On screen") }).unwrap();
+        store.insert(Note { is_open: true, ..note(hidden, "Out of the way") }).unwrap();
+        store.update(hidden, 1.0, |note| note.is_hidden = true);
+        assert!(store.flush().is_empty());
+    }
+    let file = fs::read_to_string(&windows).unwrap();
+    // Only a hidden note carries the key; the others stay as the Swift app wrote them.
+    assert_eq!(file.matches("isHidden").count(), 1, "{file}");
+
+    let mut reopened = NoteStore::new(&folder, &windows, at(CREATED));
+    assert!(reopened.note(hidden).unwrap().is_hidden);
+    assert!(reopened.note(hidden).unwrap().is_open);
+    assert!(!reopened.note(shown).unwrap().is_hidden);
+
+    // Shown again: the key goes away.
+    reopened.update(hidden, 2.0, |note| note.is_hidden = false);
+    assert!(reopened.flush().is_empty());
+    assert!(!fs::read_to_string(&windows).unwrap().contains("isHidden"));
+
+    // A windows file without the key (as the Swift app and older builds write it) reads as
+    // open and not hidden.
+    let older = NoteStore::new(&folder, &windows, at(CREATED));
+    assert!(!older.note(hidden).unwrap().is_hidden);
+    assert!(older.note(hidden).unwrap().is_open);
 }
 
 #[test]

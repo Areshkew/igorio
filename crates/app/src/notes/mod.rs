@@ -3,6 +3,7 @@
 pub mod context;
 pub mod editor;
 pub mod markdown;
+pub mod panel;
 pub mod store;
 pub mod summoner;
 pub mod window;

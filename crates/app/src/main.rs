@@ -17,6 +17,7 @@ use igorio_app::drop_router::{DebugLog, Drops};
 use igorio_app::follower::Follower;
 use igorio_app::hook::{self, MouseEvent, MouseHook};
 use igorio_app::layout::CardSize;
+use igorio_app::notes::panel::menu_notes;
 use igorio_app::notes::store::{NoteId, RecycleBin};
 use igorio_app::notes::summoner::{Block, SummonConfig, Summoner, SummonerEvent, ToolContext, ToolId};
 use igorio_app::notes::window::{Event as NotesEvent, Notes, NotesConfig, RecentNote, Theme};
@@ -58,6 +59,7 @@ const MENU_OPEN_NOTES_FOLDER: u32 = 5;
 const MENU_RECORD: u32 = 6;
 const MENU_PEN: u32 = 7;
 const MENU_HIGHLIGHTER: u32 = 8;
+const MENU_NOTES_PANEL: u32 = 9;
 /// A recent note in the tray menu: this id plus its place in the list.
 const MENU_NOTE_BASE: u32 = 100;
 /// How long stopping the notes may take: saving the text and closing the windows.
@@ -578,6 +580,8 @@ struct NotesFeature {
     recent: Vec<RecentNote>,
     /// The notes the tray menu shows, in menu order.
     shown: Vec<NoteId>,
+    /// "Notes…" was chosen: the loop opens the panel by the tray icon.
+    panel_asked: bool,
     summoner_events: Vec<SummonerEvent>,
     /// The tool menu's Record screen was chosen: the loop hands it to the recording.
     record: bool,
@@ -604,6 +608,7 @@ impl NotesFeature {
             windows_file,
             log: DebugLog::from_env(),
             recent: Vec::new(),
+            panel_asked: false,
             shown: Vec::new(),
             summoner_events: Vec::new(),
             record: false,
@@ -890,18 +895,19 @@ impl NotesFeature {
         }
     }
 
-    /// The tray menu's notes section (`NotesController.appendMenuItems`): "Recent Notes"
-    /// with every note, open ones checked, and "Open Notes Folder". Shows the last known list;
-    /// the refresh it asks for answers before the next opening.
+    /// The tray menu's notes section (`NotesController.appendMenuItems`): "Notes…" (the
+    /// panel), "Recent Notes" with the five last changed, open ones checked, and "Open Notes
+    /// Folder". Shows the last known list; the refresh it asks for answers before the next
+    /// opening.
     fn menu_section(&mut self) -> Vec<MenuItem> {
         let Some(running) = &self.active else {
             self.shown.clear();
             return Vec::new();
         };
         running.notes.refresh();
-        self.shown = self.recent.iter().map(|note| note.id).collect();
-        let mut items: Vec<MenuItem> = self
-            .recent
+        let recent = menu_notes(&self.recent);
+        self.shown = recent.iter().map(|note| note.id).collect();
+        let mut items: Vec<MenuItem> = recent
             .iter()
             .enumerate()
             .map(|(index, note)| MenuItem::Action {
@@ -915,6 +921,7 @@ impl NotesFeature {
             items.push(MenuItem::Label("No notes yet — hold Alt on empty space".into()));
         }
         vec![
+            MenuItem::action(MENU_NOTES_PANEL, "Notes…"),
             MenuItem::Submenu { label: "Recent Notes".into(), items },
             MenuItem::action(MENU_OPEN_NOTES_FOLDER, "Open Notes Folder"),
         ]
@@ -922,7 +929,9 @@ impl NotesFeature {
 
     fn menu_action(&mut self, id: u32) {
         let Some(running) = &self.active else { return };
-        if id == MENU_OPEN_NOTES_FOLDER {
+        if id == MENU_NOTES_PANEL {
+            self.panel_asked = true;
+        } else if id == MENU_OPEN_NOTES_FOLDER {
             let folder = running.folder.clone();
             // Starting Explorer is a process launch: keep it off the UI thread.
             thread::spawn(move || {
@@ -937,6 +946,17 @@ impl NotesFeature {
         {
             running.notes.reopen(note);
             self.log.line(hook::now(), &format!("notes: reopen {note} from the menu"));
+        }
+    }
+
+    /// Opens (or closes) the notes panel when "Notes…" was chosen, next to the tray icon.
+    fn open_panel_if_asked(&mut self, anchor: impl FnOnce() -> Option<windows::Win32::Foundation::RECT>) {
+        if !std::mem::take(&mut self.panel_asked) {
+            return;
+        }
+        if let Some(running) = &self.active {
+            running.notes.toggle_panel(anchor());
+            self.log.line(hook::now(), "notes: the notes panel");
         }
     }
 }
@@ -1481,6 +1501,7 @@ fn main() -> windows::core::Result<()> {
                 action => app.borrow_mut().shortcut(action, now),
             }
         }
+        notes.borrow_mut().open_panel_if_asked(|| tray.icon_rect().ok());
         if open_settings.replace(false) && let Err(error) = settings_window.open() {
             eprintln!("could not queue Settings: {error}");
         }
