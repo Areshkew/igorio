@@ -44,7 +44,9 @@ pub struct Settings {
     /// Action id -> chord text or null. Read leniently: a bad entry gives that action its
     /// default and leaves the rest alone (see `Shortcuts::from_json`).
     pub shortcuts: Shortcuts,
-    /// How many recordings showed the "Hold Alt and scroll to zoom" hint. Missing: 0.
+    /// How many recordings showed the "Hold Alt and scroll to zoom" hint; it shows while
+    /// this is below `recording::feature::START_HINT_RECORDINGS`. Missing: 0. To see the hint
+    /// again, set it to 0 or delete it in settings.json.
     pub recording_hints_shown: u32,
 }
 
@@ -111,6 +113,16 @@ impl Settings {
             let _ = fs::remove_file(&temp);
         }
         result
+    }
+
+    /// Counts one more recording that showed the zoom hint, in the file at `path`: loads,
+    /// adds one, saves, and returns what was saved. A file that cannot be read (locked) is an
+    /// error and is left alone, as `load` says; nothing else in it changes.
+    pub fn note_recording_hint_shown(path: &Path) -> io::Result<Settings> {
+        let mut settings = Settings::load(path)?;
+        settings.recording_hints_shown = settings.recording_hints_shown.saturating_add(1);
+        settings.save(path)?;
+        Ok(settings)
     }
 
     /// The folder to use for notes: a writable absolute path, otherwise the default.
